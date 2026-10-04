@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Install the Delta orchestration bundle: custom subagent profiles, the
 # /orchestrate skill, and a roster generated for this machine's accounts.
-# Also generates rules/personal-AGENTS.generated.md (context router plus
-# Ponytail) for pasting into Settings > Rules > Personal AGENTS.md.
+# Also generates personal-AGENTS.generated.md (context router plus Ponytail)
+# in $XDG_STATE_HOME/zetta-delta (default ~/.local/state/zetta-delta) for
+# pasting into Settings > Rules > Personal AGENTS.md; --clean removes it.
+# Run it from a clone, or piped from curl with ZETTA_DELTA_REF set (README).
 #
 # Required (a custom provider's id is "custom:" + sha256 of its base URL; see README):
 #   KIMI_PROVIDER        Delta provider id for Kimi Code
@@ -31,24 +33,28 @@
 #   DELTA_CONFIG_DIR     overrides Delta's config directory (same as Delta)
 #   PONYTAIL_DIR         ponytail plugin version dir (default: newest under
 #                        ~/.codex/plugins/cache/ponytail/ponytail/)
+#   ZETTA_DELTA_REF      commit to fetch the bundle at when none is next to this
+#                        script (curl | bash); there is no default
 #
-# Usage: install.sh [--force] [--dry-run] [--prune-legacy] [--skill-dir DIR]
+# Usage: install.sh [--force] [--dry-run] [--prune-legacy] [--skill-dir DIR] [--clean]
 set -euo pipefail
-
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly SCRIPT_DIR
+# One brace group, closed on the last line: bash parses all of it before
+# running any of it, so a download cut short (curl | bash) runs nothing.
+{
 
 die()  { printf 'install.sh: error: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
 warn() { printf 'install.sh: warning: %s\n' "$*" >&2; }
 
 usage() {
-  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$SELF"
 }
 
 FORCE=0
 DRY_RUN=0
 PRUNE_LEGACY=0
+CLEAN=0
+HELP=0
 SKILL_ROOT="${HOME}/.agents/skills"
 
 while (($#)); do
@@ -57,11 +63,50 @@ while (($#)); do
     --dry-run)      DRY_RUN=1 ;;
     --prune-legacy) PRUNE_LEGACY=1 ;;
     --skill-dir)    [[ $# -ge 2 ]] || die "--skill-dir needs a value"; SKILL_ROOT="$2"; shift ;;
-    -h|--help)      usage; exit 0 ;;
+    --clean)        CLEAN=1 ;;
+    -h|--help)      HELP=1 ;;
     *)              die "unknown argument: $1 (see --help)" ;;
   esac
   shift
 done
+
+# The generated rules wait here until pasted into Delta; --clean removes them.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zetta-delta"
+[[ $STATE_DIR == /* ]] || die "XDG_STATE_HOME must be an absolute path"
+readonly STATE_DIR
+if ((CLEAN && !HELP)); then
+  if [[ ! -e $STATE_DIR ]]; then info "nothing to remove: $STATE_DIR does not exist"
+  elif ((DRY_RUN)); then info "would remove $STATE_DIR"
+  else rm -rf -- "$STATE_DIR"; info "removed $STATE_DIR"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------- bundle ---
+# From a clone, the bundle sits next to this script. Piped from curl (or saved
+# alone), fetch the repository at ZETTA_DELTA_REF into a temporary folder,
+# removed on exit, and install from there.
+
+readonly REPO_URL="https://github.com/beardedeagle/zetta-delta"
+SELF="${BASH_SOURCE[0]:-}"
+if [[ -f $SELF && -f $(dirname -- "$SELF")/profiles/model.toml.tmpl ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "$SELF")" && pwd)"
+else
+  ref="${ZETTA_DELTA_REF:-}"
+  [[ -n $ref ]] || die "no bundle next to this script; set ZETTA_DELTA_REF to the commit to install (see README)"
+  [[ $ref =~ ^[A-Za-z0-9._-]+$ ]] || die "ZETTA_DELTA_REF='$ref' is invalid (a commit, tag, or branch name)"
+  command -v curl >/dev/null 2>&1 || die "curl not found"
+  SCRIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zetta-delta.XXXXXX")"
+  trap 'rm -rf -- "$SCRIPT_DIR"' EXIT
+  info "fetching $REPO_URL at $ref"
+  curl -fsSL --proto '=https' "$REPO_URL/archive/$ref.tar.gz" \
+    | tar -xzf - -C "$SCRIPT_DIR" --strip-components=1 \
+    || die "could not fetch $REPO_URL at $ref"
+  [[ -f $SCRIPT_DIR/profiles/model.toml.tmpl ]] || die "$REPO_URL at $ref has no bundle"
+  SELF="$SCRIPT_DIR/install.sh"
+fi
+readonly SCRIPT_DIR SELF
+if ((HELP)); then usage; exit 0; fi
 
 # ---------------------------------------------------------------- inputs ---
 
@@ -482,13 +527,14 @@ generate_rules() {
   fi
 }
 
-rules_out="$SCRIPT_DIR/rules/personal-AGENTS.generated.md"
+rules_out="$STATE_DIR/personal-AGENTS.generated.md"
 if [[ -z $PONYTAIL_DIR || ! -f $PONYTAIL_DIR/AGENTS.md ]]; then
   warn "ponytail not found; generated rules contain the context router only (set PONYTAIL_DIR)"
 fi
 if ((DRY_RUN)); then
   info "would write $rules_out"
 else
+  mkdir -p -- "$STATE_DIR"
   tmp="$(mktemp "${rules_out}.XXXXXX")"
   generate_rules > "$tmp"
   chmod 0644 "$tmp"
@@ -505,4 +551,6 @@ info "  1. Set the built-in Scout, Worker, and Reviewer models in Settings > Sub
 info "     to match the roster, then confirm every custom profile loaded without errors."
 info "  2. Settings > Rules > Personal AGENTS.md: add the contents of"
 info "     $rules_out"
-info "     (replace any earlier DELTA_CONTEXT_ROUTER and PONYTAIL blocks)."
+info "     (replace any earlier DELTA_CONTEXT_ROUTER and PONYTAIL blocks),"
+info "     then remove the file with install.sh --clean."
+}
