@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Install the Delta orchestration bundle: custom subagent profiles, the
-# /orchestrate skill, and a roster generated for this machine's accounts.
+# /orchestrate, /adversarial, and /isolated skills, and a roster generated for
+# this machine's accounts (one copy in each skill).
 # Also generates personal-AGENTS.generated.md (context router plus Ponytail)
 # in $XDG_STATE_HOME/zetta-delta (default ~/.local/state/zetta-delta) for
 # pasting into Settings > Rules > Personal AGENTS.md; --clean removes it.
@@ -372,11 +373,18 @@ if [[ -n $skipped ]]; then
   done
 fi
 
-# ------------------------------------------------------------------ skill --
+# ----------------------------------------------------------------- skills --
+# Each skill is self-contained under $SKILL_ROOT, with its own copy of the
+# roster below. install_file renders {{SKILL_DIR}} from SKILL_DIR.
 
+readonly SKILLS="orchestrate adversarial isolated"
 install_file "$SCRIPT_DIR/skills/orchestrate/SKILL.md" "$SKILL_DIR/SKILL.md"
 install_file "$SCRIPT_DIR/skills/orchestrate/references/best-of-n.md" \
              "$SKILL_DIR/references/best-of-n.md" render
+install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
+install_file "$SCRIPT_DIR/skills/adversarial/SKILL.md" "$SKILL_ROOT/adversarial/SKILL.md"
+SKILL_DIR="$SKILL_ROOT/isolated"
+install_file "$SCRIPT_DIR/skills/isolated/SKILL.md" "$SKILL_DIR/SKILL.md" render
 install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
 
 # ----------------------------------------------------------------- roster --
@@ -449,7 +457,7 @@ generate_roster() {
     if installed "$name" && [[ $roles == *reviewer* ]]; then printf '%s. %s: %s\n' "$o" "$name" "$family"; o=$((o+1)); fi
   done
   printf '\n## Best-of-N candidates (flat lanes)\n\n'
-  printf 'Spawn each with no model override and the BEST-OF-N CANDIDATE block from references/best-of-n.md.\n\n'
+  printf 'Spawn each with no model override; the skill names the block to send.\n\n'
   printf '| Spawn as | Model | Lane | Family |\n|---|---|---|---|\n'
   printf '| Worker (built-in) | %s | %s | %s |\n' "$BUILTIN_WORKER_MODEL" "$BUILTIN_WORKER_LANE" "$BUILTIN_WORKER_FAMILY"
   printf '| Reviewer (built-in) | %s | %s | %s |\n' "$BUILTIN_REVIEWER_MODEL" "$BUILTIN_REVIEWER_LANE" "$BUILTIN_REVIEWER_FAMILY"
@@ -462,18 +470,24 @@ generate_roster() {
   return 0
 }
 
-roster_dest="$SKILL_DIR/references/roster.md"
-if [[ -e $roster_dest && $FORCE -ne 1 ]]; then die "$roster_dest exists; rerun with --force to overwrite"; fi
-if ((DRY_RUN)); then
-  info "would write $roster_dest:"
-  generate_roster | sed 's/^/  | /'
-else
+roster="$(generate_roster)" # generated once, so every skill's copy is identical
+for skill in $SKILLS; do
+  roster_dest="$SKILL_ROOT/$skill/references/roster.md"
+  if [[ -e $roster_dest && $FORCE -ne 1 ]]; then die "$roster_dest exists; rerun with --force to overwrite"; fi
+done
+for skill in $SKILLS; do
+  roster_dest="$SKILL_ROOT/$skill/references/roster.md"
+  if ((DRY_RUN)); then info "would write $roster_dest"; continue; fi
   mkdir -p -- "$(dirname -- "$roster_dest")"
   tmp="$(mktemp "${roster_dest}.XXXXXX")"
-  generate_roster > "$tmp"
+  printf '%s\n' "$roster" > "$tmp"
   chmod 0644 "$tmp"
   mv -f -- "$tmp" "$roster_dest"
   info "wrote $roster_dest"
+done
+if ((DRY_RUN)); then
+  info "roster:"
+  printf '%s\n' "$roster" | sed 's/^/  | /'
 fi
 
 # ------------------------------------------------------------------ rules --

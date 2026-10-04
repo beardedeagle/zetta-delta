@@ -1,6 +1,6 @@
 #!/bin/sh
-# Best-of-N plumbing for the orchestrate skill. Delta runs every command in a
-# fresh shell, so each subcommand takes what it needs as arguments.
+# Best-of-N plumbing for the orchestrate and isolated skills. Delta runs every
+# command in a fresh shell, so each subcommand takes what it needs as arguments.
 #
 #   bon.sh snapshot               parent: pin this checkout; prints RUN and TREE
 #   bon.sh begin  RUN SLUG TREE   candidate: confirm this copy matches the snapshot

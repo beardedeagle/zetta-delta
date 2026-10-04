@@ -62,6 +62,16 @@ check "piped install: fetched the pinned commit" "$(fetched)" "https://github.co
 check "piped install: profiles" "$(cd "$T/delta/profiles" && printf '%s ' *)" "deepseek-pro.toml qwen-max.toml scout-deepseek.toml scout-qwen.toml "
 check "piped install: skill" "$(cd "$T/home/.agents/skills/orchestrate" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
   "./SKILL.md ./references/best-of-n.md ./references/roster.md ./scripts/bon.sh "
+check "piped install: adversarial skill" "$(cd "$T/home/.agents/skills/adversarial" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
+  "./SKILL.md ./references/roster.md "
+check "piped install: isolated skill" "$(cd "$T/home/.agents/skills/isolated" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
+  "./SKILL.md ./references/roster.md ./scripts/bon.sh "
+check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/.agents/skills" \
+  && cmp -s orchestrate/references/roster.md adversarial/references/roster.md \
+  && cmp -s orchestrate/references/roster.md isolated/references/roster.md \
+  && cmp -s orchestrate/scripts/bon.sh isolated/scripts/bon.sh && echo same)" "same"
+has "piped install: isolated runs its own bon.sh" "$(cat "$T/home/.agents/skills/isolated/SKILL.md")" \
+  "sh $T/home/.agents/skills/isolated/scripts/bon.sh snapshot"
 check "piped install: rules in the state folder" \
   "$(head -1 "$T/home/.local/state/zetta-delta/personal-AGENTS.generated.md")" "<!-- DELTA_CONTEXT_ROUTER_START v1 -->"
 check "piped install: temporary copy removed" "$(ls -A "$T/tmp")" ""
