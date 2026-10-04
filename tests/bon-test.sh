@@ -53,7 +53,7 @@ mkdir -p build && printf 'ignored change\n' > build/y
 mkdir -p "$T/expect" && files | while IFS= read -r f; do mkdir -p "$T/expect/$(dirname "$f")"; cp -p "$f" "$T/expect/$f"; done
 
 r=$(delta "$T/copy" "$(bon export "$RUN" kimi "$TREE")")
-check "export" "$(printf %s "$r" | sed 's/saved to .*;/saved;/')" "RESULT: ok: patch saved; copy restored to the snapshot"
+check "export" "$(printf %s "$r" | sed 's/saved to [^;]*;/saved;/')" "RESULT: ok: patch saved; copy restored to the snapshot; working content and index entries verified"
 check "copy back at snapshot" "$(snap "$T/copy")" "$TREE"
 check "copy has no new files" "$(cd "$T/copy" && printf '%s ' *)" "a.txt bin.dat build keep.txt tool.sh u.txt "
 
@@ -122,3 +122,4 @@ for f in "${TMPDIR:-/tmp}"/bon-index.*; do if [ -e "$f" ]; then left=$((left + 1
 check "no temp index files left" "$left" "0"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "SOME FAILED"
+exit "$fail"

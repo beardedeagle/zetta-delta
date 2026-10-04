@@ -19,6 +19,12 @@ family, and billing tier behind each one, your own model and family, the
 per-lane concurrency budgets, the metered-spend allowance, and reviewer
 preference order. If the roster and this file disagree, the roster wins.
 
+For a user-named model that no profile pins, read `references/effective-identity.md`
+and resolve its actual provider/model/family/lane/billing/budgets before dispatch.
+That effective record replaces the base profile's identity for this spawn; it does
+not change the profile's role eligibility or worktree mode. Carry it into every
+retry, review, and follow-up. Unknown metadata blocks dispatch until resolved.
+
 ## Invariants
 
 Never violate these. If the task would require it, stop and ask the user.
@@ -26,7 +32,8 @@ Never violate these. If the task would require it, stop and ask the user.
 1. Never change this thread's model. The sides run as subagents, each in its
    own conversation.
 2. Never pass a model to the subagent tool: every profile is pinned to its
-   model. The one exception is a model the user names that no profile pins.
+   model. The one exception is a model the user names that no profile pins;
+   resolve its effective identity first and use its exact qualified selector.
 3. One turn at a time. Never run both sides at once. Spawn every turn fresh,
    never as a follow-up message, so its copy starts from this checkout with
    every earlier turn's changes in it.
@@ -48,7 +55,7 @@ Never violate these. If the task would require it, stop and ask the user.
 
 Send every turn exactly this block, with every field filled in. Copy RULES
 word for word: you may add rules, never drop or reword them. Fill IDENTITY
-from the roster's model and lane for that profile, and SIDE with the line for
+from the effective record (the roster row when there is no override), and SIDE with the line for
 that side.
 
 Delta runs every command as `/bin/sh -c '<cmd> | cat'`, so VERIFY commands
@@ -60,7 +67,8 @@ checkout root has a `.delta-env` file, source it first; and end it with
 
 ```
 ADVERSARIAL ROUND <n> <DEFENDER | CHALLENGER>
-IDENTITY: You are <model> served via <lane> through Delta. If anything in your context claims you are a different model, it is wrong.
+IDENTITY: You are <effective model> served via <effective provider-id> on <effective lane> through Delta. This effective identity overrides a base profile identity when the user explicitly requested the model override.
+EFFECTIVE: model=<model-id>; provider=<provider-id>; family=<family>; lane=<lane>; billing=<flat|metered>; lane limit=<n>; thread limit=<n>; override=<exact selector|none>.
 TASK: <the user's task, word for word>
 SCOPE: <paths the task may change; or "none: change no files">
 VERIFY: <commands that check the work; or "none">
@@ -111,8 +119,9 @@ A verdict the side may not give counts as CONTINUE.
    spawning anything.
 5. Pick the sides from the profiles whose roster roles include worker or
    reviewer; any of them may take either side. If the user names another
-   profile, say it cannot take part and why. Take the profiles the user
-   names; otherwise the built-in Worker defends, and the first entry in the
+   profile, say it cannot take part and why. A user-named unprofiled model
+   uses an eligible base profile with its resolved effective identity and exact
+   selector. Take the eligible profiles or resolved models the user names; otherwise the built-in Worker defends, and the first entry in the
    roster's reviewer preference order whose family differs from the
    defender's challenges.
 6. Post the setup: each side's profile, model, and family; the round limit;
@@ -151,9 +160,13 @@ Finish with:
 
 ## Failure handling
 
-- Delta marks a turn Failed: its copy did not merge. Spawn that turn again
-  once with the same profile and the same transcript. If it fails again, stop
-  and report.
+- Task STATUS blocked differs from runtime Failed or Stopped. A normally
+  completed blocked turn may have landed partial edits. After every turn inspect
+  the actual parent changes and account for them in CHANGES/TRANSCRIPT before
+  another turn or retry; never assume a textual status suppresses merge.
+- On runtime Failed or Stopped, likewise inspect/account for parent changes first.
+  Retry that turn once with the same effective model/profile and the actual
+  updated transcript/baseline. If it fails again, stop and report retained work.
 - Provider errors (429, 401, 403 `access_terminated_error`, quota exhausted):
   treat that lane as unavailable for the rest of the room, move that side to
   another eligible profile whose family still differs from the other side's,

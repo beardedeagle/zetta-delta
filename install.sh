@@ -35,6 +35,10 @@
 #   METERED_LANES="DeepSeek API, OpenCode Zen"
 #   ORCHESTRATOR_MODEL=k3  ORCHESTRATOR_LANE="Kimi Code"  ORCHESTRATOR_FAMILY=Kimi
 #   BUILTIN_{SCOUT,WORKER,REVIEWER}_{MODEL,LANE,FAMILY}  (see README)
+#   BUILTIN_{SCOUT,WORKER,REVIEWER}_{PROVIDER,BILLING,LIMIT}
+#     Known lanes infer their provider, billing, and shared limit. API/custom
+#     lanes need an explicit provider id and limit; unknown lanes also need
+#     billing=flat|metered. Roles sharing a lane must agree on billing/limit.
 #   DELTA_CONFIG_DIR     overrides Delta's config directory (same as Delta)
 #   PONYTAIL_DIR         ponytail plugin version dir (default: newest under
 #                        ~/.codex/plugins/cache/ponytail/ponytail/)
@@ -74,6 +78,13 @@ while (($#)); do
   esac
   shift
 done
+
+# Rendered helper commands need one absolute shell argument. Line breaks cannot
+# be represented by the line-oriented templates; reject them before any writes.
+if ((!CLEAN && !HELP)); then
+  [[ $SKILL_ROOT != *$'\n'* && $SKILL_ROOT != *$'\r'* ]] || die "--skill-dir must not contain line breaks"
+  [[ ! $SKILL_ROOT =~ \{\{[A-Z_]*\}\} ]] || die "--skill-dir must not contain template placeholder syntax"
+fi
 
 # Earlier versions left the rules here for pasting into Delta; --clean removes
 # that file and keeps the backups.
@@ -204,6 +215,106 @@ for v in GPT_PROVIDER GROK_PROVIDER COPILOT_PROVIDER; do
 done
 if [[ -n $LOCAL_PROVIDER ]]; then check LOCAL_PROVIDER "$LOCAL_PROVIDER" "$id_re" "id"; check LOCAL_MODEL "$LOCAL_MODEL" "$model_re" "model id"; fi
 
+
+# All profiles sharing a provider or lane use one billing classification and
+# one concurrency budget. Built-in overrides must supply missing metadata.
+LANES=()             # lane|billing|limit|basis
+PROVIDER_LANES=()    # provider id|lane
+metered_contains() {
+  local part
+  local -a parts
+  IFS=',' read -r -a parts <<<"$METERED_LANES"
+  for part in "${parts[@]}"; do
+    part="${part#"${part%%[![:space:]]*}"}"
+    part="${part%"${part##*[![:space:]]}"}"
+    [[ $part != "$1" ]] || return 0
+  done
+  return 1
+}
+known_lane() { # lane -> provider|billing|limit|basis (empty fields need explicit input)
+  case $1 in
+    "Kimi Code") printf '%s|flat|%s|Request window, not concurrency, is the constraint\n' "$KIMI_PROVIDER" "$KIMI_LIMIT" ;;
+    "Z.AI Coding Plan") printf '%s|flat|%s|Tier %s; concurrency is dynamic and higher off-peak\n' "$ZAI_PROVIDER" "$ZAI_LIMIT" "$ZAI_TIER" ;;
+    "Qwen Token Plan") printf '%s|flat|%s|Tier %s concurrent-agent allowance\n' "$QWEN_PROVIDER" "$QWEN_LIMIT" "$QWEN_TIER" ;;
+    "MiniMax") printf '%s|%s|%s|Billing: %s\n' "$MINIMAX_PROVIDER" "$MINIMAX_TIER" "$MINIMAX_LIMIT" "$MINIMAX_BILLING" ;;
+    "ChatGPT subscription") printf '%s|flat|2|Unpublished limits\n' "${GPT_PROVIDER:-openai-subscribed}" ;;
+    "Grok subscription") printf '%s|flat|1|Unpublished limits; keep low\n' "${GROK_PROVIDER:-x_ai-subscribed}" ;;
+    "GitHub Copilot") printf '%s|flat|1|Premium-request allowance; keep low\n' "$COPILOT_PROVIDER" ;;
+    "Local inference") printf '%s|flat|%s|Throughput of the local server\n' "$LOCAL_PROVIDER" "$LOCAL_LIMIT" ;;
+    "DeepSeek API"|"OpenCode Zen") printf '|metered||Explicit API concurrency limit\n' ;;
+    *) return 1 ;;
+  esac
+}
+register_lane() { # lane billing limit basis
+  local entry name billing limit
+  if [[ $2 == flat ]] && metered_contains "$1"; then die "lane '$1' is flat but METERED_LANES declares it metered"; fi
+  for entry in ${LANES[@]+"${LANES[@]}"}; do
+    IFS='|' read -r name billing limit _ <<<"$entry"
+    if [[ $name == "$1" ]]; then
+      [[ $billing == "$2" && $limit == "$3" ]] || die "lane '$1' has conflicting billing or limits; all profiles on a lane must agree"
+      return
+    fi
+  done
+  LANES+=("$1|$2|$3|$4")
+}
+register_provider() { # provider id lane
+  local entry provider lane
+  check provider "$1" "$id_re" "Delta provider id"
+  for entry in ${PROVIDER_LANES[@]+"${PROVIDER_LANES[@]}"}; do
+    IFS='|' read -r provider lane <<<"$entry"
+    if [[ $provider == "$1" ]]; then
+      [[ $lane == "$2" ]] || die "provider '$1' is assigned to both '$lane' and '$2'; use one shared lane"
+      return
+    fi
+  done
+  PROVIDER_LANES+=("$1|$2")
+}
+add_known_lane() {
+  local metadata provider billing limit basis
+  metadata="$(known_lane "$1")"
+  IFS='|' read -r provider billing limit basis <<<"$metadata"
+  register_lane "$1" "$billing" "$limit" "$basis"
+  register_provider "$provider" "$1"
+}
+for lane in "Kimi Code" "Z.AI Coding Plan" "Qwen Token Plan"; do add_known_lane "$lane"; done
+[[ -z $MINIMAX_PROVIDER ]] || add_known_lane "MiniMax"
+[[ -z $GPT_PROVIDER ]] || add_known_lane "ChatGPT subscription"
+[[ -z $GROK_PROVIDER ]] || add_known_lane "Grok subscription"
+[[ -z $COPILOT_PROVIDER ]] || add_known_lane "GitHub Copilot"
+[[ -z $LOCAL_PROVIDER ]] || add_known_lane "Local inference"
+
+resolve_builtin() {
+  local prefix="BUILTIN_$1" lane_key provider_key billing_key limit_key
+  local lane provider billing limit metadata known_provider known_billing known_limit basis
+  lane_key="${prefix}_LANE"; provider_key="${prefix}_PROVIDER"
+  billing_key="${prefix}_BILLING"; limit_key="${prefix}_LIMIT"
+  lane="${!lane_key}"; provider="${!provider_key:-}"
+  billing="${!billing_key:-}"; limit="${!limit_key:-}"
+  if metadata="$(known_lane "$lane")"; then
+    IFS='|' read -r known_provider known_billing known_limit basis <<<"$metadata"
+    [[ -z $billing || $billing == "$known_billing" ]] || die "$billing_key conflicts with known billing for '$lane' ($known_billing)"
+    billing="$known_billing"
+    if [[ -n $known_limit ]]; then
+      [[ -z $limit || $limit == "$known_limit" ]] || die "$limit_key conflicts with the shared limit for '$lane' ($known_limit); update the lane's setting instead"
+      limit="$known_limit"
+    fi
+    provider="${provider:-$known_provider}"
+  else
+    basis="Explicit built-in override budget"
+    [[ -n $billing ]] || die "unknown $lane_key='$lane'; set $billing_key=flat|metered, $provider_key and $limit_key"
+  fi
+  [[ -n $provider ]] || die "$lane_key='$lane' needs $provider_key set to its actual Delta provider id"
+  [[ -n $limit ]] || die "$lane_key='$lane' needs an explicit positive $limit_key"
+  case "$billing" in flat|metered) ;; *) die "$billing_key must be flat or metered" ;; esac
+  check "$limit_key" "$limit" "$int_re" "positive integer"
+  register_lane "$lane" "$billing" "$limit" "$basis"
+  register_provider "$provider" "$lane"
+  printf -v "$provider_key" '%s' "$provider"
+  printf -v "$billing_key" '%s' "$billing"
+  printf -v "$limit_key" '%s' "$limit"
+}
+for role in SCOUT WORKER REVIEWER; do resolve_builtin "$role"; done
+
 # ---------------------------------------------------------------- paths ----
 
 delta_config_dir() {
@@ -216,7 +327,36 @@ delta_config_dir() {
     *)                    die "unsupported OS; set DELTA_CONFIG_DIR" ;;
   esac
 }
-CONFIG_DIR="$(delta_config_dir)"
+# Resolve installation roots component by component before .. so a symlinked
+# parent keeps its filesystem meaning. Destinations below them are never resolved:
+# dangling profile/rule links remain entries for preflight and link backups.
+canonical_dir() {
+  local path="$1" label="$2" resolved="" rest part candidate
+  if [[ $path =~ ^[A-Za-z]:[\\/] || $path == \\\\* ]]; then
+    command -v cygpath >/dev/null 2>&1 || die "Windows $label paths need cygpath; use an absolute POSIX path"
+    path="$(cygpath -u -- "$path")" || die "could not convert $label directory"
+  fi
+  [[ $path == /* ]] || path="$PWD/$path"
+  [[ $path != //* ]] || resolved=/
+  rest="$path"
+  while [[ -n $rest ]]; do
+    rest="${rest#/}"; part="${rest%%/*}"
+    if [[ $rest == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    case $part in
+      ""|.) ;;
+      ..) resolved="${resolved%/*}" ;;
+      *)
+        candidate="$resolved/$part"
+        if [[ -d $candidate ]]; then resolved="$(cd -- "$candidate" && pwd -P)"
+        elif [[ -e $candidate || -L $candidate ]]; then die "$label path component is not a directory: $candidate"
+        else resolved="$candidate"
+        fi ;;
+    esac
+  done
+  printf '%s\n' "${resolved:-/}"
+}
+CONFIG_DIR="$(canonical_dir "$(delta_config_dir)" "Delta config")"
+SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"
 PROFILES_DIR="$CONFIG_DIR/profiles"
 [[ -f $CONFIG_DIR/settings.json ]] \
   || warn "no settings.json in $CONFIG_DIR; is that Delta's config directory?"
@@ -233,14 +373,28 @@ backup() { # DEST: save DEST under BACKUP_DIR before it changes
   local saved="$BACKUP_DIR/${1#/}"
   [[ -d $BACKUP_DIR ]] || info "saving the files this install changes under $BACKUP_DIR"
   mkdir -p -- "$(dirname -- "$saved")"
-  cp -p -- "$1" "$saved"
+  cp -Pp -- "$1" "$saved"
 }
 
 commit_file() { # TMP DEST: move a finished TMP into place, saving the DEST it changes
   chmod 0644 "$1"
-  if [[ -e $2 ]] && ! cmp -s -- "$1" "$2"; then backup "$2"; fi
+  if [[ -L $2 ]] || { [[ -e $2 ]] && ! cmp -s -- "$1" "$2"; }; then backup "$2"; fi
   mv -f -- "$1" "$2"
   info "wrote $2"
+}
+
+# Escape the two separate languages: literal replacement text for sed, and
+# complete POSIX shell arguments for commands embedded in the skill templates.
+sed_literal() { printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }
+shell_argument() {
+  local rest="$1" head
+  printf "'"
+  while [[ $rest == *"'"* ]]; do
+    head="${rest%%\'*}"
+    printf '%s' "$head" "'\\''"
+    rest="${rest#*\'}"
+  done
+  printf "%s'" "$rest"
 }
 
 # install_file SRC DEST [render [SED_EXPR...]]: copy, optionally substituting placeholders.
@@ -257,7 +411,11 @@ install_file() {
         -e "s|{{QWEN}}|$QWEN_PROVIDER|g"       -e "s|{{MINIMAX}}|$MINIMAX_PROVIDER|g" \
         -e "s|{{GPT}}|$GPT_PROVIDER|g"         -e "s|{{GROK}}|$GROK_PROVIDER|g" \
         -e "s|{{COPILOT}}|$COPILOT_PROVIDER|g" -e "s|{{LOCAL}}|$LOCAL_PROVIDER|g" \
-        -e "s|{{LOCAL_MODEL}}|$LOCAL_MODEL|g"  -e "s|{{SKILL_DIR}}|$SKILL_DIR|g" \
+        -e "s|{{LOCAL_MODEL}}|$LOCAL_MODEL|g" \
+        -e "s|{{SKILL_DIR}}|$(sed_literal "$SKILL_DIR")|g" \
+        -e "s|{{BON_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/bon.sh")")|g" \
+        -e "s|{{IDENTITY_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/identity.py")")|g" \
+        -e "s|{{IDENTITY_REGISTRY}}|$(sed_literal "$(shell_argument "$SKILL_DIR/references/identity-registry.json")")|g" \
         "$@" -- "$src" > "$tmp"
     if grep -q '{{[A-Z_]*}}' "$tmp"; then rm -f -- "$tmp"; die "unrendered placeholder in $src"; fi
   else
@@ -298,6 +456,7 @@ readonly LEGACY_PROFILES
 order=""
 for p in $PROFILE_PRIORITY; do
   [[ " $PRIORITY " == *" $p "* ]] || die "PROFILE_PRIORITY: unknown profile '$p' (known: $PRIORITY)"
+  [[ " $order " != *" $p "* ]] || die "PROFILE_PRIORITY: duplicate profile '$p'"
   order+=" $p"
 done
 for p in $PRIORITY; do
@@ -322,9 +481,9 @@ fi
 if [[ -n $GROK_PROVIDER ]]; then
   MODELS+=("grok|$GROK_PROVIDER|grok-4.7|Grok subscription|xAI|flat|xhigh|worker, reviewer, candidate|Extra implementer and reviewer family")
 fi
-# A metered MiniMax lane gets no candidate role: candidates run on flat lanes only.
+# Metered candidates require explicit user naming and the skill's spending gate.
 if [[ -n $MINIMAX_PROVIDER ]]; then
-  roles="worker"
+  roles="worker, candidate (explicit metered opt-in only)"
   if [[ $MINIMAX_TIER == flat ]]; then roles="worker, candidate"; fi
   MODELS+=("minimax|$MINIMAX_PROVIDER|MiniMax-M3|MiniMax|MiniMax|$MINIMAX_TIER||$roles|Well-specified, self-contained units; UI work that benefits from screenshots; check the roster's billing first")
 fi
@@ -363,9 +522,9 @@ install_profile() { # $1=profile name: a scout template, or a MODELS entry
 # --prune-legacy, superseded ones are retired before anything is written.
 others="" n_others=0 legacy=""
 for f in "$PROFILES_DIR"/*.toml; do
-  [[ -e $f ]] || continue
+  [[ -e $f || -L $f ]] || continue
   n="$(basename -- "$f" .toml)"
-  if [[ $BUILTIN_PROFILES == *" $n "* ]] || configured "$n"; then continue; fi
+  if [[ $BUILTIN_PROFILES == *" $n "* || " $PRIORITY " == *" $n "* ]]; then continue; fi
   if [[ $LEGACY_PROFILES == *" $n "* ]]; then
     if ((PRUNE_LEGACY)); then continue; fi  # retired below (or would be, in a dry run)
     legacy+=" $n"
@@ -373,6 +532,8 @@ for f in "$PROFILES_DIR"/*.toml; do
   others+=" $n"
   n_others=$((n_others + 1))
 done
+
+((n_others <= CUSTOM_SLOTS)) || die "$n_others unmanaged custom profiles exceed Delta's $CUSTOM_SLOTS slots; retire some before installing"
 
 INSTALLED=" " n_installed=0 skipped=""
 for p in $order; do
@@ -395,22 +556,92 @@ if [[ -n $legacy ]]; then
 fi
 if [[ -n $skipped ]]; then
   warn "Delta offers only $CUSTOM_SLOTS custom profiles and $n_others other profiles take slots${others:+ (${others# })}; not installed:$skipped. Free slots, or reorder with PROFILE_PRIORITY"
-  for p in $skipped; do
-    if [[ -e $PROFILES_DIR/$p.toml ]]; then
-      warn "$p.toml from an earlier install is still there; delete it, or Delta drops another profile in its place"
-    fi
+fi
+
+# The final active directory determines Delta's offered set. Retire earlier
+# managed selections that no longer belong to this install, preserving contents
+# under .retired and backing up entries before a forced update.
+RETIRE=()
+for p in $PRIORITY; do
+  f="$PROFILES_DIR/$p.toml"
+  if [[ $INSTALLED != *" $p "* && ( -e $f || -L $f ) ]]; then RETIRE+=("$f"); fi
+done
+if ((PRUNE_LEGACY)); then
+  for p in $LEGACY_PROFILES; do
+    f="$PROFILES_DIR/$p.toml"
+    [[ ! -e $f && ! -L $f ]] || RETIRE+=("$f")
   done
 fi
 
 # ----------------------------------------------------------------- roster --
 
 metered_list="$METERED_LANES"
-[[ -n $MINIMAX_PROVIDER && $MINIMAX_TIER == metered ]] && metered_list="$metered_list, MiniMax"
+for entry in ${LANES[@]+"${LANES[@]}"}; do
+  IFS='|' read -r lane billing _ _ <<<"$entry"
+  if [[ $billing == metered ]] && ! metered_contains "$lane"; then metered_list="$metered_list, $lane"; fi
+done
+
+BUILTIN_WORKER_ROLES="worker, candidate"
+BUILTIN_REVIEWER_ROLES="reviewer, candidate"
+[[ $BUILTIN_WORKER_BILLING != metered ]] || BUILTIN_WORKER_ROLES="worker, candidate (explicit metered opt-in only)"
+[[ $BUILTIN_REVIEWER_BILLING != metered ]] || BUILTIN_REVIEWER_ROLES="reviewer, candidate (explicit metered opt-in only)"
+
+MODEL_FAMILIES=() # exact provider id|model id|family bindings
+register_model() { # provider id model id family
+  local entry provider model family
+  for entry in ${MODEL_FAMILIES[@]+"${MODEL_FAMILIES[@]}"}; do
+    IFS='|' read -r provider model family <<<"$entry"
+    if [[ $provider == "$1" && $model == "$2" ]]; then
+      [[ $family == "$3" ]] || die "provider/model '$1/$2' has conflicting families '$family' and '$3'; set consistent metadata"
+      return
+    fi
+  done
+  MODEL_FAMILIES+=("$1|$2|$3")
+}
+register_model "$BUILTIN_SCOUT_PROVIDER" "$BUILTIN_SCOUT_MODEL" "$BUILTIN_SCOUT_FAMILY"
+register_model "$BUILTIN_WORKER_PROVIDER" "$BUILTIN_WORKER_MODEL" "$BUILTIN_WORKER_FAMILY"
+register_model "$BUILTIN_REVIEWER_PROVIDER" "$BUILTIN_REVIEWER_MODEL" "$BUILTIN_REVIEWER_FAMILY"
+register_model "$QWEN_PROVIDER" qwen3.8-flash Qwen
+register_model "$QWEN_PROVIDER" deepseek-v4.1-flash DeepSeek
+[[ -z $COPILOT_PROVIDER ]] || register_model "$COPILOT_PROVIDER" gemini-3.8-flash Gemini
+[[ -z $LOCAL_PROVIDER ]] || register_model "$LOCAL_PROVIDER" "$LOCAL_MODEL" "$LOCAL_FAMILY"
+for entry in "${MODELS[@]}"; do
+  IFS='|' read -r _ provider model _ family _ _ _ _ <<<"$entry"
+  register_model "$provider" "$model" "$family"
+done
+
+lane_metadata() {
+  local entry name
+  for entry in ${LANES[@]+"${LANES[@]}"}; do
+    name="${entry%%|*}"
+    if [[ $name == "$1" ]]; then printf '%s\n' "$entry"; return; fi
+  done
+  return 1
+}
+generate_identity_registry() {
+  local entry provider lane billing limit model family metadata comma=""
+  printf '{"version":1,"thread_limit":%s,"metered_max_spawns":%s,"providers":[' "$THREAD_CAP" "$METERED_MAX_SPAWNS"
+  for entry in ${PROVIDER_LANES[@]+"${PROVIDER_LANES[@]}"}; do
+    IFS='|' read -r provider lane <<<"$entry"
+    metadata="$(lane_metadata "$lane")"
+    IFS='|' read -r _ billing limit _ <<<"$metadata"
+    printf '%s{"provider_id":"%s","lane":"%s","billing":"%s","limit":%s}' "$comma" "$provider" "$lane" "$billing" "$limit"
+    comma=,
+  done
+  printf '],"models":['; comma=""
+  for entry in ${MODEL_FAMILIES[@]+"${MODEL_FAMILIES[@]}"}; do
+    IFS='|' read -r provider model family <<<"$entry"
+    printf '%s{"provider_id":"%s","model_id":"%s","family":"%s"}' "$comma" "$provider" "$model" "$family"
+    comma=,
+  done
+  printf ']}\n'
+}
+identity_registry="$(generate_identity_registry)"
 
 installed() { [[ $INSTALLED == *" $1 "* ]]; }
 
 generate_roster() {
-  local o m name model lane family billing roles use
+  local o m name provider model lane family billing roles use entry limit basis metadata
   printf '# Roster\n\nGenerated by install.sh on %s. Authoritative for this machine.\n' "$(date -u +%Y-%m-%dT%H:%MZ)"
   printf 'Regenerate with install.sh --force after changing plans or built-in models.\n\n'
 
@@ -421,42 +652,48 @@ generate_roster() {
 
   printf '## Profiles\n\n'
   printf 'A profile takes only the roles listed here; the block you send sets the role, and each skill says which of its blocks each role may take.\n\n'
-  printf '| Spawn as | Model | Lane | Family | Billing | Worktree | Roles | Use for |\n'
-  printf '|---|---|---|---|---|---|---|---|\n'
-  printf '| Scout (built-in) | %s | %s | %s | flat | shared | scout | Default read-only recon |\n' \
-    "$BUILTIN_SCOUT_MODEL" "$BUILTIN_SCOUT_LANE" "$BUILTIN_SCOUT_FAMILY"
-  installed scout-qwen     && printf '| scout-qwen | qwen3.8-flash | Qwen Token Plan | Qwen | flat | shared | scout | Quick recon off the Z.AI lane |\n'
-  installed scout-deepseek && printf '| scout-deepseek | deepseek-v4.1-flash | Qwen Token Plan | DeepSeek | flat | shared | scout | Recon needing more reasoning, off the Z.AI lane |\n'
-  installed scout-gemini   && printf '| scout-gemini | gemini-3.8-flash | GitHub Copilot | Gemini | flat | shared | scout | Recon outside the coding-plan quotas |\n'
-  installed scout-local    && printf '| scout-local | %s | Local inference | %s | flat (no quota) | shared | scout | Bulk or background recon; slower |\n' "$LOCAL_MODEL" "$LOCAL_FAMILY"
-  printf '| Worker (built-in) | %s | %s | %s | flat | isolated | worker, candidate | Default implementer |\n' \
-    "$BUILTIN_WORKER_MODEL" "$BUILTIN_WORKER_LANE" "$BUILTIN_WORKER_FAMILY"
-  printf '| Reviewer (built-in) | %s | %s | %s | flat | isolated | reviewer, candidate | Default reviewer |\n' \
-    "$BUILTIN_REVIEWER_MODEL" "$BUILTIN_REVIEWER_LANE" "$BUILTIN_REVIEWER_FAMILY"
+  printf '| Spawn as | Provider ID | Model | Lane | Family | Billing | Worktree | Roles | Use for |\n'
+  printf '|---|---|---|---|---|---|---|---|---|\n'
+  printf '| Scout (built-in) | %s | %s | %s | %s | %s | shared | scout | Default read-only recon |\n' \
+    "$BUILTIN_SCOUT_PROVIDER" "$BUILTIN_SCOUT_MODEL" "$BUILTIN_SCOUT_LANE" "$BUILTIN_SCOUT_FAMILY" "$BUILTIN_SCOUT_BILLING"
+  installed scout-qwen     && printf '| scout-qwen | %s | qwen3.8-flash | Qwen Token Plan | Qwen | flat | shared | scout | Quick recon off the Z.AI lane |\n' "$QWEN_PROVIDER"
+  installed scout-deepseek && printf '| scout-deepseek | %s | deepseek-v4.1-flash | Qwen Token Plan | DeepSeek | flat | shared | scout | Recon needing more reasoning, off the Z.AI lane |\n' "$QWEN_PROVIDER"
+  installed scout-gemini   && printf '| scout-gemini | %s | gemini-3.8-flash | GitHub Copilot | Gemini | flat | shared | scout | Recon outside the coding-plan quotas |\n' "$COPILOT_PROVIDER"
+  installed scout-local    && printf '| scout-local | %s | %s | Local inference | %s | flat (no quota) | shared | scout | Bulk or background recon; slower |\n' "$LOCAL_PROVIDER" "$LOCAL_MODEL" "$LOCAL_FAMILY"
+  printf '| Worker (built-in) | %s | %s | %s | %s | %s | isolated | %s | Default implementer |\n' \
+    "$BUILTIN_WORKER_PROVIDER" "$BUILTIN_WORKER_MODEL" "$BUILTIN_WORKER_LANE" "$BUILTIN_WORKER_FAMILY" "$BUILTIN_WORKER_BILLING" "$BUILTIN_WORKER_ROLES"
+  printf '| Reviewer (built-in) | %s | %s | %s | %s | %s | isolated | %s | Default reviewer |\n' \
+    "$BUILTIN_REVIEWER_PROVIDER" "$BUILTIN_REVIEWER_MODEL" "$BUILTIN_REVIEWER_LANE" "$BUILTIN_REVIEWER_FAMILY" "$BUILTIN_REVIEWER_BILLING" "$BUILTIN_REVIEWER_ROLES"
   for m in "${MODELS[@]}"; do
-    IFS='|' read -r name _ model lane family billing _ roles use <<<"$m"
+    IFS='|' read -r name provider model lane family billing _ roles use <<<"$m"
     if installed "$name"; then
-      printf '| %s | %s | %s | %s | %s | isolated | %s | %s |\n' "$name" "$model" "$lane" "$family" "$billing" "$roles" "$use"
+      printf '| %s | %s | %s | %s | %s | %s | isolated | %s | %s |\n' "$name" "$provider" "$model" "$lane" "$family" "$billing" "$roles" "$use"
     fi
   done
   printf '\n'
 
   printf '## Budgets (subagents in flight at once, this thread)\n\n'
   printf '| Lane | Limit | Basis |\n|---|---|---|\n'
-  printf '| Kimi Code | %s | Request window, not concurrency, is the constraint |\n' "$KIMI_LIMIT"
-  printf '| Z.AI Coding Plan | %s | Tier %s; concurrency is dynamic and higher off-peak |\n' "$ZAI_LIMIT" "$ZAI_TIER"
-  printf '| Qwen Token Plan | %s | Tier %s concurrent-agent allowance |\n' "$QWEN_LIMIT" "$QWEN_TIER"
-  [[ -n $MINIMAX_PROVIDER ]] && printf '| MiniMax | %s | Billing: %s |\n' "$MINIMAX_LIMIT" "$MINIMAX_BILLING"
-  [[ -n $GPT_PROVIDER ]]     && printf '| ChatGPT subscription | 2 | Unpublished limits |\n'
-  [[ -n $GROK_PROVIDER ]]    && printf '| Grok subscription | 1 | Unpublished limits; keep low |\n'
-  [[ -n $COPILOT_PROVIDER ]] && printf '| GitHub Copilot | 1 | Premium-request allowance; keep low |\n'
-  [[ -n $LOCAL_PROVIDER ]]   && printf '| Local inference | %s | Throughput of the local server |\n' "$LOCAL_LIMIT"
+  for entry in ${LANES[@]+"${LANES[@]}"}; do
+    IFS='|' read -r lane _ limit basis <<<"$entry"
+    printf '| %s | %s | %s |\n' "$lane" "$limit" "$basis"
+  done
   printf '| **All lanes** | **%s** | Delta Max Agents Per Thread |\n\n' "$THREAD_CAP"
   printf 'Budgets count spawns by the lane they run on, whatever the profile.\n'
   printf 'These budgets are per orchestrator thread. Orchestrator threads do not see each\n'
   printf 'other, so two running at once can together exceed a plan'"'"'s limits. When another\n'
   printf 'orchestrator thread is active, use half of each limit (rounded down, minimum 1)\n'
   printf 'unless a shared admission proxy enforces the limits across threads.\n\n'
+
+  printf '## Provider lanes\n\n'
+  printf '| Provider ID | Lane | Billing | Limit |\n|---|---|---|---|\n'
+  for entry in ${PROVIDER_LANES[@]+"${PROVIDER_LANES[@]}"}; do
+    IFS='|' read -r provider lane <<<"$entry"
+    metadata="$(lane_metadata "$lane")"
+    IFS='|' read -r _ billing limit _ <<<"$metadata"
+    printf '| %s | %s | %s | %s |\n' "$provider" "$lane" "$billing" "$limit"
+  done
+  printf '\nExact configured model-family bindings and provider metadata are also in identity-registry.json; use effective-identity.md for an actual model override.\n\n'
 
   printf '## Metered lanes\n\n'
   printf 'Metered: %s. Allowance: %s metered spawns per run, under SKILL.md invariant 7.\n' \
@@ -472,13 +709,13 @@ generate_roster() {
     if installed "$name" && [[ $roles == *reviewer* ]]; then printf '%s. %s: %s\n' "$o" "$name" "$family"; o=$((o+1)); fi
   done
   printf '\n## Best-of-N candidates (flat lanes)\n\n'
-  printf 'Spawn each with no model override; the skill names the block to send.\n\n'
+  printf '%s\n\n' "Pinned candidates use no model override; user-named unprofiled overrides follow effective-identity.md and the skill's candidate block."
   printf '| Spawn as | Model | Lane | Family |\n|---|---|---|---|\n'
-  printf '| Worker (built-in) | %s | %s | %s |\n' "$BUILTIN_WORKER_MODEL" "$BUILTIN_WORKER_LANE" "$BUILTIN_WORKER_FAMILY"
-  printf '| Reviewer (built-in) | %s | %s | %s |\n' "$BUILTIN_REVIEWER_MODEL" "$BUILTIN_REVIEWER_LANE" "$BUILTIN_REVIEWER_FAMILY"
+  [[ $BUILTIN_WORKER_BILLING != flat ]] || printf '| Worker (built-in) | %s | %s | %s |\n' "$BUILTIN_WORKER_MODEL" "$BUILTIN_WORKER_LANE" "$BUILTIN_WORKER_FAMILY"
+  [[ $BUILTIN_REVIEWER_BILLING != flat ]] || printf '| Reviewer (built-in) | %s | %s | %s |\n' "$BUILTIN_REVIEWER_MODEL" "$BUILTIN_REVIEWER_LANE" "$BUILTIN_REVIEWER_FAMILY"
   for m in "${MODELS[@]}"; do
-    IFS='|' read -r name _ model lane family _ _ roles _ <<<"$m"
-    if installed "$name" && [[ $roles == *candidate* ]]; then
+    IFS='|' read -r name _ model lane family billing _ roles _ <<<"$m"
+    if installed "$name" && [[ $billing == flat && $roles == *candidate* ]]; then
       printf '| %s | %s | %s | %s |\n' "$name" "$model" "$lane" "$family"
     fi
   done
@@ -561,10 +798,21 @@ readonly rules_blocks
 # A block missing its START or END line would make the rest of the file look
 # like part of it; refuse rather than drop the user's own rules.
 if [[ -f $RULES_FILE ]]; then
-  for b in ${rules_blocks//|/ }; do
-    [[ $(grep -c "^<!-- ${b}_START" "$RULES_FILE") == $(grep -c "^<!-- ${b}_END -->" "$RULES_FILE") ]] \
-      || die "$RULES_FILE has a ${b}_START line without its ${b}_END line, or the reverse; fix that by hand first"
-  done
+  awk '
+    /^<!-- (DELTA_CONTEXT_ROUTER|PONYTAIL)_START/ {
+      name = $0; sub(/^<!-- /, "", name); sub(/_START.*/, "", name)
+      if (active != "") { bad = 1; print "nested or overlapping " name "_START marker" > "/dev/stderr"; exit 1 }
+      active = name; next
+    }
+    /^<!-- (DELTA_CONTEXT_ROUTER|PONYTAIL)_END -->/ {
+      name = $0; sub(/^<!-- /, "", name); sub(/_END.*/, "", name)
+      if (active != name) { bad = 1; print name "_END line without its matching " name "_START line" > "/dev/stderr"; exit 1 }
+      active = ""
+    }
+    END {
+      if (!bad && active != "") { print active "_START line without its " active "_END line" > "/dev/stderr"; exit 1 }
+    }
+  ' "$RULES_FILE" || die "$RULES_FILE has malformed block markers; fix that by hand first"
 fi
 
 personal_rules() { # our blocks, then whatever else RULES_FILE already holds
@@ -587,16 +835,21 @@ readonly SKILLS="orchestrate adversarial isolated"
 write_bundle() {
   local p skill SKILL_DIR="$SKILL_ROOT/orchestrate"
   for p in $INSTALLED; do install_profile "$p"; done
-  install_file "$SCRIPT_DIR/skills/orchestrate/SKILL.md" "$SKILL_DIR/SKILL.md"
+  install_file "$SCRIPT_DIR/skills/orchestrate/SKILL.md" "$SKILL_DIR/SKILL.md" render
   install_file "$SCRIPT_DIR/skills/orchestrate/references/best-of-n.md" \
                "$SKILL_DIR/references/best-of-n.md" render
   install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
-  install_file "$SCRIPT_DIR/skills/adversarial/SKILL.md" "$SKILL_ROOT/adversarial/SKILL.md"
+  SKILL_DIR="$SKILL_ROOT/adversarial"
+  install_file "$SCRIPT_DIR/skills/adversarial/SKILL.md" "$SKILL_DIR/SKILL.md" render
   SKILL_DIR="$SKILL_ROOT/isolated"
   install_file "$SCRIPT_DIR/skills/isolated/SKILL.md" "$SKILL_DIR/SKILL.md" render
   install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
   for skill in $SKILLS; do
-    install_output "$SKILL_ROOT/$skill/references/roster.md" printf '%s\n' "$roster"
+    SKILL_DIR="$SKILL_ROOT/$skill"
+    install_output "$SKILL_DIR/references/roster.md" printf '%s\n' "$roster"
+    install_output "$SKILL_DIR/references/identity-registry.json" printf '%s\n' "$identity_registry"
+    install_file "$SCRIPT_DIR/skills/orchestrate/scripts/identity.py" "$SKILL_DIR/scripts/identity.py"
+    install_file "$SCRIPT_DIR/skills/orchestrate/references/effective-identity.md" "$SKILL_DIR/references/effective-identity.md" render
   done
   install_output "$RULES_FILE" personal_rules
 }
@@ -606,23 +859,20 @@ PLANNING=1
 write_bundle
 PLANNING=0
 existing=""
-for f in "${PLANNED[@]}"; do
-  if [[ -e $f ]]; then existing+=$'\n  '"$f"; fi
+for f in "${PLANNED[@]}" ${RETIRE[@]+"${RETIRE[@]}"}; do
+  if [[ -e $f || -L $f ]]; then existing+=$'\n  '"$f"; fi
 done
 if [[ -n $existing ]] && ((!FORCE)); then
   die "these files exist; rerun with --force to replace them (it saves each one it changes first):$existing"
 fi
 
-if ((PRUNE_LEGACY)); then
-  for old in $LEGACY_PROFILES; do
-    f="$PROFILES_DIR/$old.toml"
-    [[ -e $f ]] || continue
-    if ((DRY_RUN)); then info "would retire $f"; continue; fi
-    if [[ -e $f.retired ]] && ! cmp -s -- "$f" "$f.retired"; then backup "$f.retired"; fi
-    mv -f -- "$f" "$f.retired"
-    info "retired $f -> $f.retired"
-  done
-fi
+for f in ${RETIRE[@]+"${RETIRE[@]}"}; do
+  if ((DRY_RUN)); then info "would retire $f"; continue; fi
+  backup "$f"
+  if [[ -L $f.retired ]] || { [[ -e $f.retired ]] && ! cmp -s -- "$f" "$f.retired"; }; then backup "$f.retired"; fi
+  mv -f -- "$f" "$f.retired"
+  info "retired $f -> $f.retired"
+done
 
 write_bundle
 if ((DRY_RUN)); then

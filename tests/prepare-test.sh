@@ -59,5 +59,34 @@ owners=$(for n in $slots; do cat "$T/slots/$n/owner"; done | sort -u | wc -l | t
 check "concurrent reclaims: each slot names its checkout" "$owners" "12"
 check "no reclaim lock left" "$( [ -e "$T/slots/.reclaim.lock" ] && echo left || echo none)" "none"
 
+# Optional indexing errors must not make a prepared checkout unusable.
+prep_output=$(prep "$T/c1" DELTA_SCRATCH_DIR="$T/no-log-parent")
+prep_status=$?
+check "index log failure leaves prepare successful" "$prep_status" "0"
+check "index log failure still completes prepare" "$(printf '%s\n' "$prep_output" | tail -n 1)" "prepare: $T/c1 -> slot 1"
+
+# Preserve cache paths as literal shell values, including metacharacters.
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/sccache"
+chmod +x "$T/bin/sccache"
+cache_dir="$T/Cache Folder's
+\$(touch '$T/injected')	/end"
+env_shell=${ENV_SHELL:-$(command -v dash || command -v sh)}
+prep "$T/c1" DELTA_PREPARE_INDEXES=0 SCCACHE_DIR="$cache_dir" >/dev/null
+# Variables in this program are expanded by the child POSIX shell.
+# shellcheck disable=SC2016
+sourced=$(env -i HOME="$T/home" PATH="$PATH_ENV" "$env_shell" -e -c '. "$1"; printf "%s|end" "$SCCACHE_DIR"' sh "$T/c1/.delta-env" 2>/dev/null)
+source_status=$?
+check "generated sccache path sources successfully" "$source_status" "0"
+check "generated sccache path stays literal" "$sourced" "$cache_dir|end"
+check "sourcing the cache path executes no substitution" "$( [ -e "$T/injected" ] && echo executed || echo literal)" "literal"
+
+# Even a broken Python launcher must leave the successful prepare result intact.
+printf '#!/bin/sh\nexit 3\n' > "$T/bin/python3"
+chmod +x "$T/bin/python3"
+prep_output=$(prep "$T/c1")
+prep_status=$?
+check "index interpreter failure leaves prepare successful" "$prep_status" "0"
+check "index interpreter failure still completes prepare" "$(printf '%s\n' "$prep_output" | tail -n 1)" "prepare: $T/c1 -> slot 1"
+
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 [ "$fail" = 0 ]

@@ -3,6 +3,7 @@
 Run with: python3 -m unittest (in this folder).
 """
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -28,11 +29,12 @@ class PinAndVerify(unittest.TestCase):
 
     def write_version(self, version):
         (self.package / "package.json").write_text(
-            json.dumps({"name": "@zvec/zvec-grep", "version": version}))
+            json.dumps({"name": "@zvec/zvec-grep", "version": version,
+                        "type": "module", "bin": {"zg": "dist/index.js"}}))
 
-    def guard(self, *args):
+    def guard(self, *args, env=None):
         return subprocess.run([sys.executable, str(self.tools / GUARD.name), *args],
-                              capture_output=True, text=True, check=False)
+                              capture_output=True, text=True, check=False, env=env)
 
     def assert_verdict(self, expected):
         result = self.guard(str(self.package))
@@ -58,6 +60,41 @@ class PinAndVerify(unittest.TestCase):
         self.guard("--pin", str(self.package))
         self.write_version("0.2.2")
         self.assert_verdict(1)
+
+    def test_runtime_package_metadata_drift_is_rejected(self):
+        self.guard("--pin", str(self.package))
+        metadata = json.loads((self.package / "package.json").read_text())
+        metadata["type"] = "commonjs"
+        (self.package / "package.json").write_text(json.dumps(metadata))
+        self.assert_verdict(1)
+
+    def test_added_dist_artifact_is_rejected(self):
+        self.guard("--pin", str(self.package))
+        (self.package / "dist/replacement.js").write_text("export {};\n")
+        self.assert_verdict(1)
+
+    def test_path_executable_must_be_the_pinned_entrypoint(self):
+        entrypoint = self.package / "dist/cli/index.js"
+        entrypoint.parent.mkdir()
+        entrypoint.write_text("export {};\n")
+        metadata = json.loads((self.package / "package.json").read_text())
+        metadata["bin"]["zg"] = "dist/cli/index.js"
+        (self.package / "package.json").write_text(json.dumps(metadata))
+        entrypoint.chmod(0o755)
+        binary = self.tools / "zg"
+        binary.symlink_to(entrypoint)
+        env = dict(os.environ, PATH=str(self.tools))
+        self.guard("--pin", str(self.package))
+        accepted = self.guard(env=env)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        # Redirect to an existing pinned artifact: unchanged artifact hashes
+        # and metadata alone must not authorize another executable.
+        replacement = self.package / "dist/engine/config.js"
+        replacement.chmod(0o755)
+        binary.unlink()
+        binary.symlink_to(replacement)
+        rejected = self.guard(env=env)
+        self.assertEqual(rejected.returncode, 1, rejected.stdout)
 
     def test_pin_refuses_another_package(self):
         (self.package / "package.json").write_text(json.dumps({"name": "other", "version": "1.0.0"}))

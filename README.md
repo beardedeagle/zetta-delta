@@ -88,6 +88,8 @@ way.
 | `skills/orchestrate/SKILL.md` | `~/.agents/skills/orchestrate/` | Always |
 | `skills/orchestrate/references/best-of-n.md` | same `references/` | Always |
 | `skills/orchestrate/scripts/bon.sh` | same `scripts/`, and `~/.agents/skills/isolated/scripts/` | Always; best-of-N snapshot, patch handoff, apply, cleanup |
+| `skills/orchestrate/scripts/identity.py` and `references/effective-identity.md` | each installed skill's `scripts/` and `references/` | Always; resolve effective model overrides from sanitized local metadata |
+| `references/identity-registry.json` | each installed skill's `references/` | Generated provider lanes, billing/budgets, and exact model-family bindings |
 | `skills/adversarial/SKILL.md` | `~/.agents/skills/adversarial/` | Always |
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
@@ -203,7 +205,10 @@ The installer counts every other `.toml` already in the profiles folder,
 installs at most the remaining of 7 custom slots in a fixed priority order
 (`./install.sh --help`; `PROFILE_PRIORITY` puts named profiles first), names
 what it skipped and what takes the slots, and writes only installed profiles
-into the roster.
+into the roster. On `--force`, earlier managed selections that are no longer
+chosen are backed up and retired as `.toml.retired`, so reprioritizing does not
+leave active leftovers above the cap. Without force, required retirements are
+reported and refused before writes. Duplicate priorities are refused.
 
 ## 4. Delta settings
 
@@ -224,7 +229,22 @@ Set these three in Settings > Subagents > Profiles (Delta saves them as
 Left at "Same as Parent" or "Provider Default", they resolve to the thread's
 model, so a Kimi thread's Reviewer would be Kimi reviewing Kimi.
 The built-in models must match the roster; if you choose others, pass the
-`BUILTIN_*` variables to the installer so the roster stays truthful.
+`BUILTIN_*` variables to the installer so the roster stays truthful. Each role
+accepts `MODEL`, `LANE`, `FAMILY`, `PROVIDER`, `BILLING`, and `LIMIT` suffixes
+(for example, `BUILTIN_WORKER_PROVIDER`). Known plan lanes infer provider,
+billing, and the shared lane limit from your account settings. A metered API
+lane needs its actual provider id and a positive limit; an unknown lane needs
+all three explicitly. Conflicting lane metadata is refused before writes.
+Metered built-ins remain available only through the named, explicit metered
+opt-in; they are absent from the default flat candidate table.
+
+For an unprofiled model override, the skills resolve the exact provider/model
+from Delta's available-model metadata and the generated
+`references/identity-registry.json`. The shared identity helper returns the
+effective family, lane, billing, and limits used for dispatch and reviewer
+selection. An unknown family needs verified or explicit user metadata; an
+unknown provider needs configured lane/budget metadata. The selected profile
+is not used as a substitute identity.
 
 **LLM Providers**
 
@@ -262,7 +282,10 @@ Without the file it indexes Git repositories only. State for non-Git folders
 lives in `~/Library/Caches/context-indexes/` (`~/.cache/context-indexes/`
 off macOS), never in the folder. It never starts a
 full build it cannot finish: codegraph above 5,000 files and zg above 4,000
-are skipped with a note. A first zg build runs detached for up to 30 minutes;
+are skipped with a note. Tracked submodule files contribute to the tools that
+traverse them, and edits inside them affect freshness. An empty or incomplete
+zg directory still follows first-build admission and background handling.
+A first zg build runs detached for up to 30 minutes;
 if it times out, the hook removes the partial index it created and stops
 retrying until you build one by hand. Only one first zg build runs at a time
 on the machine (a lock in `~/Library/Caches/context-indexes/`): a checkout
@@ -272,7 +295,11 @@ runs use 2 embedding contexts, not zg's default 8, unless
 `ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` is set. Before each zg build it runs the
 zg guard (section 9) and skips zg when the guard fails.
 Keep vendored clones or bulky folders
-out of an index with a `.gitignore` entry in that root; every tool honors it.
+out of an index with a `.gitignore` entry in that root. Automatic zg builds
+also receive the effective Git local/global exclusions as literal paths,
+including filenames with glob characters, backslashes, or newlines. Tracked
+files retain Git's tracked-file exception; explicit `.ignore` rules and native
+file filters still apply.
 
 Delta clones each checkout from your local repository under
 `<repo>/.delta/`, so checkouts contain only committed files on the branch
@@ -370,7 +397,12 @@ running, say so; the skill halves its budgets.
 In best-of-N, two to four models from different families each attempt the
 same unit in their own copy and hand back a patch through `bon.sh`. The thread
 judges the patches and applies only the winner, which then gets the usual
-review.
+review. Export verifies restoration before a candidate finishes, and repeating
+a completed export preserves its patch. The thread checks the parent's content
+against the pinned tree before selection. A failed task report is distinct
+from a failed runtime turn: partial worker changes are inspected before a
+retry, and a comparison copy that cannot restore remains active for recovery
+or Stop Subagent instead of finishing with dirty changes.
 
 ```mermaid
 flowchart TD
@@ -430,7 +462,8 @@ get the same task in their own copies and never see each other's work. What
 each changes comes back as a patch through `bon.sh`, so nothing lands until
 you choose. The thread shows every result word for word, side by side; you
 keep one, its patch is applied, and follow-ups go only to the models you
-pick.
+pick. Keeping a winner promotes its code into the common parent baseline;
+subsequent rounds isolate new attempts from that promoted baseline.
 
 ```mermaid
 flowchart TD
@@ -484,16 +517,20 @@ removes on exit. Where things go:
 - Semble installs with its `mcp` extra, so agents that use Semble's MCP
   server keep working.
 - CodeGraph: its self-contained bundle in
-  `~/.codegraph/versions/v1.6.2-zetta-delta`, with `~/.local/bin/codegraph`
-  and `~/.codegraph/current` pointing at it. Earlier versions stay, so
-  rolling back is re-pointing those two links.
+  `~/.codegraph/versions/`, in a directory identified by upstream version,
+  patch hash, platform, and a unique build suffix, with `~/.local/bin/codegraph`
+  and `~/.codegraph/current` pointing at it. Extraction and launcher validation
+  finish before activation. Earlier builds stay even for a same-version patch
+  update or reinstall, so rollback is re-pointing those two links.
 - The index maintainer: `~/.local/share/zetta-delta/`, where the rules and
   `.agents/prepare` run it. List non-Git folders to index in
   `~/.config/zetta-delta/index-roots` (section 5).
 - zvec-grep installs as version `<release>+zetta-delta.<hash>`, where the
   hash covers its patches. The installer then copies the zg guard
   (`stack/zvec-grep/verify-install.py`) to `~/.local/share/zvec-grep/`, pins
-  it to the package files it just installed, and checks them. An existing
+  it to the exact dist artifact set, package metadata, and zg entrypoint it
+  just installed, and checks them. Added artifacts, executable redirection,
+  and metadata drift are rejected. An existing
   guard and pin are first saved under
   `~/.local/share/zvec-grep/restores/<UTC time>/`. The index maintainer runs
   the guard before each zg build and skips zg when it fails, so a zvec-grep
