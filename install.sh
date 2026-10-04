@@ -2,9 +2,10 @@
 # Install the Delta orchestration bundle: custom subagent profiles, the
 # /orchestrate, /adversarial, and /isolated skills, and a roster generated for
 # this machine's accounts (one copy in each skill).
-# Also generates personal-AGENTS.generated.md (context router plus Ponytail)
-# in $XDG_STATE_HOME/zetta-delta (default ~/.local/state/zetta-delta) for
-# pasting into Settings > Rules > Personal AGENTS.md; --clean removes it.
+# Also writes the context router and Ponytail into Delta's Personal AGENTS.md
+# (~/.config/delta/AGENTS.md), replacing only those two blocks and keeping the
+# rest of the file. --clean removes the personal-AGENTS.generated.md that
+# earlier versions left in $XDG_STATE_HOME/zetta-delta for pasting.
 # If any file it would write exists, it changes nothing without --force; with
 # --force it first saves each file it changes under
 # $XDG_STATE_HOME/zetta-delta/backups/<UTC time>/, which --clean keeps.
@@ -74,8 +75,8 @@ while (($#)); do
   shift
 done
 
-# The generated rules wait here until pasted into Delta; --clean removes them
-# and keeps the backups.
+# Earlier versions left the rules here for pasting into Delta; --clean removes
+# that file and keeps the backups.
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zetta-delta"
 [[ $STATE_DIR == /* ]] || die "XDG_STATE_HOME must be an absolute path"
 RULES_OUT="$STATE_DIR/personal-AGENTS.generated.md"
@@ -488,7 +489,10 @@ roster="$(generate_roster)" # generated once, so every skill's copy is identical
 
 # ------------------------------------------------------------------ rules --
 # Personal rules = context router + Ponytail's always-on text, generated from
-# the installed plugin so a reinstall picks up Ponytail updates.
+# the installed plugin so a reinstall picks up Ponytail updates. They go into
+# Delta's Personal AGENTS.md, which Delta re-reads at the start of every turn.
+
+readonly RULES_FILE="$HOME/.config/delta/AGENTS.md"
 
 PONYTAIL_DIR="${PONYTAIL_DIR:-}"
 if [[ -z $PONYTAIL_DIR ]]; then
@@ -528,18 +532,50 @@ sys.stdout.write(body)
 PY
 }
 
+ponytail_version() { # the plugin's own version; its cache folder's name can differ
+  local v=""
+  if [[ -f $PONYTAIL_DIR/package.json ]]; then
+    v="$(awk -F'"' '/^[[:space:]]*"version"[[:space:]]*:/ { print $4; exit }' "$PONYTAIL_DIR/package.json")"
+  fi
+  printf '%s\n' "${v:-$(basename -- "$PONYTAIL_DIR")}"
+}
+
 generate_rules() {
   cat -- "$SCRIPT_DIR/rules/personal-AGENTS.md"
   if [[ -n $PONYTAIL_DIR && -f $PONYTAIL_DIR/AGENTS.md ]]; then
-    printf '\n<!-- PONYTAIL_START %s -->\n' "$(basename -- "$PONYTAIL_DIR")"
+    printf '\n<!-- PONYTAIL_START %s -->\n' "$(ponytail_version)"
     ponytail_block "$PONYTAIL_DIR/AGENTS.md"
     printf '<!-- PONYTAIL_END -->\n'
   fi
 }
 
-if [[ -z $PONYTAIL_DIR || ! -f $PONYTAIL_DIR/AGENTS.md ]]; then
-  warn "ponytail not found; generated rules contain the context router only (set PONYTAIL_DIR)"
+# The blocks this install owns in RULES_FILE: the router, and Ponytail when found
+# (an earlier Ponytail block stays when it is not).
+rules_blocks="DELTA_CONTEXT_ROUTER"
+if [[ -n $PONYTAIL_DIR && -f $PONYTAIL_DIR/AGENTS.md ]]; then
+  rules_blocks+="|PONYTAIL"
+else
+  warn "ponytail not found; the rules contain the context router only (set PONYTAIL_DIR)"
 fi
+readonly rules_blocks
+# A block missing its START or END line would make the rest of the file look
+# like part of it; refuse rather than drop the user's own rules.
+if [[ -f $RULES_FILE ]]; then
+  for b in ${rules_blocks//|/ }; do
+    [[ $(grep -c "^<!-- ${b}_START" "$RULES_FILE") == $(grep -c "^<!-- ${b}_END -->" "$RULES_FILE") ]] \
+      || die "$RULES_FILE has a ${b}_START line without its ${b}_END line, or the reverse; fix that by hand first"
+  done
+fi
+
+personal_rules() { # our blocks, then whatever else RULES_FILE already holds
+  local rest=""
+  generate_rules
+  if [[ -f $RULES_FILE ]]; then
+    rest="$(awk -v s="^<!-- ($rules_blocks)_START" -v e="^<!-- ($rules_blocks)_END -->" \
+      '$0 ~ s { skip = 1 } !skip && (NF || kept) { kept = 1; print } $0 ~ e { skip = 0 }' "$RULES_FILE")"
+  fi
+  if [[ -n $rest ]]; then printf '\n%s\n' "$rest"; fi
+}
 
 # ---------------------------------------------------------------- install --
 # Every file the install writes, in order. Each skill is self-contained under
@@ -562,7 +598,7 @@ write_bundle() {
   for skill in $SKILLS; do
     install_output "$SKILL_ROOT/$skill/references/roster.md" printf '%s\n' "$roster"
   done
-  install_output "$RULES_OUT" generate_rules
+  install_output "$RULES_FILE" personal_rules
 }
 
 # Plan first: without --force, refuse before anything changes.
@@ -593,10 +629,10 @@ if ((DRY_RUN)); then
   info "roster:"
   printf '%s\n' "$roster" | sed 's/^/  | /'
 else
-  rules_bytes=$(wc -c < "$RULES_OUT" | tr -d ' ')
-  info "$RULES_OUT: $rules_bytes bytes"
+  rules_bytes=$(wc -c < "$RULES_FILE" | tr -d ' ')
+  info "$RULES_FILE: $rules_bytes bytes"
   # Delta re-sends these rules every turn and shows no size cap; the budget is ours.
-  ((rules_bytes <= 10240)) || warn "generated rules are $rules_bytes bytes, over the 10240-byte budget; trim before adding more"
+  ((rules_bytes <= 10240)) || warn "Personal AGENTS.md is $rules_bytes bytes, over the 10240-byte budget; trim before adding more"
 fi
 [[ ! -d $BACKUP_DIR ]] || info "the files this install changed were saved under $BACKUP_DIR"
 
@@ -604,8 +640,7 @@ info ""
 info "Next:"
 info "  1. Set the built-in Scout, Worker, and Reviewer models in Settings > Subagents"
 info "     to match the roster, then confirm every custom profile loaded without errors."
-info "  2. Settings > Rules > Personal AGENTS.md: add the contents of"
-info "     $RULES_OUT"
-info "     (replace any earlier DELTA_CONTEXT_ROUTER and PONYTAIL blocks),"
-info "     then remove the file with install.sh --clean."
+info "  2. Nothing to paste: Delta re-reads $RULES_FILE"
+info "     (Settings > Rules > Personal AGENTS.md) at the start of each turn."
+[[ ! -e $RULES_OUT ]] || info "     $RULES_OUT from an earlier install is no longer used; install.sh --clean removes it."
 }

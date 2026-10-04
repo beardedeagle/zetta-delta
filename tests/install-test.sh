@@ -1,6 +1,7 @@
 #!/bin/sh
-# Offline check of install.sh's curl mode (curl | bash) and --clean: a fake
-# curl serves a tarball of this checkout, and each run gets a scratch HOME.
+# Offline check of install.sh's curl mode (curl | bash), refusals, backups, the
+# Personal AGENTS.md update, and --clean: a fake curl serves a tarball of this
+# checkout, and each run gets a scratch HOME.
 #   sh tests/install-test.sh                      runs install.sh with the bash on PATH
 #   BASH_BIN=/bin/bash sh tests/install-test.sh   with another bash (macOS ships 3.2)
 set -u
@@ -14,6 +15,11 @@ has() { case $2 in *"$3"*) echo "PASS $1" ;; *) echo "FAIL $1: got [$2] want it 
 fetched() { if [ -e "$T/url" ]; then cat "$T/url"; else echo none; fi; }
 
 mkdir -p "$T/bin" "$T/home" "$T/tmp" "$T/delta" && touch "$T/delta/settings.json"
+# A Ponytail plugin whose cache folder name is not its version, as Codex stores it.
+pt=$T/home/.codex/plugins/cache/ponytail/ponytail/1.0.0
+mkdir -p "$pt" && printf '# Ponytail\n\nGrep every caller of the function you touch.\n' > "$pt/AGENTS.md"
+printf '{\n  "name": "ponytail",\n  "version": "4.10.3"\n}\n' > "$pt/package.json"
+rules=$T/home/.config/delta/AGENTS.md
 tar -czf "$T/bundle.tar.gz" -C "$(dirname "$ROOT")" --exclude .git "$(basename "$ROOT")"
 cat > "$T/bin/curl" <<EOF
 #!/bin/sh
@@ -72,8 +78,9 @@ check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/
   && cmp -s orchestrate/scripts/bon.sh isolated/scripts/bon.sh && echo same)" "same"
 has "piped install: isolated runs its own bon.sh" "$(cat "$T/home/.agents/skills/isolated/SKILL.md")" \
   "sh $T/home/.agents/skills/isolated/scripts/bon.sh snapshot"
-check "piped install: rules in the state folder" \
-  "$(head -1 "$T/home/.local/state/zetta-delta/personal-AGENTS.generated.md")" "<!-- DELTA_CONTEXT_ROUTER_START v1 -->"
+check "piped install: rules in Delta's Personal AGENTS.md" "$(head -1 "$rules")" "<!-- DELTA_CONTEXT_ROUTER_START v1 -->"
+check "piped install: Ponytail labelled with its own version" "$(grep '^<!-- PONYTAIL_START' "$rules")" "<!-- PONYTAIL_START 4.10.3 -->"
+check "piped install: nothing left to paste" "$(ls -A "$T/home/.local/state" 2>/dev/null)" ""
 check "piped install: temporary copy removed" "$(ls -A "$T/tmp")" ""
 
 r=$(run "$ROOT/install.sh" "ZETTA_DELTA_REF=abc123" --help)
@@ -91,10 +98,12 @@ clone() { out=$(env -i $base $prov "$BASH_BIN" "$ROOT/install.sh" "$@" 2>&1); pr
 snapshot() { (cd "$T" && find delta home -type f | LC_ALL=C sort | xargs cksum); }
 state=$T/home/.local/state/zetta-delta
 printf 'name = "old"\n' > "$T/delta/profiles/candidate.toml" # a superseded profile
+# Rules from an earlier install, plus one of the user's own.
+printf '<!-- DELTA_CONTEXT_ROUTER_START v0 -->\nold router\n<!-- DELTA_CONTEXT_ROUTER_END -->\n\n# my own rule\n' > "$rules"
 before=$(snapshot)
 r=$(clone --prune-legacy)
 has "no --force: refused" "$r" "rerun with --force"
-has "no --force: names every file in the way" "$r" "$state/personal-AGENTS.generated.md"
+has "no --force: names every file in the way" "$r" "$rules"
 check "no --force: nothing changed, nothing retired" "$(snapshot)" "$before"
 
 printf '# local edit\n' >> "$T/home/.agents/skills/adversarial/SKILL.md"
@@ -104,9 +113,19 @@ check "--force: the edited file saved first" "$(tail -n 1 "$state"/backups/*/"${
 check "--force: the edit replaced" "$(cmp -s "$ROOT/skills/adversarial/SKILL.md" "$T/home/.agents/skills/adversarial/SKILL.md" && echo same)" "same"
 check "--force: unchanged files not saved" "$(find "$state/backups" -name '*.toml' -o -name bon.sh | wc -l | tr -d ' ')" "0"
 check "--prune-legacy: retired" "$(cd "$T/delta/profiles" && ls candidate.toml*)" "candidate.toml.retired"
+check "--force: old router replaced, once" "$(grep -c -e '^old router' -e '^<!-- DELTA_CONTEXT_ROUTER_START v1' "$rules")" "1"
+check "--force: the user's own rule kept" "$(tail -n 1 "$rules")" "# my own rule"
+check "--force: old rules saved first" "$(sed -n 2p "$state"/backups/*/"${T#/}"/home/.config/delta/AGENTS.md)" "old router"
 
+printf '<!-- PONYTAIL_START 1 -->\n' >> "$rules" # a block with no end
+before=$(snapshot)
+r=$(clone --force)
+has "unterminated block: refused" "$r" "PONYTAIL_START line without its PONYTAIL_END line"
+check "unterminated block: nothing changed" "$(snapshot)" "$before"
+
+printf 'old\n' > "$state/personal-AGENTS.generated.md" # left by an earlier version for pasting
 r=$(run "$ROOT/install.sh" "" --clean)
-has "clean: removes the generated rules" "$r" "removed $state/personal-AGENTS.generated.md"
+has "clean: removes the old pasted-rules file" "$r" "removed $state/personal-AGENTS.generated.md"
 check "clean: keeps only the backups, nothing fetched" "$(ls -A "$state") $(fetched)" "backups none"
 r=$(run "$ROOT/install.sh" "" --clean)
 has "clean again: nothing to remove" "$r" "nothing to remove"
