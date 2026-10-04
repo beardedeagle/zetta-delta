@@ -33,8 +33,7 @@ Never violate these. If the task would require it, stop and ask the user.
 6. At most two fix rounds per work unit. Then stop and report the unit as
    unresolved.
 7. Metered lanes (billing: metered in the roster) are used only when the user
-   asked for them, or after a unit failed two fix rounds on flat lanes. Never
-   exceed the roster's metered-spawn allowance per run. Before each metered
+   asks for them. Never exceed the roster's metered-spawn allowance per run. Before each metered
    spawn, post one line in this thread naming the model and the reason.
 8. Ask the user before changing files outside the request's evident scope,
    changing public interfaces the request did not mention, adding
@@ -210,7 +209,9 @@ rounds.
    (different family from yours) check your fix. Delegate larger fixes as a
    new unit.
 3. For changes spanning three or more units, spawn one final reviewer over
-   the whole change set.
+   the whole change set: the first in the roster's preference order whose
+   family wrote none of it. If every reviewer's family wrote part of it,
+   split the final review so no reviewer covers its own family's units.
 
 ### 6. Report
 

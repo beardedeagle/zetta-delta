@@ -5,7 +5,8 @@ family: profiles from the roster's Best-of-N table, each sent the BEST-OF-N
 CANDIDATE block below. Each candidate works in its own isolated copy, saves its
 attempt as a patch outside every checkout, and restores its copy, so nothing
 reaches this checkout until you apply the winner. Do not edit this checkout
-while candidates run.
+while candidates run, and start no unit whose FILES IN SCOPE overlap the
+files the task may touch: its merge would force a three-way apply.
 
 Every step uses `{{SKILL_DIR}}/scripts/bon.sh`. Each command runs in a fresh
 shell, so write the actual RUN, TREE, and slug values into every command and
