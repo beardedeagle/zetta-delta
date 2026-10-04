@@ -1,0 +1,271 @@
+From 8bd9619f7aee4a0a9e67db5b339241f327727bca Mon Sep 17 00:00:00 2001
+From: beardedeagle <randy@heroictek.com>
+Date: Fri, 2 Oct 2026 22:02:22 -0500
+Subject: [PATCH] fix(filters): don't print a TOML filter's on_empty message
+ when the command failed
+
+A TOML filter captures stdout only unless it sets filter_stderr, and stage 8
+printed on_empty whenever that stdout filtered away. A failed command's stdout
+is often empty for exactly that reason: its errors go to stderr. So
+`rtk mix compile` on a broken project printed the compiler error on stderr and
+then `mix compile: ok` on stdout, while exiting 1.
+
+on_empty now fires only when the command exited zero. A failed run whose
+stdout filters away prints what is left (nothing, or the raw stdout when the
+recovery hint would cost more), and stderr and the exit code are unchanged.
+`rtk verify` and inline [[tests.*]] still exercise the success path.
+---
+ src/core/README.md                |  2 +-
+ src/core/toml_filter.rs           | 51 +++++++++++++++++++++++--------
+ src/filters/README.md             |  4 +--
+ src/main.rs                       |  2 +-
+ tests/stderr_only_failure_test.rs | 49 +++++++++++++++++++++++++++++
+ 5 files changed, 91 insertions(+), 17 deletions(-)
+
+diff --git a/src/core/README.md b/src/core/README.md
+index db75623..eef1f0e 100644
+--- a/src/core/README.md
++++ b/src/core/README.md
+@@ -24,7 +24,7 @@ The TOML DSL applies 8 stages in order:
+ 5. **truncate_lines_at**: Truncate each line to N chars (unicode-safe)
+ 6. **head/tail_lines**: Keep first N or last N lines (with omit message)
+ 7. **max_lines**: Absolute line cap applied after head/tail
+-8. **on_empty**: Return message if result is empty after all stages
++8. **on_empty**: Return message if result is empty after all stages and the command succeeded
+ 
+ Three-tier filter lookup (first match wins):
+ 1. `.rtk/filters.toml` (project-local, requires `rtk trust`)
+diff --git a/src/core/toml_filter.rs b/src/core/toml_filter.rs
+index 413e20e..528e0c8 100644
+--- a/src/core/toml_filter.rs
++++ b/src/core/toml_filter.rs
+@@ -22,7 +22,7 @@
+ ///   5. truncate_lines_at    — truncate each line to N chars
+ ///   6. head/tail_lines      — keep first/last N lines
+ ///   7. max_lines            — absolute line cap
+-///   8. on_empty             — message if result is empty
++///   8. on_empty             — message if result is empty and the command succeeded
+ use super::constants::RTK_META_COMMANDS;
+ use crate::core::user_dirs;
+ use crate::core::user_env;
+@@ -556,7 +556,8 @@ pub fn find_filter_in<'a>(
+     filters.iter().find(|f| f.match_regex.is_match(command))
+ }
+ 
+-/// Apply a compiled filter pipeline to raw stdout. Pure String -> String.
++/// Apply a compiled filter pipeline to the raw stdout of a command that succeeded.
++/// Pure String -> String.
+ ///
+ /// Pipeline stages (in order):
+ ///   1. strip_ansi           — remove ANSI escape codes
+@@ -568,7 +569,7 @@ pub fn find_filter_in<'a>(
+ ///   7. max_lines            — absolute line cap
+ ///   8. on_empty             — message if result is empty
+ pub fn apply_filter(filter: &CompiledFilter, stdout: &str) -> String {
+-    apply_filter_with_info(filter, stdout).0
++    apply_filter_with_info(filter, stdout, true).0
+ }
+ 
+ #[derive(Debug, PartialEq)]
+@@ -583,7 +584,13 @@ pub enum Lossiness {
+     Whole,
+ }
+ 
+-pub fn apply_filter_with_info(filter: &CompiledFilter, stdout: &str) -> (String, Lossiness) {
++/// Apply the pipeline and report what it dropped. `success` is whether the command
++/// exited zero; `on_empty` fires only when it did.
++pub fn apply_filter_with_info(
++    filter: &CompiledFilter,
++    stdout: &str,
++    success: bool,
++) -> (String, Lossiness) {
+     let mut lines: Vec<String> = stdout.lines().map(String::from).collect();
+ 
+     // 1. strip_ansi
+@@ -691,9 +698,11 @@ pub fn apply_filter_with_info(filter: &CompiledFilter, stdout: &str) -> (String,
+         max_cut = Some(max);
+     }
+ 
+-    // 8. on_empty
++    // 8. on_empty — success only. The message says "nothing to report" (e.g. `mix compile: ok`),
++    //    but a failed command's stdout is empty because its errors went to stderr.
+     let result = lines.join("\n");
+-    if result.trim().is_empty()
++    if success
++        && result.trim().is_empty()
+         && let Some(ref msg) = filter.on_empty
+     {
+         return (msg.clone(), Lossiness::None);
+@@ -936,7 +945,7 @@ mod tests {
+     #[test]
+     fn test_loss_tail_configured_unfired_max_fires_is_whole() {
+         let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\ntail_lines = 100\nmax_lines = 2\n";
+-        let (out, loss) = apply_filter_with_info(&first_filter(toml), "a\nb\nc\nd\ne");
++        let (out, loss) = apply_filter_with_info(&first_filter(toml), "a\nb\nc\nd\ne", true);
+         assert!(out.contains("lines truncated"));
+         assert_ne!(loss, Lossiness::None);
+     }
+@@ -986,13 +995,13 @@ mod tests {
+     }
+ 
+     fn loss_of(toml: &str, input: &str) -> Lossiness {
+-        apply_filter_with_info(&first_filter(toml), input).1
++        apply_filter_with_info(&first_filter(toml), input, true).1
+     }
+ 
+     #[test]
+     fn test_loss_head_lines_is_tail() {
+         let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nhead_lines = 2\n";
+-        let (out, loss) = apply_filter_with_info(&first_filter(toml), "a\nb\nc\nd\ne");
++        let (out, loss) = apply_filter_with_info(&first_filter(toml), "a\nb\nc\nd\ne", true);
+         assert!(out.starts_with("a\nb\n"));
+         match loss {
+             Lossiness::Tail {
+@@ -1051,7 +1060,8 @@ mod tests {
+     #[test]
+     fn test_loss_match_output_is_whole() {
+         let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\n[[filters.f.match_output]]\npattern = \"ok\"\nmessage = \"all good\"\n";
+-        let (out, loss) = apply_filter_with_info(&first_filter(toml), "everything ok here\nmore");
++        let (out, loss) =
++            apply_filter_with_info(&first_filter(toml), "everything ok here\nmore", true);
+         assert_eq!(out, "all good");
+         assert_eq!(loss, Lossiness::Whole);
+     }
+@@ -1059,7 +1069,8 @@ mod tests {
+     #[test]
+     fn test_loss_strip_only_is_none() {
+         let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nstrip_lines_matching = [\"^noise\"]\n";
+-        let (out, loss) = apply_filter_with_info(&first_filter(toml), "keep\nnoise line\nkeep2");
++        let (out, loss) =
++            apply_filter_with_info(&first_filter(toml), "keep\nnoise line\nkeep2", true);
+         assert_eq!(out, "keep\nkeep2");
+         assert_eq!(loss, Lossiness::None);
+     }
+@@ -1067,11 +1078,22 @@ mod tests {
+     #[test]
+     fn test_loss_on_empty_is_none() {
+         let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nstrip_lines_matching = [\".\"]\non_empty = \"nothing\"\n";
+-        let (out, loss) = apply_filter_with_info(&first_filter(toml), "a\nb\nc");
++        let (out, loss) = apply_filter_with_info(&first_filter(toml), "a\nb\nc", true);
+         assert_eq!(out, "nothing");
+         assert_eq!(loss, Lossiness::None);
+     }
+ 
++    /// A failed command whose stdout filters away must not be reported as "ok":
++    /// its errors went to stderr, which the user sees directly.
++    #[test]
++    fn test_on_empty_withheld_when_command_failed() {
++        let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nstrip_lines_matching = [\"^Compiling\"]\non_empty = \"cmd: ok\"\n";
++        let (out, loss) =
++            apply_filter_with_info(&first_filter(toml), "Compiling 1 file (.ex)", false);
++        assert_eq!(out, "");
++        assert_eq!(loss, Lossiness::None);
++    }
++
+     #[test]
+     fn test_loss_no_truncation_is_none() {
+         let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nhead_lines = 10\n";
+@@ -1083,7 +1105,10 @@ mod tests {
+         let toml = "schema_version = 1\n[filters.f]\nmatch_command = \"^cmd\"\nhead_lines = 2\n";
+         let f = first_filter(toml);
+         let input = "a\nb\nc\nd";
+-        assert_eq!(apply_filter(&f, input), apply_filter_with_info(&f, input).0);
++        assert_eq!(
++            apply_filter(&f, input),
++            apply_filter_with_info(&f, input, true).0
++        );
+     }
+ 
+     // --- Pipeline primitives (existing) ---
+diff --git a/src/filters/README.md b/src/filters/README.md
+index 5b9bbb9..5f9625a 100644
+--- a/src/filters/README.md
++++ b/src/filters/README.md
+@@ -36,7 +36,7 @@ strip_lines_matching = [               # optional: drop lines matching any of th
+   "^noise pattern",
+ ]
+ max_lines = 40                          # optional: keep only the first N lines after filtering
+-on_empty = "my-tool: ok"               # optional: message to emit when output is empty after filtering
++on_empty = "my-tool: ok"               # optional: message to emit when a successful run's output is empty after filtering
+ 
+ [[tests.my-tool]]
+ name = "descriptive test name"
+@@ -59,7 +59,7 @@ expected = "expected filtered output"
+ | `truncate_lines_at` | int | Truncate lines longer than N characters |
+ | `max_lines` | int | Keep only the first N lines |
+ | `tail_lines` | int | Keep only the last N lines (applied after other filters) |
+-| `on_empty` | string | Fallback message when filtered output is empty |
++| `on_empty` | string | Fallback message when filtered output is empty and the command exited 0 |
+ 
+ ## Naming convention
+ 
+diff --git a/src/main.rs b/src/main.rs
+index 6335146..8f25363 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1654,7 +1654,7 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
+                 };
+                 let success = output.status.success();
+                 let (filtered, loss) =
+-                    core::toml_filter::apply_filter_with_info(filter, &combined_raw);
++                    core::toml_filter::apply_filter_with_info(filter, &combined_raw, success);
+                 let lossy = !matches!(loss, core::toml_filter::Lossiness::None);
+ 
+                 let hint = if !success {
+diff --git a/tests/stderr_only_failure_test.rs b/tests/stderr_only_failure_test.rs
+index 7a6e1ea..7e97aa5 100644
+--- a/tests/stderr_only_failure_test.rs
++++ b/tests/stderr_only_failure_test.rs
+@@ -178,3 +178,52 @@ fn lint_issues_are_summarised_and_exit_zero() {
+         "exit 1 means issues found, which RTK reports without failing"
+     );
+ }
++
++/// TOML filters capture stdout only, too. mix-compile strips the `Compiling` line and
++/// prints its `on_empty` message, `mix compile: ok`, when nothing is left; a failed
++/// build leaves nothing there because its error went to stderr.
++#[test]
++fn toml_on_empty_is_not_claimed_for_a_failed_command() {
++    let dir = tempfile::tempdir().expect("tempdir");
++    fake_tool(
++        dir.path(),
++        "mix",
++        r#"echo "Compiling 1 file (.ex)"
++echo "** (CompileError) lib/broken.ex:2: undefined function nope/0" >&2
++exit 1"#,
++    );
++
++    let out = rtk_with(dir.path(), &["mix", "compile"]);
++    let stdout = String::from_utf8_lossy(&out.stdout);
++
++    assert!(
++        !stdout.contains("mix compile: ok"),
++        "a failed build must not be reported as ok; got stdout: {stdout}"
++    );
++    assert!(
++        String::from_utf8_lossy(&out.stderr).contains("CompileError"),
++        "the compiler's error must reach the user"
++    );
++    assert_eq!(out.status.code(), Some(1), "exit code must propagate");
++}
++
++/// The other half: a clean build still gets the filter's `on_empty` message.
++#[test]
++fn toml_on_empty_reports_a_clean_run() {
++    let dir = tempfile::tempdir().expect("tempdir");
++    fake_tool(
++        dir.path(),
++        "mix",
++        r#"echo "Compiling 1 file (.ex)"
++echo "Generated app app"
++exit 0"#,
++    );
++
++    let out = rtk_with(dir.path(), &["mix", "compile"]);
++
++    assert_eq!(
++        String::from_utf8_lossy(&out.stdout).trim(),
++        "mix compile: ok"
++    );
++    assert_eq!(out.status.code(), Some(0));
++}

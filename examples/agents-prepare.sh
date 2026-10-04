@@ -83,11 +83,12 @@ fi
 [ -f "$root/Cargo.toml" ] && (cd "$root" && cargo fetch)
 
 # Context indexes (tgrep, CodeGraph, zvec). Delta has no SessionStart hook, so
-# feed the Codex index maintainer the same payload its hook would send. It is
-# bounded, per-worktree locked, and fail-open; run it detached so creating the
-# checkout is not delayed. Set DELTA_PREPARE_INDEXES=0 to skip (for example on
-# short-lived subagent copies when many agents run at once).
-ensure="$HOME/.codex/hooks/ensure-context-indexes.py"
+# feed the index maintainer (installed by stack/install.sh) the payload that
+# hook would send. It is bounded, per-worktree locked, and fail-open; run it
+# detached so creating the checkout is not delayed. Set DELTA_PREPARE_INDEXES=0
+# to skip (for example on short-lived subagent copies when many agents run at
+# once).
+ensure="$HOME/.local/share/zetta-delta/ensure-context-indexes.py"
 if [ "${DELTA_PREPARE_INDEXES:-1}" != 0 ] && [ -f "$ensure" ] && command -v python3 >/dev/null 2>&1; then
   log="${DELTA_SCRATCH_DIR:-${TMPDIR:-/tmp}}/context-indexes.log"
   python3 -c 'import json,sys;print(json.dumps({"hook_event_name":"SessionStart","cwd":sys.argv[1]}))' "$root" \

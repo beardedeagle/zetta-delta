@@ -1,0 +1,287 @@
+From 12f6108f8a20e22cac20b63ab4582928a86369ca Mon Sep 17 00:00:00 2001
+From: beardedeagle <randy@heroictek.com>
+Date: Sat, 19 Sep 2026 22:33:30 -0500
+Subject: [PATCH 1/2] fix: detect inline Rust tests in caller coverage
+
+---
+ __tests__/explore-blast-radius.test.ts   | 44 +++++++++++++++++++++++-
+ __tests__/kernel-rustlang-parity.test.ts | 20 +++++++++++
+ codegraph-kernel/src/rustlang.rs         | 27 ++++++++++++++-
+ src/extraction/languages/rust.ts         | 13 +++++++
+ src/mcp/tools.ts                         |  9 +++--
+ src/search/query-utils.ts                |  6 ++++
+ src/ui-server/api/node.ts                |  6 ++--
+ src/ui-server/api/wire.ts                |  4 +--
+ 8 files changed, 117 insertions(+), 12 deletions(-)
+
+diff --git a/__tests__/explore-blast-radius.test.ts b/__tests__/explore-blast-radius.test.ts
+index 50ad362..95e5e69 100644
+--- a/__tests__/explore-blast-radius.test.ts
++++ b/__tests__/explore-blast-radius.test.ts
+@@ -13,6 +13,8 @@ import * as path from 'path';
+ import * as os from 'os';
+ import CodeGraph from '../src/index';
+ import { ToolHandler } from '../src/mcp/tools';
++import { buildNode } from '../src/ui-server/api/node';
++import { toNodeRef } from '../src/ui-server/api/wire';
+ 
+ describe('codegraph_explore — blast radius', () => {
+   let testDir: string;
+@@ -63,7 +65,24 @@ describe('codegraph_explore — blast radius', () => {
+       `export function untestedCaller() { return untestedHelper(); }\n`,
+     );
+ 
+-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
++    fs.writeFileSync(path.join(src, 'cli.rs'), `
++pub fn parse_args_from() {}
++pub fn untested_rust() {}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn parse() { parse_args_from(); }
++    #[/* built-in */ test /* marker */]
++    #[ignore]
++    // Comments between attributes and the item do not detach them.
++    fn parse_exec() { parse(); }
++    fn test_named_helper() { untested_rust(); }
++    #[cfg(test)]
++    fn cfg_only_helper() { untested_rust(); }
++}
++`);
++
++    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts', '**/*.rs'], exclude: [] } });
+     await cg.indexAll();
+     handler = new ToolHandler(cg);
+   });
+@@ -112,4 +131,27 @@ describe('codegraph_explore — blast radius', () => {
+     // lonelyLeaf has zero callers — it must never appear under a blast-radius bullet.
+     expect(text).not.toMatch(/Blast radius[\s\S]*`lonelyLeaf`/);
+   });
++
++  it.each([
++    ['parse', 1, 'tests:'],
++    ['parse_args_from', 2, 'tested via callers:'],
++  ])('finds inline Rust tests reaching %s in MCP and the viewer', async (name, hops, label) => {
++    const res = await handler.execute('codegraph_explore', { query: name });
++    const line = res.content[0].text.split('\n').find((l: string) => l.startsWith(`- \`${name}\``));
++    expect(line).toContain(`${label} \`src/cli.rs\``);
++    const node = cg.searchNodes(name).find((n) => n.node.name === name)!.node;
++    const view = await buildNode(cg, testDir, node.id) as { tests: unknown };
++    expect(view.tests).toMatchObject({ reached: true, hops, files: ['src/cli.rs'] });
++    const test = cg.searchNodes('parse_exec').find((n) => n.node.name === 'parse_exec')!.node;
++    expect(toNodeRef(test).test).toBe(true);
++    expect(toNodeRef(node).test).toBe(false);
++  });
++
++  it('does not treat every caller in a Rust file with inline tests as a test', async () => {
++    const res = await handler.execute('codegraph_explore', { query: 'untested_rust' });
++    expect(res.content[0].text).toMatch(/`untested_rust`[^\n]*no tests found within 3 caller hops/);
++    const node = cg.searchNodes('untested_rust').find((n) => n.node.name === 'untested_rust')!.node;
++    const view = await buildNode(cg, testDir, node.id) as { tests: unknown };
++    expect(view.tests).toMatchObject({ reached: false, files: [] });
++  });
+ });
+diff --git a/__tests__/kernel-rustlang-parity.test.ts b/__tests__/kernel-rustlang-parity.test.ts
+index 3380ae6..14c7b21 100644
+--- a/__tests__/kernel-rustlang-parity.test.ts
++++ b/__tests__/kernel-rustlang-parity.test.ts
+@@ -127,6 +127,26 @@ fn next() {}
+     assertParity('fixtures/torture.rs (crlf)', crlf, 20);
+   });
+ 
++  it('preserves inline test attributes without marking neighboring helpers', () => {
++    const source = `
++#[cfg(test)]
++mod tests {
++    #[/* built-in */ test /* marker */]
++    #[ignore]
++    // Still attached to the test.
++    fn parses() {}
++    fn helper() {}
++    #[cfg(test)]
++    fn cfg_only() {}
++}
++`;
++    assertParity('src/cli.rs', source);
++    const nodes = extractFromSource('src/cli.rs', source, 'rust').nodes;
++    expect(nodes.find((n) => n.name === 'parses')?.decorators).toEqual(['test']);
++    expect(nodes.find((n) => n.name === 'helper')?.decorators).toBeUndefined();
++    expect(nodes.find((n) => n.name === 'cfg_only')?.decorators).toBeUndefined();
++  });
++
+   it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {
+     const broken = 'fn f( {\n  return }} 12 (\n';
+     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+diff --git a/codegraph-kernel/src/rustlang.rs b/codegraph-kernel/src/rustlang.rs
+index 1dbc689..4a8aab8 100644
+--- a/codegraph-kernel/src/rustlang.rs
++++ b/codegraph-kernel/src/rustlang.rs
+@@ -287,6 +287,31 @@ impl<'t> Walker<'t> {
+         let sig_ref = opt_str(&mut self.arena, extra.signature.as_deref());
+         let decorators_ref = opt_str(&mut self.arena, extra.decorators.as_deref());
+         let ret_ref = opt_str(&mut self.arena, extra.return_type.as_deref());
++        // Match rustExtractor.extractModifiers: only an attached #[test]
++        // marks the function, never its neighbors or its containing module.
++        // The wasm walker applies it when the node is created, and its later
++        // Tauri-command scan (carried here in extra.decorators) replaces the
++        // list, so a decorator from extract_fn_or_method takes precedence.
++        let mut decorators = decorators_ref;
++        if extra.decorators.is_none() && node.kind() == "function_item" {
++            let mut sibling = node.prev_named_sibling();
++            while let Some(attr) = sibling {
++                match attr.kind() {
++                    "line_comment" | "block_comment" => {}
++                    "attribute_item" => {
++                        let is_test = (0..attr.named_child_count())
++                            .filter_map(|i| attr.named_child(i))
++                            .any(|value| value.kind() == "attribute" && self.text(value).trim() == "test");
++                        if is_test {
++                            decorators = self.arena.put_list(&["test".to_string()]);
++                            break;
++                        }
++                    }
++                    _ => break,
++                }
++                sibling = attr.prev_named_sibling();
++            }
++        }
+         let row = self.tables.push_node(&NodeRow {
+             kind: node_kind_index(kind).unwrap(),
+             visibility: extra.visibility.unwrap_or(0),
+@@ -300,7 +325,7 @@ impl<'t> Walker<'t> {
+             id: id_ref,
+             docstring: doc_ref,
+             signature: sig_ref,
+-            decorators: decorators_ref,
++            decorators,
+             type_parameters: NONE_STR,
+             return_type: ret_ref,
+             extra_json: NONE_STR,
+diff --git a/src/extraction/languages/rust.ts b/src/extraction/languages/rust.ts
+index 9c47100..32d6683 100644
+--- a/src/extraction/languages/rust.ts
++++ b/src/extraction/languages/rust.ts
+@@ -99,6 +99,19 @@ export const rustExtractor: LanguageExtractor = {
+   paramsField: 'parameters',
+   returnField: 'return_type',
+   getReturnType: extractRustReturnType,
++  extractModifiers: (node) => {
++    if (node.type !== 'function_item') return undefined;
++    // Outer attributes are siblings; stop at the preceding item so a test
++    // marker never leaks onto a neighboring helper or production function.
++    for (let sibling = node.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
++      if (sibling.type === 'line_comment' || sibling.type === 'block_comment') continue;
++      if (sibling.type !== 'attribute_item') break;
++      if (sibling.namedChildren.some((child) => child.type === 'attribute' && child.text.trim() === 'test')) {
++        return ['test'];
++      }
++    }
++    return undefined;
++  },
+   getSignature: (node, source) => {
+     const params = getChildByField(node, 'parameters');
+     const returnType = getChildByField(node, 'return_type');
+diff --git a/src/mcp/tools.ts b/src/mcp/tools.ts
+index c8fec8d..05824d8 100644
+--- a/src/mcp/tools.ts
++++ b/src/mcp/tools.ts
+@@ -34,7 +34,7 @@ import {
+ } from '../sync/worktree';
+ import type { PendingFile } from '../sync';
+ import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
+-import { isTestFile, normalizeNameToken } from '../search/query-utils';
++import { isTestNode, normalizeNameToken } from '../search/query-utils';
+ import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
+ import {
+   extractQueryPaths,
+@@ -3909,9 +3909,8 @@ export class ToolHandler {
+       }
+       if (uniq.length === 0) continue; // no blast radius → nothing to flag
+ 
+-      const callerFiles = [...new Set(uniq.map((n) => rel(n.filePath)))];
+-      const testFiles = callerFiles.filter((f) => isTestFile(f));
+-      const nonTest = callerFiles.filter((f) => !isTestFile(f));
++      const testFiles = [...new Set(uniq.filter(isTestNode).map((n) => rel(n.filePath)))];
++      const nonTest = [...new Set(uniq.filter((n) => !isTestNode(n)).map((n) => rel(n.filePath)))];
+ 
+       const shown = nonTest.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
+       const more = nonTest.length > FILE_CAP ? ` +${nonTest.length - FILE_CAP} more` : '';
+@@ -3960,7 +3959,7 @@ export class ToolHandler {
+           if (!n || visited.has(n.id)) continue;
+           visited.add(n.id);
+           const f = rel(n.filePath);
+-          if (isTestFile(f)) found.add(f);
++          if (isTestNode(n)) found.add(f);
+           else next.push(n);
+         }
+       }
+diff --git a/src/search/query-utils.ts b/src/search/query-utils.ts
+index 03817b8..d5ce3c3 100644
+--- a/src/search/query-utils.ts
++++ b/src/search/query-utils.ts
+@@ -300,6 +300,12 @@ export function isTestFile(filePath: string): boolean {
+   return isTestPath(filePath) || matchesNonProductionDir(filePath.toLowerCase());
+ }
+ 
++/** Include inline Rust tests without classifying their whole source file as tests. */
++export function isTestNode(node: Node): boolean {
++  return isTestFile(node.filePath.replace(/\\/g, '/')) ||
++    (node.language === 'rust' && node.decorators?.includes('test') === true);
++}
++
+ /**
+  * Check if a file path names a TEST — a suite that exercises other code.
+  *
+diff --git a/src/ui-server/api/node.ts b/src/ui-server/api/node.ts
+index c5431a0..a069a6b 100644
+--- a/src/ui-server/api/node.ts
++++ b/src/ui-server/api/node.ts
+@@ -22,7 +22,7 @@
+ 
+ import type { CodeGraph } from '../../index';
+ import type { Edge, Node, NodeKind } from '../../types';
+-import { isTestFile } from '../../search/query-utils';
++import { isTestFile, isTestNode } from '../../search/query-utils';
+ import { buildHierarchy, type WireOverride } from './hierarchy';
+ import { notFound } from './respond';
+ import { findIndexedFile, hasDriftedOnDisk } from './source';
+@@ -332,7 +332,7 @@ export interface WireTestSummary {
+  */
+ function summarizeTestCallers(cg: CodeGraph, directCallers: readonly Node[]): WireTestSummary {
+   const directFiles = [
+-    ...new Set(directCallers.map((n) => toPosixPath(n.filePath)).filter(isTestFile)),
++    ...new Set(directCallers.filter(isTestNode).map((n) => toPosixPath(n.filePath))),
+   ];
+   if (directFiles.length > 0) {
+     return {
+@@ -367,7 +367,7 @@ function summarizeTestCallers(cg: CodeGraph, directCallers: readonly Node[]): Wi
+         if (!source || visited.has(source.id)) continue;
+         visited.add(source.id);
+         const file = toPosixPath(source.filePath);
+-        if (isTestFile(file)) found.add(file);
++        if (isTestNode(source)) found.add(file);
+         else next.push(source);
+       }
+     }
+diff --git a/src/ui-server/api/wire.ts b/src/ui-server/api/wire.ts
+index 3fef493..f1da848 100644
+--- a/src/ui-server/api/wire.ts
++++ b/src/ui-server/api/wire.ts
+@@ -16,7 +16,7 @@
+  */
+ 
+ import type { Edge, EdgeKind, Language, Node, NodeKind } from '../../types';
+-import { isTestFile } from '../../search/query-utils';
++import { isTestNode } from '../../search/query-utils';
+ 
+ // =============================================================================
+ // Caps and thresholds
+@@ -131,7 +131,7 @@ export function toNodeRef(node: Node): WireNodeRef {
+     line: node.startLine,
+     endLine: node.endLine,
+     language: node.language,
+-    test: isTestFile(file),
++    test: isTestNode(node),
+   };
+   if (node.signature) ref.signature = node.signature;
+   if (node.isExported) ref.exported = true;
