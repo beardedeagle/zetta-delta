@@ -1,0 +1,150 @@
+Subject: [PATCH] Preserve literal effective Git exclusions and tracked exceptions
+
+--- a/src/engine/pipeline/indexing/scanner/index.ts
++++ b/src/engine/pipeline/indexing/scanner/index.ts
+@@ -46,6 +46,9 @@
+ const BINARY_CONTROL_CHAR_RATIO = 0.3;
+ const MAX_GITIGNORE_CACHE_ENTRIES = 4_096;
+ 
++/** Tagged --ignore-file JSON inventories preserve Git's literal path semantics. */
++export const ZETTA_DELTA_GIT_INVENTORY_VERSION = 1;
++
+ const DEFAULT_IGNORED_DIRECTORY_NAMES = [
+   "node_modules",
+   "vendor",
+@@ -126,6 +129,13 @@
+   directoryOnly: boolean;
+   anchored: boolean;
+   hasSlash: boolean;
++  fromGitIgnore?: boolean;
++  gitInventory?: {
++    ignored: ReadonlySet<string>;
++    ignoredDirectories: ReadonlySet<string>;
++    tracked: ReadonlySet<string>;
++    trackedDirectories: ReadonlySet<string>;
++  };
+ };
+ 
+ type IgnoreMatch = {
+@@ -730,7 +740,10 @@
+   if (cached?.content === content) {
+     return cached.rules;
+   }
+-  const rules = parseGitIgnoreRules(content, basePath);
++  const rules = parseGitIgnoreRules(content, basePath).map((rule) => ({
++    ...rule,
++    fromGitIgnore: true,
++  }));
+   gitIgnoreRuleCache.set(cacheKey, { content, rules });
+   if (gitIgnoreRuleCache.size > MAX_GITIGNORE_CACHE_ENTRIES) {
+     gitIgnoreRuleCache.delete(gitIgnoreRuleCache.keys().next().value!);
+@@ -747,9 +760,73 @@
+       ? path
+       : resolve(rootPath.absolutePath, path);
+     const content = await readFile(absolutePath, "utf8");
+-    rules.push(...parseGitIgnoreRules(content, ""));
++    rules.push(...(parseGitInventory(content) ?? parseGitIgnoreRules(content, "")));
+   }
+   return rules;
++}
++
++function parseGitInventory(content: string): IgnoreRule[] | null {
++  let value: unknown;
++  try {
++    value = JSON.parse(content);
++  } catch {
++    return null; // Ordinary ignore files retain their existing parser.
++  }
++  if (
++    !value ||
++    typeof value !== "object" ||
++    !("zettaDeltaGitInventory" in value)
++  ) {
++    return null;
++  }
++  const inventory = value as Record<string, unknown>;
++  const validPaths = (paths: unknown): paths is string[] =>
++    Array.isArray(paths) &&
++    paths.every(
++      (path) =>
++        typeof path === "string" &&
++        path.length > 0 &&
++        !path.includes("\0") &&
++        !path.startsWith("/") &&
++        !path
++          .replace(/\/$/, "")
++          .split("/")
++          .some((part) => !part || part === "." || part === ".."),
++    );
++  if (
++    inventory.zettaDeltaGitInventory !== ZETTA_DELTA_GIT_INVENTORY_VERSION ||
++    !validPaths(inventory.ignored) ||
++    !validPaths(inventory.tracked)
++  ) {
++    throw new Error("Invalid exact Git path inventory");
++  }
++  const trackedDirectories = new Set<string>();
++  for (const path of inventory.tracked) {
++    const parts = path.split("/");
++    for (let depth = 1; depth < parts.length; depth++) {
++      trackedDirectories.add(parts.slice(0, depth).join("/"));
++    }
++  }
++  return [
++    {
++      basePath: "",
++      pattern: "",
++      negated: false,
++      directoryOnly: false,
++      anchored: true,
++      hasSlash: true,
++      gitInventory: {
++        ignored: new Set(inventory.ignored.filter((path) => !path.endsWith("/"))),
++        ignoredDirectories: new Set(
++          inventory.ignored
++            .filter((path) => path.endsWith("/"))
++            .map((path) => path.slice(0, -1)),
++        ),
++        tracked: new Set(inventory.tracked),
++        trackedDirectories,
++      },
++    },
++  ];
+ }
+ 
+ function parseGitIgnoreRules(content: string, basePath: string): IgnoreRule[] {
+@@ -812,7 +889,34 @@
+   let matchedNegation = false;
+   let matchedRule: IgnoreRule | undefined;
+ 
++  const inventories = rules.flatMap((rule) =>
++    rule.gitInventory ? [rule.gitInventory] : [],
++  );
++  const tracked = inventories.some((inventory) =>
++    isDirectory
++      ? inventory.trackedDirectories.has(relativePath)
++      : inventory.tracked.has(relativePath),
++  );
++  const parts = relativePath.split("/");
++  if (
++    !tracked &&
++    inventories.some(
++      (inventory) =>
++        inventory.ignored.has(relativePath) ||
++        parts.some((_, index) =>
++          inventory.ignoredDirectories.has(parts.slice(0, index + 1).join("/")),
++        ),
++    )
++  ) {
++    // Exact Git exclusions cannot be reintroduced by a glob include. There is
++    // no glob rule to pass to ignoredPathExplicitlyIncluded.
++    return { ignored: true, matchedNegation: false };
++  }
++
+   for (const rule of rules) {
++    if (rule.gitInventory || (tracked && rule.fromGitIgnore)) {
++      continue;
++    }
+     if (!ignoreRuleMatches(rule, relativePath, isDirectory)) {
+       continue;
+     }

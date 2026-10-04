@@ -5,6 +5,8 @@ Only selected Git worktrees and the non-Git folders listed in $XDG_CONFIG_HOME/z
 ~/.config) are indexed. No shell evaluation, model downloads, remote embeddings, persistent servers, or watchers.
 Native tools own indexes.
 """
+from __future__ import annotations
+
 import fcntl
 import hashlib
 import json
@@ -335,33 +337,53 @@ def git_files(root, deadline, check=True):
     return [name for name in result.stdout.split("\0") if name and name.split("/", 1)[0] not in INDEX_DIRS]
 
 
-def scope(root, deadline):
+def scope(root: Path, deadline: float, tool: str | None = None):
     # tgrep and codegraph descend into nested repositories and hidden folders; zg skips both.
     # Returns every path to fingerprint and, per tool, how many files a full build reads.
-    top = git_files(root, deadline)
+    top = [name.rstrip("/") + "/" if (root / name).is_dir() and not (root / name).is_symlink() else name
+           for name in git_files(root, deadline)]
     files, pending = list(top), [name for name in top if name.endswith("/")]
     while pending:
         nested = pending.pop()
         for name in git_files(root / nested, deadline, check=False):
+            child = root / nested / name
+            if child.is_dir() and not child.is_symlink():
+                name = name.rstrip("/") + "/"
             files.append(nested + name)
             if name.endswith("/"):
                 pending.append(nested + name)
-    return files, {
+    zg_files = [name for name in top if not name.endswith("/")
+                and not any(part.startswith(".") for part in name.split("/"))]
+    # Stored includes can opt into hidden paths or nested repositories. Admission
+    # must then use the full eligible corpus as a conservative upper bound.
+    try:
+        manifest = load_json(root / ".zvec-grep/manifest.json")
+        roots = manifest.get("rootPaths", [])
+        broader = not isinstance(roots, list) or any(
+            entry.get("hidden") or entry.get("include") or entry.get("globs") or entry.get("insensitiveGlobs")
+            for entry in roots if isinstance(entry, dict))
+    except (OSError, ValueError):
+        # zg preflight owns configuration errors; code-tool freshness remains
+        # independent. Until it is readable, admit against the largest corpus.
+        broader = True
+    if broader:
+        zg_files = [name for name in files if not name.endswith("/")]
+    return (zg_files if tool == "zg" else files), {
         "codegraph": sum(not name.endswith("/") for name in files),
-        "zg": sum(not name.endswith("/") and not any(part.startswith(".") for part in name.split("/"))
-                  for name in top)}
+        "zg": len(zg_files)}
 
 
-def fingerprint(root, deadline):
+def fingerprint(root: Path, deadline: float, tool: str | None = None) -> str:
     # ponytail: O(file count) metadata scan, use a watcher only if this is measurably costly.
-    files = scope(root, deadline)[0]
+    files = scope(root, deadline, tool)[0]
     extras = []
     if (root / ".git").exists():
         extras = [run(["git", "rev-parse", "--git-path", "info/exclude"], root, deadline).stdout.strip()]
     digest = hashlib.sha256()
     global_ignore = run(["git", "config", "--path", "--get", "core.excludesFile"],
                         root, deadline, check=False).stdout.strip()
-    for extra in (*extras, global_ignore or str(Path.home() / ".config/git/ignore"), ".ignore"):
+    default_ignore = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "git/ignore"
+    for extra in (*extras, global_ignore or str(default_ignore), ".gitignore", ".ignore"):
         path = root / Path(extra).expanduser()
         try:
             info = path.lstat()
@@ -448,8 +470,13 @@ def zvec_model(root, deadline):
                  or str(Path(os.environ.get("ZVEC_GREP_HOME", str(Path.home() / ".zvec-grep"))) / "models")).expanduser().resolve()
     catalog = Path(shutil.which("zg")).resolve().parents[1] / "engine/models/catalog.js"
     # Read the installed catalog, so model names/sizes are never guessed or downloaded.
-    script = "const m=await import(process.argv[1]); console.log(JSON.stringify(m.EMBEDDING_MODEL_CATALOG[process.argv[2]]||{}))"
+    script = ("const m=await import(process.argv[1]); "
+              "const s=await import(new URL('../pipeline/indexing/scanner/index.js',process.argv[1])); "
+              "console.log(JSON.stringify({...m.EMBEDDING_MODEL_CATALOG[process.argv[2]],"
+              "gitInventoryVersion:s.ZETTA_DELTA_GIT_INVENTORY_VERSION}))")
     entry = json.loads(run(["node", "--input-type=module", "-e", script, catalog.as_uri(), model], root, deadline).stdout)
+    if entry.get("gitInventoryVersion") != 1:
+        raise RuntimeError("zg needs the reviewed exact Git exclusion patch before automatic indexing")
     if entry.get("backend") != "llama-cpp" or not entry.get("cacheFile"):
         raise RuntimeError("zg cached model backend is not validated for automatic indexing")
     artifact = cache / entry["cacheFile"]
@@ -469,8 +496,59 @@ def zg_preflight(root, deadline):
     return zvec_model(root, deadline)
 
 
+def write_git_inventory(root: Path, deadline: float) -> Path:
+    """Persist literal effective Git exclusions, retaining tracked exceptions.
+
+    Git collapses wholly ignored directories, so generated dependency trees do
+    not require a leaf scan. Nested repositories have their own ignore rules.
+    """
+    tracked, ignored, pending = set(), set(), [("", root)]
+    while pending:
+        prefix, folder = pending.pop()
+        if (folder / ".git").exists():
+            names = run(["git", "ls-files", "-z", "--cached"], folder, deadline).stdout.split("\0")
+            excluded = run(["git", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"],
+                           folder, deadline).stdout.split("\0")
+        else:
+            with tempfile.TemporaryDirectory(prefix="context-git-inventory-") as empty:
+                run(["git", "init", "-q", "--bare", empty], folder, deadline)
+                names = []
+                excluded = run(["git", "--git-dir", empty, "--work-tree", folder, "ls-files", "-z",
+                                "--others", "--ignored", "--exclude-standard", "--directory"],
+                               folder, deadline).stdout.split("\0")
+        tracked.update(prefix + name for name in names if name and not (folder / name).is_dir()
+                       and name.split("/", 1)[0] not in INDEX_DIRS)
+        ignored.update(prefix + name for name in excluded if name)
+        ignored.update(prefix + name + "/" for name in INDEX_DIRS)
+        for name in git_files(folder, deadline):
+            child = folder / name
+            if child.is_dir() and not child.is_symlink():
+                pending.append((prefix + name.rstrip("/") + "/", child))
+    # Maintenance-owned directories are always excluded, even if committed.
+    state_dir = maintenance_dir(root, deadline)
+    path = state_dir / "codex-zg-git-inventory.json"
+    save_state(state_dir, path, {"zettaDeltaGitInventory": 1, "ignored": sorted(ignored), "tracked": sorted(tracked)})
+    return path
+
+
 def maintain_zg(root, changed, deadline):
     model, cache = zg_preflight(root, deadline)
+    inventory = write_git_inventory(root, deadline)
+    manifest = load_json(root / ".zvec-grep/manifest.json")
+    if not any(str(inventory) in entry.get("ignoreFiles", []) for entry in manifest.get("rootPaths", [])
+               if isinstance(entry, dict)):
+        changed = True  # Existing indexes must adopt the effective Git corpus.
+    ignore_files = [inventory]
+    for entry in manifest.get("rootPaths", []):
+        if isinstance(entry, dict) and Path(entry.get("absolutePath", "")).resolve() == root:
+            for value in entry.get("ignoreFiles", []):
+                path = Path(value) if Path(value).is_absolute() else root / value
+                if path not in ignore_files:
+                    ignore_files.append(path)
+    for name in (".ignore",) if (root / ".git").exists() else (".gitignore", ".ignore"):
+        path = root / name
+        if path.is_file() and path not in ignore_files:
+            ignore_files.append(path)
     guard = ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)(deny network*)"]
     # zg's default 8 embedding contexts peak near 11 GB per build; 2 measured as fast here at 3.75 GB.
     contexts = {"ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM": os.environ.get("ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM") or "2"}
@@ -492,9 +570,8 @@ def maintain_zg(root, changed, deadline):
     status = ["status", root, "--mode", "direct", "--check-ready"]
     if changed or invoke(status, check=False).returncode:
         args = ["index", root, "--mode", "direct", "--embedding", model, "--model-cache", cache]
-        for name in (".ignore",) if (root / ".git").exists() else (".gitignore", ".ignore"):
-            if (root / name).is_file():
-                args += ["--ignore-file", root / name]
+        for path in ignore_files:
+            args += ["--ignore-file", path]
         invoke(args)
         if invoke(status, check=False).returncode:
             raise RuntimeError("zg index is not ready")
@@ -610,6 +687,20 @@ def start_background_zg(root, state_dir, stamp):
     return "zg first build started in the background; zg is unavailable until it finishes"
 
 
+def zg_index_usable(root: Path, deadline: float) -> bool:
+    """Check a native store can be read; ordinary source edits remain inline refreshes."""
+    index = root / ".zvec-grep"
+    manifest = load_json(index / "manifest.json")
+    if not manifest.get("embedding") or not all((index / name).exists() for name in ("files.zvec", "index.zvec")):
+        return False
+    result = run(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)(deny network*)",
+                  "zg", "status", root, "--mode", "direct", "--check-ready", "--no-color"],
+                 root, deadline, check=False)
+    # The pinned native CLI reports source differences separately from an
+    # uncreated/unreadable store. A stale but readable store needs only refresh.
+    return result.returncode == 0 or "Workspace index needs an update" in result.stdout
+
+
 def build_zg_in_background(root, stamp):
     deadline = time.monotonic() + BACKGROUND_SECONDS
     if project_root(root) != root:
@@ -624,7 +715,18 @@ def build_zg_in_background(root, stamp):
             # Two hooks raced past the check in ensure: wait in the queue for the running build.
             queue_zg(root)
             raise RuntimeError("another zg first build is running on this machine; this one is queued") from None
-        existed = index.exists()
+        owner = None
+        try:
+            index.mkdir(mode=0o700)
+        except FileExistsError:
+            pass  # Existing directories, including partial stores, have unknown ownership.
+        else:
+            token = os.urandom(16).hex()
+            marker = index / ".codex-build-owner"
+            with safe_open(marker) as f:
+                f.write(token)
+            info = index.stat()
+            owner = (info.st_dev, info.st_ino, token)
         outcome = {"retry_after": time.time() + 600}  # a failed build backs off before the next attempt
         try:
             maintain_zg(root, True, deadline)
@@ -632,8 +734,17 @@ def build_zg_in_background(root, stamp):
         except (TimeoutError, subprocess.TimeoutExpired):
             # The killed build left residue zg cannot reopen: drop only an index this build created,
             # and stop retrying until someone builds it by hand.
-            if not existed and not index.is_symlink():
-                shutil.rmtree(index, ignore_errors=True)
+            try:
+                if owner and index.is_dir() and not index.is_symlink():
+                    info = index.stat()
+                    marker = index / ".codex-build-owner"
+                    if ((info.st_dev, info.st_ino) == owner[:2] and not marker.is_symlink()
+                            and marker.is_file() and marker.stat().st_size == len(owner[2])
+                            and marker.read_text() == owner[2]
+                            and not zg_index_usable(root, time.monotonic() + 2)):
+                        shutil.rmtree(index, ignore_errors=True)
+            except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired):
+                note("zg timeout residue was preserved because ownership/readiness could not be confirmed")
             outcome = {"gave_up": stamp}
             raise
         finally:
@@ -660,7 +771,7 @@ def ensure(root, names, deadline):
             raise RuntimeError("refusing symlinked index state or directory")
         if (root / ".git").exists():
             ignore_indexes(root, deadline)
-        stamp = fingerprint(root, deadline)
+        stamps = {}
         state = load_state(state_path)
         for name in names:
             if not shutil.which(name):
@@ -673,11 +784,16 @@ def ensure(root, names, deadline):
                 note(name + " maintenance is cooling down after an earlier failure")
                 continue
             try:
+                corpus = "zg" if name == "zg" else "code"
+                if corpus not in stamps:
+                    stamps[corpus] = fingerprint(root, deadline, name)
+                stamp = stamps[corpus]
                 if name == "zg" and lock_held(state_dir / "zg-build.lock"):
                     note("zg first build is still running in the background; zg is unavailable until it finishes")
                     continue
-                if name == "zg" and not (root / ".zvec-grep").exists():
+                if name == "zg":
                     zg_preflight(root, deadline)  # report a broken install now, not from the child
+                if name == "zg" and not zg_index_usable(root, deadline):
                     count = scope(root, deadline)[1]["zg"]
                     if "gave_up" in previous or count > FIRST_BUILD_MAX_FILES["zg"]:
                         note(f"zg skipped: a first build here ({count} files) outlasts its "
@@ -695,7 +811,8 @@ def ensure(root, names, deadline):
                     state[name] = {"fingerprint": stamp}
             except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
                 state[name] = {"retry_after": time.time() + 60}
-                note(name + ": " + str(error).splitlines()[0][:180])
+                message = "hook budget exhausted" if isinstance(error, subprocess.TimeoutExpired) else str(error)
+                note(name + ": " + message.splitlines()[0][:180])
         save_state(state_dir, state_path, state)
 
 

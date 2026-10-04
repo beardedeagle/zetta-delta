@@ -13,8 +13,12 @@ trap 'if [ "$fail" = 0 ]; then rm -rf "$T"; else echo "kept $T for inspection"; 
 check() { if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
 has() { case $2 in *"$3"*) echo "PASS $1" ;; *) echo "FAIL $1: got [$2] want it to contain [$3]"; fail=1 ;; esac; }
 fetched() { if [ -e "$T/url" ]; then cat "$T/url"; else echo none; fi; }
+# System tools (including macOS Python) may legitimately leave TMPDIR scratch.
+# Only directories owned by the installer's bundle fetch count as residue.
+download_residue() { find "$T/tmp" -mindepth 1 -maxdepth 1 -name 'zetta-delta.*' -print; }
 
 mkdir -p "$T/bin" "$T/home" "$T/tmp" "$T/delta" && touch "$T/delta/settings.json"
+printf 'system scratch\n' > "$T/tmp/system-scratch"
 # A Ponytail plugin whose cache folder name is not its version, as Codex stores it.
 pt=$T/home/.codex/plugins/cache/ponytail/ponytail/1.0.0
 mkdir -p "$pt" && printf '# Ponytail\n\nGrep every caller of the function you touch.\n' > "$pt/AGENTS.md"
@@ -55,7 +59,7 @@ check "bad ref: nothing fetched" "$(fetched)" "none"
 
 r=$(run "$ROOT/install.sh" "$prov ZETTA_DELTA_REF=abc123 FAKE_CURL_FAIL=1" --force)
 has "failed download: reported" "$r" "could not fetch https://github.com/beardedeagle/zetta-delta at abc123"
-check "failed download: temporary copy removed" "$(ls -A "$T/tmp")" ""
+check "failed download: temporary copy removed" "$(download_residue)" ""
 
 head -c "$(($(wc -c < "$ROOT/install.sh") / 2))" "$ROOT/install.sh" > "$T/half.sh"
 r=$(run "$T/half.sh" "$prov ZETTA_DELTA_REF=abc123" --force)
@@ -67,21 +71,22 @@ has "piped install: exit 0" "$r" "exit=0"
 check "piped install: fetched the pinned commit" "$(fetched)" "https://github.com/beardedeagle/zetta-delta/archive/abc123.tar.gz"
 check "piped install: profiles" "$(cd "$T/delta/profiles" && printf '%s ' *)" "deepseek-pro.toml qwen-max.toml scout-deepseek.toml scout-qwen.toml "
 check "piped install: skill" "$(cd "$T/home/.agents/skills/orchestrate" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/best-of-n.md ./references/roster.md ./scripts/bon.sh "
+  "./SKILL.md ./references/best-of-n.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/bon.sh ./scripts/identity.py "
 check "piped install: adversarial skill" "$(cd "$T/home/.agents/skills/adversarial" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/roster.md "
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/identity.py "
 check "piped install: isolated skill" "$(cd "$T/home/.agents/skills/isolated" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/roster.md ./scripts/bon.sh "
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/bon.sh ./scripts/identity.py "
 check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/.agents/skills" \
   && cmp -s orchestrate/references/roster.md adversarial/references/roster.md \
   && cmp -s orchestrate/references/roster.md isolated/references/roster.md \
   && cmp -s orchestrate/scripts/bon.sh isolated/scripts/bon.sh && echo same)" "same"
 has "piped install: isolated runs its own bon.sh" "$(cat "$T/home/.agents/skills/isolated/SKILL.md")" \
-  "sh $T/home/.agents/skills/isolated/scripts/bon.sh snapshot"
+  "sh '$T/home/.agents/skills/isolated/scripts/bon.sh' snapshot"
 check "piped install: rules in Delta's Personal AGENTS.md" "$(head -1 "$rules")" "<!-- DELTA_CONTEXT_ROUTER_START v1 -->"
 check "piped install: Ponytail labelled with its own version" "$(grep '^<!-- PONYTAIL_START' "$rules")" "<!-- PONYTAIL_START 4.10.3 -->"
 check "piped install: nothing left to paste" "$(ls -A "$T/home/.local/state" 2>/dev/null)" ""
-check "piped install: temporary copy removed" "$(ls -A "$T/tmp")" ""
+check "piped install: temporary copy removed" "$(download_residue)" ""
+check "piped install: system scratch preserved" "$(cat "$T/tmp/system-scratch")" "system scratch"
 
 r=$(run "$ROOT/install.sh" "ZETTA_DELTA_REF=abc123" --help)
 has "piped --help: usage from the fetched copy" "$r" "Usage: install.sh [--force]"
@@ -111,7 +116,7 @@ r=$(clone --force --prune-legacy)
 has "--force: exit 0" "$r" "exit=0"
 check "--force: the edited file saved first" "$(tail -n 1 "$state"/backups/*/"${T#/}"/home/.agents/skills/adversarial/SKILL.md)" "# local edit"
 check "--force: the edit replaced" "$(cmp -s "$ROOT/skills/adversarial/SKILL.md" "$T/home/.agents/skills/adversarial/SKILL.md" && echo same)" "same"
-check "--force: unchanged files not saved" "$(find "$state/backups" -name '*.toml' -o -name bon.sh | wc -l | tr -d ' ')" "0"
+check "--force: unchanged files not saved" "$(find "$state/backups" -name scout-qwen.toml -o -name scout-deepseek.toml -o -name qwen-max.toml -o -name deepseek-pro.toml -o -name bon.sh | wc -l | tr -d ' ')" "0"
 check "--prune-legacy: retired" "$(cd "$T/delta/profiles" && ls candidate.toml*)" "candidate.toml.retired"
 check "--force: old router replaced, once" "$(grep -c -e '^old router' -e '^<!-- DELTA_CONTEXT_ROUTER_START v1' "$rules")" "1"
 check "--force: the user's own rule kept" "$(tail -n 1 "$rules")" "# my own rule"

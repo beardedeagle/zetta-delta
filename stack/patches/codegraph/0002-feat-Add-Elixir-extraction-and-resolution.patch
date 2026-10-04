@@ -26,25 +26,25 @@ This is static analysis, not compiler evaluation: macro expansion,
 protocol dispatch, anonymous-function dispatch, and dynamic modules are
 out of scope, and operator definitions and ambiguous zero-argument calls
 may be missed. Elixir runs on the WASM extraction path; the native
-kernel is unchanged. EXTRACTION_VERSION moves to 28 so existing indexes
+kernel is unchanged. EXTRACTION_VERSION moves to 29 so existing indexes
 refresh.
 
 Tests: Elixir extraction and graph suites, and resolution cases for the
 Elixir matcher.
 ---
- __tests__/elixir-graph.test.ts              | 150 ++++
+ __tests__/elixir-graph.test.ts              | 195 +++++
  __tests__/elixir.test.ts                    | 440 ++++++++++++
  __tests__/resolution.test.ts                |  63 ++
  src/extraction/extraction-version.ts        |   2 +-
  src/extraction/grammars.ts                  |   4 +
- src/extraction/languages/elixir.ts          | 740 ++++++++++++++++++++
+ src/extraction/languages/elixir.ts          | 756 ++++++++++++++++++++
  src/extraction/languages/index.ts           |   2 +
  src/extraction/wasm/tree-sitter-elixir.wasm | Bin 0 -> 1617756 bytes
  src/resolution/import-resolver.ts           |   1 +
  src/resolution/index.ts                     |   7 +-
- src/resolution/name-matcher.ts              |  30 +
+ src/resolution/name-matcher.ts              |  33 +
  src/types.ts                                |   1 +
- 12 files changed, 1438 insertions(+), 2 deletions(-)
+ 12 files changed, 1502 insertions(+), 2 deletions(-)
  create mode 100644 __tests__/elixir-graph.test.ts
  create mode 100644 __tests__/elixir.test.ts
  create mode 100644 src/extraction/languages/elixir.ts
@@ -52,10 +52,10 @@ Elixir matcher.
 
 diff --git a/__tests__/elixir-graph.test.ts b/__tests__/elixir-graph.test.ts
 new file mode 100644
-index 0000000..b005158
+index 0000000..96e1a09
 --- /dev/null
 +++ b/__tests__/elixir-graph.test.ts
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,195 @@
 +import { describe, it, expect } from 'vitest';
 +import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 +import { join } from 'path';
@@ -200,6 +200,51 @@ index 0000000..b005158
 +      expect(graph.getCallers(node('Caller::run/1').id).some((r) => r.node.filePath === 'caller_test.exs')).toBe(true);
 +      const module = graph.getNodesByKind('module').find((n) => n.name === 'B.User')!;
 +      expect(graph.getCallers(module.id).some((r) => r.edge.kind === 'imports')).toBe(true);
++    } finally {
++      graph?.close();
++      rmSync(root, { recursive: true, force: true });
++    }
++  });
++});
++
++describe('Elixir defaults and import selectors', () => {
++  it('resolves omitted defaults and literal function/macro selectors', async () => {
++    const root = mkdtempSync(join(tmpdir(), 'codegraph-elixir-defaults-'));
++    let graph: CodeGraph | undefined;
++    try {
++      writeFileSync(join(root, 'defaults.ex'), String.raw`defmodule Defaults do
++  def first(), do: :first
++  def second(), do: :second
++  def body(a, b), do: {a, b}
++  def run(a \\ first(), b \\ second()), do: body(a, b)
++end`);
++      writeFileSync(join(root, 'source.ex'), `defmodule Source do
++  def f(x), do: x
++  defmacro m(x), do: quote do: unquote(x)
++end`);
++      writeFileSync(join(root, 'imports.ex'), `defmodule Functions do
++  import Source, only: :functions
++  def run_f(x), do: f(x)
++  def run_m(x), do: m(x)
++  defp m(x), do: x
++end
++defmodule Macros do
++  import Source, only: :macros
++  def run_m(x), do: m(x)
++  def run_f(x), do: f(x)
++  defp f(x), do: x
++end`);
++      graph = await CodeGraph.init(root, { index: true });
++      graph.resolveReferences();
++      const node = (name: string) => graph!.getNodesByKind('function').find((n) => n.qualifiedName === name)!;
++      const callees = (name: string) => graph!.getCallees(node(name).id).filter((r) => r.edge.kind === 'calls').map((r) => r.node.qualifiedName).sort();
++      expect(callees('Defaults::run/0')).toEqual(['Defaults::first/0', 'Defaults::run/2', 'Defaults::second/0']);
++      expect(callees('Defaults::run/1')).toEqual(['Defaults::run/2', 'Defaults::second/0']);
++      expect(callees('Defaults::run/2')).toEqual(['Defaults::body/2']);
++      expect(callees('Functions::run_f/1')).toEqual(['Source::f/1']);
++      expect(callees('Functions::run_m/1')).toEqual(['Functions::m/1']);
++      expect(callees('Macros::run_m/1')).toEqual(['Source::m/1']);
++      expect(callees('Macros::run_f/1')).toEqual(['Macros::f/1']);
 +    } finally {
 +      graph?.close();
 +      rmSync(root, { recursive: true, force: true });
@@ -735,7 +780,7 @@ index 3691e95..e41b5f6 100644
   * in the product is load-bearing").
   */
 -export const EXTRACTION_VERSION = 27;
-+export const EXTRACTION_VERSION = 28;
++export const EXTRACTION_VERSION = 29;
 diff --git a/src/extraction/grammars.ts b/src/extraction/grammars.ts
 index 6a05b96..b3961e0 100644
 --- a/src/extraction/grammars.ts
@@ -767,10 +812,10 @@ index 6a05b96..b3961e0 100644
      objc: 'Objective-C',
 diff --git a/src/extraction/languages/elixir.ts b/src/extraction/languages/elixir.ts
 new file mode 100644
-index 0000000..db438e2
+index 0000000..db35c51
 --- /dev/null
 +++ b/src/extraction/languages/elixir.ts
-@@ -0,0 +1,740 @@
+@@ -0,0 +1,756 @@
 +import type { Node as SyntaxNode } from 'web-tree-sitter';
 +import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 +import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
@@ -791,7 +836,7 @@ index 0000000..db438e2
 +// by `alias` directives, consulted by handleUserCall to expand
 +// short-name receivers (`Mod.foo/2` -> `My.Deep.Module.foo/2`).
 +let aliasStack: Array<Map<string, string>> = [];
-+type ImportScope = { module: string; only?: Set<string>; except?: Set<string> };
++type ImportScope = { module: string; only?: Set<string> | 'functions' | 'macros'; except?: Set<string> };
 +let importStack: ImportScope[][] = [];
 +
 +function visitScoped(node: SyntaxNode, ctx: ExtractorContext): void {
@@ -889,7 +934,7 @@ index 0000000..db438e2
 +// Inline `def foo(a), do: ...` puts the head call + keywords in arguments;
 +// block `def foo(a) do ... end` puts the head call in arguments and the
 +// do_block as a sibling.
-+function parseDefHead(callNode: SyntaxNode, source: string): { name: string; arity: number; defaults: number; guard?: SyntaxNode } | null {
++function parseDefHead(callNode: SyntaxNode, source: string): { name: string; arity: number; defaults: number; defaultValues: SyntaxNode[]; guard?: SyntaxNode } | null {
 +  const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
 +  if (!args || args.namedChildCount === 0) return null;
 +  let head = args.namedChild(0);
@@ -901,15 +946,18 @@ index 0000000..db438e2
 +    if (!head) return null;
 +  }
 +  if (head.type === 'identifier') {
-+    return { name: getNodeText(head, source), arity: 0, defaults: 0, guard };
++    return { name: getNodeText(head, source), arity: 0, defaults: 0, defaultValues: [], guard };
 +  }
 +  if (head.type === 'call') {
 +    const nameNode = head.namedChild(0);
 +    if (!nameNode || nameNode.type !== 'identifier') return null;
 +    const name = getNodeText(nameNode, source);
 +    const innerArgs = getChildByField(head, 'arguments') ?? findChild(head, 'arguments');
++    const defaultValues = (innerArgs?.namedChildren.filter((n) => n.type === 'binary_operator' && getChildByField(n, 'operator')?.text === '\\\\') ?? [])
++      .map((arg) => getChildByField(arg, 'right'))
++      .filter((value): value is SyntaxNode => value !== null);
 +    return { name, arity: innerArgs ? innerArgs.namedChildCount : 0,
-+      defaults: innerArgs?.namedChildren.filter((n) => n.type === 'binary_operator' && getChildByField(n, 'operator')?.text === '\\\\').length ?? 0, guard };
++      defaults: defaultValues.length, defaultValues, guard };
 +  }
 +  // Operator-style def heads (`def a + b`) wrap in binary_operator; skip.
 +  return null;
@@ -962,6 +1010,7 @@ index 0000000..db438e2
 +  const head = parseDefHead(node, ctx.source);
 +  if (!head) return true;
 +  const isPrivate = defKind === 'defp' || defKind === 'defmacrop';
++  const isMacro = defKind === 'defmacro' || defKind === 'defmacrop';
 +  const docstring = docBuffer.get(node.startIndex);
 +  const signature = specBuffer.get(node.startIndex);
 +  docBuffer.delete(node.startIndex);
@@ -972,7 +1021,8 @@ index 0000000..db438e2
 +    const qualifiedName = expectedQualifiedName(name, ctx);
 +    const fnNode = ctx.nodes.find((n) => n.kind === 'function' && n.qualifiedName === qualifiedName)
 +      ?? ctx.createNode('function', name, node, { qualifiedName,
-+        visibility: isPrivate ? 'private' : 'public', docstring, signature });
++        visibility: isPrivate ? 'private' : 'public', docstring, signature,
++        ...(isMacro ? { decorators: ['macro'] } : {}) });
 +    if (!fnNode) continue;
 +    // Keep all clause bodies recoverable from the single function identity.
 +    fnNode.endLine = Math.max(fnNode.endLine, node.endPosition.row + 1);
@@ -982,6 +1032,9 @@ index 0000000..db438e2
 +    importStack.push([]);
 +    try {
 +      if (arity < head.arity) {
++        // Omitted defaults are evaluated by this wrapper, not the full-arity
++        // implementation. Elixir omits the rightmost defaults first.
++        for (const value of head.defaultValues.slice(-(head.arity - arity))) ctx.visitNode(value);
 +        ctx.addUnresolvedReference({ fromNodeId: fnNode.id,
 +          referenceName: `${head.name}/${head.arity}`, referenceKind: 'calls',
 +          line: node.startPosition.row + 1, column: node.startPosition.column,
@@ -1159,6 +1212,10 @@ index 0000000..db438e2
 +        const key = getChildByField(pair, 'key')?.text.trim().replace(/:$/, '');
 +        if (key !== 'only' && key !== 'except') continue;
 +        const value = getChildByField(pair, 'value');
++        if (key === 'only' && (value?.text === ':functions' || value?.text === ':macros')) {
++          spec.only = value.text === ':functions' ? 'functions' : 'macros';
++          continue;
++        }
 +        // Non-literal selectors cannot safely establish a static import.
 +        const selected = new Set<string>();
 +        for (const match of value?.text.matchAll(/([a-z_][\w!?]*)\s*:\s*(\d+)/g) ?? []) selected.add(`${match[1]}/${match[2]}`);
@@ -1414,7 +1471,11 @@ index 0000000..db438e2
 +        const imp = scope[index]!;
 +        if (seen.has(imp.module)) continue;
 +        seen.add(imp.module);
-+        if ((!imp.only || imp.only.has(name)) && !imp.except?.has(name)) candidates.push(`${imp.module}.${name}`);
++        if (imp.except?.has(name)) continue;
++        // Selector tags survive the existing string-candidate persistence path.
++        // The resolver checks the declaration kind before choosing a target.
++        if (typeof imp.only === 'string') candidates.push(`@${imp.only}:${imp.module}.${name}`);
++        else if (!imp.only || imp.only.has(name)) candidates.push(`${imp.module}.${name}`);
 +      }
 +    }
 +  }
@@ -5860,7 +5921,7 @@ diff --git a/src/resolution/name-matcher.ts b/src/resolution/name-matcher.ts
 index e0b4ad2..89f48a7 100644
 --- a/src/resolution/name-matcher.ts
 +++ b/src/resolution/name-matcher.ts
-@@ -14,6 +14,36 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
+@@ -14,6 +14,39 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
  import { isTestPath } from '../search/query-utils';
  import { isMinifiedContent } from '../extraction/generated-detection';
  import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -5876,11 +5937,14 @@ index e0b4ad2..89f48a7 100644
 +  }
 +  const targets = new Map<string, Node>();
 +  for (const name of names) {
-+    const dot = calls ? name.lastIndexOf('.') : -1;
-+    const canonical = dot > 0 ? `${name.slice(0, dot)}::${name.slice(dot + 1)}` : name;
++    const selector = calls ? name.match(/^@(functions|macros):(.+)$/) : null;
++    const identity = selector ? selector[2]! : name;
++    const dot = calls ? identity.lastIndexOf('.') : -1;
++    const canonical = dot > 0 ? `${identity.slice(0, dot)}::${identity.slice(dot + 1)}` : identity;
 +    for (const node of context.getNodesByQualifiedName(canonical)) {
 +      if (node.language !== 'elixir') continue;
 +      if (calls ? node.kind !== 'function' : !['module', 'protocol'].includes(node.kind)) continue;
++      if (selector && (node.decorators?.includes('macro') === true) !== (selector[1] === 'macros')) continue;
 +      // Private functions/macros are callable only within their declaring module.
 +      if (calls && node.visibility === 'private') {
 +        const from = context.getNodeById?.(ref.fromNodeId);

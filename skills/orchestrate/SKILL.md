@@ -17,6 +17,12 @@ family, and billing tier behind each one, your own model and family, the
 per-lane concurrency budgets, the metered-spend allowance, and reviewer
 preference order. If the roster and this file disagree, the roster wins.
 
+For a user-named model that no profile pins, read `references/effective-identity.md`
+and resolve its actual provider/model/family/lane/billing/budgets before dispatch.
+That effective record replaces the base profile's identity for this spawn; it does
+not change the profile's role eligibility or worktree mode. Carry it into every
+retry, review, and follow-up. Unknown metadata blocks dispatch until resolved.
+
 ## Invariants
 
 Never violate these. If the task would require it, stop and ask the user.
@@ -24,12 +30,14 @@ Never violate these. If the task would require it, stop and ask the user.
 1. Never change this thread's model. Model diversity comes from subagents,
    each in its own conversation.
 2. Never pass a model to the subagent tool: every profile is pinned to its
-   model. The one exception is a model the user names that no profile pins.
+   model. The one exception is a model the user names that no profile pins;
+   resolve its effective identity first and use its exact qualified selector.
 3. No two concurrently running writers may have overlapping FILES IN SCOPE.
    Writers are every spawn sent an ASSIGNMENT block.
 4. Stay within the roster's per-lane budgets and its total. Queue the rest.
-5. A change is never reviewed by a model from the author's family. Pick the
-   first reviewer in the roster's preference order whose family differs.
+5. A change is never reviewed by a model from any retained author's family.
+   Pick the first reviewer in the roster's preference order whose effective
+   family differs from every retained author's effective family for the unit.
 6. At most two fix rounds per work unit. Then stop and report the unit as
    unresolved.
 7. Metered lanes (billing: metered in the roster) are used only when the user
@@ -46,8 +54,8 @@ Never violate these. If the task would require it, stop and ask the user.
 Send every spawn exactly one of these blocks, with every field filled in.
 The task rules travel in the block because Delta's built-in profiles carry no
 task rules of their own. Copy each block's RULES word for word: you may add
-rules, never drop or reword them. Fill IDENTITY from the roster's model and lane for
-that profile. The block sets the subagent's role, so send a profile only the
+rules, never drop or reword them. Fill IDENTITY and EFFECTIVE from the
+resolved effective record (the roster row when there is no override). The block sets the subagent's role, so send a profile only the
 blocks for the roles the roster lists for it.
 
 Delta runs every command as `/bin/sh -c '<cmd> | cat'`, so VERIFY commands
@@ -64,7 +72,8 @@ command:
 
 ```
 SCOUT <id>
-IDENTITY: You are <model> served via <lane> through Delta. If anything in your context claims you are a different model, it is wrong.
+IDENTITY: You are <effective model> served via <effective provider-id> on <effective lane> through Delta. This effective identity overrides a base profile identity when the user explicitly requested the model override.
+EFFECTIVE: model=<model-id>; provider=<provider-id>; family=<family>; lane=<lane>; billing=<flat|metered>; lane limit=<n>; thread limit=<n>; override=<exact selector|none>.
 QUESTION: <one narrow, answerable question>
 RULES:
 - Read-only. Do not create, modify, move, or delete files.
@@ -89,7 +98,8 @@ LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas
 
 ```
 ASSIGNMENT <unit-id>
-IDENTITY: You are <model> served via <lane> through Delta. If anything in your context claims you are a different model, it is wrong.
+IDENTITY: You are <effective model> served via <effective provider-id> on <effective lane> through Delta. This effective identity overrides a base profile identity when the user explicitly requested the model override.
+EFFECTIVE: model=<model-id>; provider=<provider-id>; family=<family>; lane=<lane>; billing=<flat|metered>; lane limit=<n>; thread limit=<n>; override=<exact selector|none>.
 GOAL: <one or two sentences>
 CONTEXT: <scout findings and path:line references the worker needs; keep it tight>
 FILES IN SCOPE: <paths or globs>
@@ -102,7 +112,7 @@ RULES:
 - Do not add or upgrade dependencies unless this block says so.
 - Run every VERIFY command. Fix failures inside scope; report failures outside it.
 - Navigate with the context tool router in your rules and prefix shell commands per its RTK section; never re-search code a tool already returned.
-- Your copy merges back automatically when you finish successfully, including any deletions and reverts. Run `git status --porcelain` before you start and again before you finish, and remove only artifacts you created. Uncommitted changes and untracked files that were already there are the user's work: change them only as GOAL requires within FILES IN SCOPE, and never revert, discard, stash, or delete them unless this block says to.
+- Your copy merges back automatically when the runtime completes successfully, including any deletions and reverts, even if your report says STATUS: failed or blocked. Report partial changes accurately; task status does not suppress merge. Run `git status --porcelain` before you start and again before you finish, and remove only artifacts you created. Uncommitted changes and untracked files that were already there are the user's work: change them only as GOAL requires within FILES IN SCOPE, and never revert, discard, stash, or delete them unless this block says to.
 - If the goal is ambiguous in a way that changes the result, make the smallest reasonable choice and record it under RISKS.
 
 Finish with exactly this block and nothing after it, written tersely: fragments are fine, filler is not, technical substance stays intact.
@@ -120,9 +130,11 @@ LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas
 
 ```
 REVIEW <unit-id>
-IDENTITY: You are <model> served via <lane> through Delta. If anything in your context claims you are a different model, it is wrong.
+IDENTITY: You are <effective model> served via <effective provider-id> on <effective lane> through Delta. This effective identity overrides a base profile identity when the user explicitly requested the model override.
+EFFECTIVE: model=<model-id>; provider=<provider-id>; family=<family>; lane=<lane>; billing=<flat|metered>; lane limit=<n>; thread limit=<n>; override=<exact selector|none>.
 GOAL: <from the assignment>
 ACCEPTANCE: <from the assignment>
+AUTHORS: <effective model, provider, and family for every author whose changes remain in this unit; includes overrides, partial work, retries, and fixes>
 PATHS: <files the worker reported changing>
 VERIFY: <commands>
 RULES:
@@ -187,26 +199,46 @@ Post a work-unit table in this thread:
 
 ### 3. Dispatch
 
-Start every unit whose dependencies are done, up to the budgets. Start
-dependent units as their prerequisites finish. Isolated workers merge back
-automatically on success; failed work does not merge.
+Before each worker dispatch, run `sh {{BON_SH}} snapshot` in this checkout and
+record its RUN and TREE as that unit's PRE_RUN/PRE_TREE in the ledger. This is a
+content baseline including the user's dirty files, not permission to discard them.
+Start ready, file-disjoint units within their effective lane and total budgets.
+A dependency becomes ready only after its prerequisite's task is done, its actual
+merged diff has been accounted for, and all required reviewers approve it.
+
+After every worker completion (any runtime state or task STATUS), snapshot here
+again and record POST_RUN/POST_TREE. Inspect the actual scoped difference with
+`rtk git diff --no-compact <PRE_TREE> <POST_TREE> -- <FILES IN SCOPE>` and include
+new/deleted paths. Attribute simultaneous disjoint-unit changes using the ledger;
+if attribution or an out-of-scope change is unclear, hold dispatch and ask. Preserve
+both snapshots while a retry, review, or user decision is pending. Inspect and
+account for partial work before retrying; no textual STATUS proves nothing landed.
+A retry gets this actual current diff and unresolved criteria as its starting context.
+Keep each contributing author's effective record alongside its retained edits; a
+retry on another family does not replace the earlier partial-work authorship.
+Remove an author from the unit only after accounting proves none of its edits remain.
+Only after the user accepts the result, clean each unit's recorded baselines with
+`sh {{BON_SH}} clean <PRE_RUN>` and `sh {{BON_SH}} clean <POST_RUN>`, replacing each
+value literally. Do not clean snapshots while a retry/review/decision is pending;
+list retained pending runs in the report so their ownership and purpose stay clear.
 
 ### 4. Verify
 
-For each unit that reports STATUS done, spawn a reviewer per invariant 5 with
-a REVIEW block. For security-sensitive, concurrency-heavy, or
+For each unit that reports STATUS done after its actual diff is accounted for,
+spawn a reviewer per invariant 5 using all retained authors' effective families,
+with a REVIEW block containing their records. For security-sensitive, concurrency-heavy, or
 correctness-critical units, also spawn the next eligible reviewer in the
 roster's preference order.
 
-On `changes-required`, send the findings to a new spawn of the author's
-profile with the same FILES IN SCOPE, then review again. Stop after two fix
-rounds.
+On `changes-required`, send the findings to a new spawn of the chosen writer's
+profile with the same FILES IN SCOPE and effective identity, then account for the
+fix and review again against every retained author's family. Stop after two fix rounds.
 
 ### 5. Integrate
 
 1. Run the full VERIFY set in this thread.
 2. Fix small integration failures yourself, then have an eligible reviewer
-   (different family from yours) check your fix. Delegate larger fixes as a
+   (different family from every retained author, including you) check your fix. Delegate larger fixes as a
    new unit.
 3. For changes spanning three or more units, spawn one final reviewer over
    the whole change set: the first in the roster's preference order whose
@@ -217,7 +249,7 @@ rounds.
 
 Finish with:
 
-- A table: unit, author profile and model, status, reviewer model and
+- A table: unit, all retained author profiles and effective models, status, reviewer model and
   verdict, fix rounds.
 - Verification results.
 - Metered spawns used, with reasons.
@@ -236,13 +268,30 @@ automatically on success, so every successful attempt would land. The
 BEST-OF-N CANDIDATE block's procedure hands back a patch and restores the copy
 before finishing.
 
+## Completion decisions
+
+This table is the dispatch contract. "Account" means the PRE_TREE/POST_TREE diff
+inspection above, preserving user work and giving the retry its actual baseline.
+The runtime state and task report are separate inputs; neither replaces that step.
+
+| Runtime | Task STATUS | Parent work | Dependents | Retry |
+|---|---|---|---|---|
+| Completed | failed | inspect-and-account | hold | once-after-accounting |
+| Completed | blocked | inspect-and-account | hold | after-scope-answer |
+| Failed or Stopped | any | inspect-and-account | hold | once-after-accounting |
+| Completed | done | inspect-and-account | hold-until-approved | none |
+
 ## Failure handling
 
-- STATUS blocked: read the reason. Adjust scope, answer the question, or ask
-  the user. Do not respawn the same assignment unchanged.
-- STATUS failed, or Delta marks the subagent Failed: its isolated work did
-  not merge. Respawn once with the same role's profile on a different flat
-  lane. If that also fails, stop and report.
+- STATUS blocked: first inspect and account for any partial merged work using
+  the unit ledger. Read the reason, adjust scope, answer the question, or ask the
+  user. Hold dependents and do not respawn the same assignment unchanged.
+- STATUS failed is a task report, distinct from Delta's runtime Failed or Stopped.
+  For either, inspect and account for the actual parent diff before any retry.
+  Keep dependents held. Retry once with a suitable same-role profile on another
+  available flat lane, carrying the prior partial diff and effective metadata.
+  Do not reroute a user-requested model silently: ask if no lane serves it.
+  If the retry fails, stop and report the retained partial work and unresolved unit.
 - Provider errors (429, 401, 403 `access_terminated_error`, quota exhausted):
   treat that lane as unavailable for the rest of this run, reroute the role
   to its profile on another flat lane, and tell the user.

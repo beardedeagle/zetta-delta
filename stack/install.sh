@@ -173,7 +173,7 @@ install_zvec_grep() { # pack the patched source under a stamped version, install
 }
 
 install_codegraph() { # upstream's self-contained bundle, linked like upstream's install.sh does
-  local dir target tag dest
+  local dir target tag dest stamp
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)               target=darwin-arm64 ;;
     Darwin-x86_64)              target=darwin-x64 ;;
@@ -187,10 +187,19 @@ install_codegraph() { # upstream's self-contained bundle, linked like upstream's
   # CARGO_TARGET_DIR unset for it.
   (cd "$dir" && npm ci --no-audit --no-fund --loglevel=error \
      && env -u CARGO_TARGET_DIR bash scripts/build-kernel.sh && bash scripts/build-bundle.sh "$target")
-  dest="$CODEGRAPH_INSTALL_DIR/versions/$tag-zetta-delta"
-  rm -rf -- "$dest"
-  mkdir -p -- "$dest" "$CODEGRAPH_BIN_DIR"
-  tar -xzf "$dir/release/codegraph-$target.tar.gz" -C "$dest" --strip-components=1
+  stamp="$(while IFS= read -r p; do cat -- "$p"; done < <(patches codegraph) | git hash-object --stdin)"
+  mkdir -p -- "$CODEGRAPH_INSTALL_DIR/versions" "$CODEGRAPH_BIN_DIR"
+  # A fresh build directory preserves the active bundle, including on a
+  # same-release patch update or reinstall. Activate only a complete bundle.
+  dest="$(mktemp -d "$CODEGRAPH_INSTALL_DIR/versions/$tag-zetta-delta.${stamp:0:12}-$target.XXXXXX")"
+  if ! tar -xzf "$dir/release/codegraph-$target.tar.gz" -C "$dest" --strip-components=1; then
+    rm -rf -- "$dest"
+    die "codegraph: bundle extraction failed; the previous install is unchanged"
+  fi
+  if [[ ! -x $dest/bin/codegraph ]]; then
+    rm -rf -- "$dest"
+    die "codegraph: bundle has no executable launcher; the previous install is unchanged"
+  fi
   ln -sf -- "$dest/bin/codegraph" "$CODEGRAPH_BIN_DIR/codegraph"
   ln -sfn -- "$dest" "$CODEGRAPH_INSTALL_DIR/current"
 }

@@ -75,7 +75,10 @@ tmp="$(mktemp "${env_file}.XXXXXX")"
   # Rust: share compiled artifacts across checkouts; keep target/ per checkout.
   if command -v sccache >/dev/null 2>&1; then
     printf 'export RUSTC_WRAPPER=sccache\n'
-    printf 'export SCCACHE_DIR=%s\n' "${SCCACHE_DIR:-$HOME/.cache/sccache}"
+    cache_dir="${SCCACHE_DIR:-$HOME/.cache/sccache}"
+    # POSIX single quotes preserve whitespace/control characters. Escape each
+    # apostrophe outside the quoted word so sh/dash can source the result too.
+    printf "export SCCACHE_DIR='%s'\n" "${cache_dir//\'/\'\\\'\'}"
   fi
 } > "$tmp"
 mv -f -- "$tmp" "$env_file"
@@ -107,15 +110,21 @@ fi
 ensure="$HOME/.local/share/zetta-delta/ensure-context-indexes.py"
 if [ "${DELTA_PREPARE_INDEXES:-1}" != 0 ] && [ -f "$ensure" ] && command -v python3 >/dev/null 2>&1; then
   log="${DELTA_SCRATCH_DIR:-${TMPDIR:-/tmp}}/context-indexes.log"
-  python3 - "$ensure" "$root" "$log" <<'PY'
+  if ! python3 - "$ensure" "$root" "$log" <<'PY'
 import json, subprocess, sys
 ensure, root, log = sys.argv[1:4]
-with open(log, "ab") as out:
-    child = subprocess.Popen([sys.executable, ensure], stdin=subprocess.PIPE, stdout=out, stderr=out,
-                             start_new_session=True)
-    child.stdin.write(json.dumps({"hook_event_name": "SessionStart", "cwd": root}).encode())
-    child.stdin.close()
+try:
+    with open(log, "ab") as out:
+        child = subprocess.Popen([sys.executable, ensure], stdin=subprocess.PIPE, stdout=out, stderr=out,
+                                 start_new_session=True)
+        child.stdin.write(json.dumps({"hook_event_name": "SessionStart", "cwd": root}).encode())
+        child.stdin.close()
+except OSError as error:
+    print(f"prepare: warning: context indexes skipped: {error}", file=sys.stderr)
 PY
+  then
+    echo "prepare: warning: context indexes skipped: Python launcher failed" >&2
+  fi
 fi
 
 echo "prepare: $root -> slot $slot"

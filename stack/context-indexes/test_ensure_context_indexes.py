@@ -22,9 +22,11 @@ class HookTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="context-hook-test-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
+        (self.base / "home").mkdir()
         # Keep cache-held maintenance files, including the machine-wide zg lock, out of the real cache.
         # Keep the user's index-roots file and Semble cache out of the tests too.
-        cache = patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.base / "cache"),
+        cache = patch.dict(os.environ, {"HOME": str(self.base / "home"),
+                                        "XDG_CACHE_HOME": str(self.base / "cache"),
                                         "XDG_CONFIG_HOME": str(self.base / "config"),
                                         "SEMBLE_CACHE_LOCATION": str(self.base / "semble-cache")})
         cache.start()
@@ -130,6 +132,7 @@ else:
             for changed in (False, True):
                 with self.subTest(detail=detail, changed=changed), \
                      patch.object(module.Path, "home", return_value=self.base), \
+                     patch.object(module, "write_git_inventory", return_value=self.root / ".git/fixture-inventory.json"), \
                      patch.object(module, "zvec_model", return_value=("local/cached", self.base / "cache")), \
                      patch.object(module, "run", return_value=subprocess.CompletedProcess(
                          [], 1, "FAKE_PRIVATE_OUTPUT", detail + "FAKE_PRIVATE_VALUE")) as run:
@@ -147,6 +150,7 @@ else:
         checker.parent.mkdir(parents=True)
         checker.touch()
         with patch.object(module.Path, "home", return_value=self.base), \
+             patch.object(module, "write_git_inventory", return_value=self.root / ".git/fixture-inventory.json"), \
              patch.object(module, "zvec_model") as model, \
              patch.object(module, "run", return_value=subprocess.CompletedProcess(
                  [], 1, "FAKE_PRIVATE_OUTPUT", "FAKE_PRIVATE_ERROR")) as run:
@@ -171,10 +175,12 @@ else:
         exclude.write_text(exclude.read_text() + "\n.ignore\n")
         before = module.fingerprint(self.root, time.monotonic() + 2)
         with patch.object(module.Path, "home", return_value=self.base), \
+             patch.object(module, "write_git_inventory", return_value=self.root / ".git/fixture-inventory.json"), \
              patch.object(module, "zvec_model", return_value=("local/cached", self.base / "cache")), \
              patch.object(module, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
             module.maintain_zg(self.root, True, time.monotonic() + 1)
-            self.assertNotIn("--ignore-file", run.call_args_list[0].args[0])
+            self.assertEqual(run.call_args_list[0].args[0][-2:],
+                             ["--ignore-file", self.root / ".git/fixture-inventory.json"])
             rules.write_text(".env*\n")
             run.reset_mock()
             module.maintain_zg(self.root, True, time.monotonic() + 1)
@@ -364,6 +370,7 @@ else:
                 module.maintain_tgrep(app, True, time.monotonic() + 1)
             self.assertIn("--no-require-git", run.call_args_list[1].args[0])
         with patch.object(module, "zg_preflight", return_value=("local/cached", self.base / "cache")), \
+             patch.object(module, "write_git_inventory", return_value=self.base / "fixture-inventory.json"), \
              patch.object(module, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
             module.maintain_zg(app, True, time.monotonic() + 1)
             self.assertEqual(run.call_args_list[0].args[0][-2:], ["--ignore-file", app / ".gitignore"])
@@ -379,6 +386,7 @@ else:
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         with patch.object(module.shutil, "which", return_value="/usr/bin/true"), \
              patch.object(module, "zg_preflight") as preflight, \
+             patch.object(module, "zg_index_usable", side_effect=lambda *args: (self.root / ".zvec-grep").exists()), \
              patch.object(module, "start_background_zg", return_value="started") as start, \
              patch.object(module, "start_queued_zg") as start_next, \
              patch.object(module, "maintain_zg") as maintain:
@@ -487,7 +495,7 @@ else:
         index.rmdir()
 
         def killed(*args):
-            index.mkdir()
+            index.mkdir(exist_ok=True)
             raise subprocess.TimeoutExpired("zg", 1)
         with patch.object(module, "maintain_zg", side_effect=killed):
             with self.assertRaises(subprocess.TimeoutExpired):
