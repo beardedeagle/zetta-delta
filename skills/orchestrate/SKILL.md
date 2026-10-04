@@ -70,6 +70,7 @@ QUESTION: <one narrow, answerable question>
 RULES:
 - Read-only. Do not create, modify, move, or delete files.
 - Do not run builds, installs, formatters, or git commands that change state.
+- The one exception is the index maintainer your rules tell you to run: it writes only index caches and files Git ignores, never a tracked file.
 - Search with the context tool router in your rules: tgrep for exact text, semble for unknown locations, codegraph for structure, zg for prose, ctx7 and githits for external docs and OSS. Do not start with rg, grep, or find.
 - Cite evidence as path:line. Write "unknown" rather than guess.
 - Keep the report under about 400 words.
@@ -159,9 +160,9 @@ Best-of-N only. Follow `references/best-of-n.md`.
    once before spawning anything.
 5. If the user mentions another orchestrator thread running at the same time,
    use half of each roster budget (rounded down, minimum 1) for this run.
-6. Check context-index readiness once for this checkout: `tgrep status
-   /abs/root` and `codegraph status /abs/root`. If either is missing, run the
-   bounded index command from the personal rules before dispatching scouts.
+6. Run the index maintainer once for this checkout, as the personal rules
+   describe, before dispatching scouts. It builds missing indexes and
+   refreshes stale ones, so each scout's own run returns at once.
 
 ### 1. Recon
 
