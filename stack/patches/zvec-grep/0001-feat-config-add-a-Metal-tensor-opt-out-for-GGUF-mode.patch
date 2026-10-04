@@ -1,0 +1,172 @@
+From 119bf930dc7021455b693423d521876782a9b715 Mon Sep 17 00:00:00 2001
+From: beardedeagle <randy@heroictek.com>
+Date: Fri, 2 Oct 2026 20:51:55 -0500
+Subject: [PATCH 1/2] feat(config): add a Metal tensor opt-out for GGUF models
+
+Add defaults.disableMetalTensor to the global config. When true, the
+llama.cpp backend sets GGML_METAL_TENSOR_DISABLE before loading the
+runtime, so hosts whose Metal tensor kernels fail keep Metal GPU
+offload without them. An explicit environment value still wins.
+---
+ docs/07-embedding.md                    | 13 +++++++++++
+ src/engine/config.ts                    | 18 +++++++++++++-
+ src/engine/models/backends/llama-cpp.ts | 15 ++++++++----
+ test/config.test.mjs                    | 31 +++++++++++++++++++++++++
+ 4 files changed, 71 insertions(+), 6 deletions(-)
+
+diff --git a/docs/07-embedding.md b/docs/07-embedding.md
+index fa00f2b..e333247 100644
+--- a/docs/07-embedding.md
++++ b/docs/07-embedding.md
+@@ -113,6 +113,19 @@ The equivalent environment override is `ZVEC_GREP_DEVICE`. Model2Vec models
+ such as Potion use static vector lookup, so selecting a GPU does not improve
+ their runtime.
+ 
++On macOS, GGUF models use Metal tensor kernels when the GPU supports them. If
++those kernels fail on a host, skip them while keeping Metal GPU offload by
++setting `defaults.disableMetalTensor` in `~/.zvec-grep/config.json`:
++
++```json
++{
++  "version": 1,
++  "defaults": { "disableMetalTensor": true }
++}
++```
++
++The setting applies to every GGUF model loaded by the process.
++
+ Override the download cache with `--model-cache` or `ZVEC_GREP_MODEL_CACHE`:
+ 
+ ```bash
+diff --git a/src/engine/config.ts b/src/engine/config.ts
+index ad438cc..ef13cb5 100644
+--- a/src/engine/config.ts
++++ b/src/engine/config.ts
+@@ -7,6 +7,8 @@ import { acquireReadWriteLock } from "./utils/lock.js";
+ export type ZvecGrepGlobalDefaults = {
+   embedding?: string;
+   modelCacheDir?: string;
++  /** Skip unsupported optional Metal tensor kernels; Metal GPU offload stays enabled. */
++  disableMetalTensor?: boolean;
+ };
+ 
+ export type ZvecGrepProviderConfig = {
+@@ -323,7 +325,20 @@ function parseDefaults(
+   if (!isRecord(value)) {
+     throw invalidConfig(path, "defaults must be an object");
+   }
+-  assertKnownFields(value, ["embedding", "modelCacheDir"], path, "defaults");
++  assertKnownFields(
++    value,
++    ["embedding", "modelCacheDir", "disableMetalTensor"],
++    path,
++    "defaults",
++  );
++
++  const disableMetalTensor = value.disableMetalTensor;
++  if (
++    disableMetalTensor !== undefined &&
++    typeof disableMetalTensor !== "boolean"
++  ) {
++    throw invalidConfig(path, "defaults.disableMetalTensor must be a boolean");
++  }
+ 
+   const embedding = optionalNonEmptyString(
+     value.embedding,
+@@ -338,6 +353,7 @@ function parseDefaults(
+   const defaults: ZvecGrepGlobalDefaults = {
+     ...(embedding ? { embedding } : {}),
+     ...(modelCacheDir ? { modelCacheDir } : {}),
++    ...(disableMetalTensor !== undefined ? { disableMetalTensor } : {}),
+   };
+   return Object.keys(defaults).length > 0 ? defaults : undefined;
+ }
+diff --git a/src/engine/models/backends/llama-cpp.ts b/src/engine/models/backends/llama-cpp.ts
+index 7ade13f..288fe47 100644
+--- a/src/engine/models/backends/llama-cpp.ts
++++ b/src/engine/models/backends/llama-cpp.ts
+@@ -7,6 +7,7 @@ import {
+   unlinkSync,
+ } from "node:fs";
+ import { join, resolve } from "node:path";
++import { readGlobalConfig } from "../../config.js";
+ import { EngineError } from "../../errors.js";
+ import type { Content, TextContent } from "../../types.js";
+ import { defaultHome } from "../../utils/path.js";
+@@ -93,8 +94,8 @@ const SUPPRESSED_LLAMA_CPP_LOG_MESSAGES = new Set(["Failed to get swap info"]);
+ 
+ async function defaultNodeLlamaCppLoader(): Promise<NodeLlamaCppModule> {
+   const moduleName = "node-llama-cpp";
++  installDarwinMetalRuntimeMitigations();
+   try {
+-    installDarwinMetalResidencyMitigation();
+     return (await import(moduleName)) as NodeLlamaCppModule;
+   } catch (cause) {
+     throw new EngineError(
+@@ -109,16 +110,20 @@ async function defaultNodeLlamaCppLoader(): Promise<NodeLlamaCppModule> {
+   }
+ }
+ 
+-function installDarwinMetalResidencyMitigation(): void {
++function installDarwinMetalRuntimeMitigations(): void {
+   if (process.platform !== "darwin") {
+     return;
+   }
+ 
+-  if (process.env.ZVEC_GREP_METAL_KEEP_RESIDENCY === "1") {
+-    return;
++  // The native backend is process-global, so this is a host default, not a
++  // per-model setting. Leave tensor support unchanged unless explicitly disabled.
++  if (readGlobalConfig().defaults?.disableMetalTensor === true) {
++    process.env.GGML_METAL_TENSOR_DISABLE ??= "1";
+   }
+ 
+-  process.env.GGML_METAL_NO_RESIDENCY ??= "1";
++  if (process.env.ZVEC_GREP_METAL_KEEP_RESIDENCY !== "1") {
++    process.env.GGML_METAL_NO_RESIDENCY ??= "1";
++  }
+ }
+ 
+ let defaultRuntimeImport: Promise<NodeLlamaCppModule> | null = null;
+diff --git a/test/config.test.mjs b/test/config.test.mjs
+index 172a913..cc7eb1e 100644
+--- a/test/config.test.mjs
++++ b/test/config.test.mjs
+@@ -168,6 +168,37 @@ test("embedding runtime resolver preserves every precedence layer", () => {
+   );
+ });
+ 
++test("global config accepts an explicit Metal tensor workaround and rejects non-booleans", async (t) => {
++  const directory = await mkdtemp(join(tmpdir(), "zvec-grep-metal-config-"));
++  const configPath = join(directory, "config.json");
++  t.after(() => rm(directory, { recursive: true, force: true }));
++
++  for (const disableMetalTensor of [true, false]) {
++    updateGlobalConfig({ defaults: { disableMetalTensor } }, configPath);
++    assert.equal(
++      readGlobalConfig(configPath).defaults.disableMetalTensor,
++      disableMetalTensor,
++    );
++  }
++  for (const disableMetalTensor of ["true", 1, null]) {
++    await writeFile(
++      configPath,
++      JSON.stringify({ version: 1, defaults: { disableMetalTensor } }),
++    );
++    assert.throws(
++      () => readGlobalConfig(configPath),
++      (error) => {
++        assert.equal(error.code, "ZVEC_GREP.ENGINE.CONFIG.INVALID");
++        assert.match(
++          error.context,
++          /defaults\.disableMetalTensor must be a boolean/,
++        );
++        return true;
++      },
++    );
++  }
++});
++
+ test("embedding reference resolver prefers the environment over the global default", () => {
+   assert.equal(
+     resolveEmbeddingReference({
