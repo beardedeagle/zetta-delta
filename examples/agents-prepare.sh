@@ -28,6 +28,19 @@ claim() { # $1=slot; atomic via mkdir
   return 1
 }
 
+reclaim() { # $1=slot whose checkout looked gone; one reclaimer at a time
+  local lock="$slots_dir/.reclaim.lock" owner
+  # A lock left by a killed run is stale after a minute.
+  if [ -n "$(find "$lock" -prune -mmin +1 2>/dev/null)" ]; then rmdir -- "$lock" 2>/dev/null || true; fi
+  mkdir -- "$lock" 2>/dev/null || return 1
+  # Look again under the lock: another run may have reclaimed the slot since.
+  owner="$(cat -- "$slots_dir/$1/owner" 2>/dev/null || true)"
+  if [ -n "$owner" ] && [ ! -d "$owner" ]; then rm -rf -- "${slots_dir:?}/$1"; fi
+  if claim "$1"; then rmdir -- "$lock"; return 0; fi
+  rmdir -- "$lock"
+  return 1
+}
+
 slot=""
 # 1. Reuse this checkout's existing claim, so reruns keep the same slot.
 for d in "$slots_dir"/*/; do
@@ -43,10 +56,7 @@ if [ -z "$slot" ]; then
   for n in $(seq 1 "$max_slots"); do
     if claim "$n"; then slot="$n"; break; fi
     owner="$(cat -- "$slots_dir/$n/owner" 2>/dev/null || true)"
-    if [ -n "$owner" ] && [ ! -d "$owner" ]; then
-      rm -rf -- "${slots_dir:?}/$n"
-      if claim "$n"; then slot="$n"; break; fi
-    fi
+    if [ -n "$owner" ] && [ ! -d "$owner" ] && reclaim "$n"; then slot="$n"; break; fi
   done
 fi
 [ -n "$slot" ] || { echo "prepare: no free slot in $slots_dir (max $max_slots)" >&2; exit 1; }
@@ -78,21 +88,34 @@ if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
   grep -qxF '.delta-env' "$exclude" 2>/dev/null || printf '%s\n' '.delta-env' >> "$exclude"
 fi
 
-# Per-checkout dependency setup. Keep what applies to the project.
-[ -f "$root/mix.exs" ]    && (cd "$root" && mix deps.get)
-[ -f "$root/Cargo.toml" ] && (cd "$root" && cargo fetch)
+# Per-checkout dependency setup. Keep what applies to the project. Tests need
+# the dependencies, so this waits for them, but each fetch tries the local
+# package caches first: a checkout whose dependencies are cached needs no network.
+if [ -f "$root/mix.exs" ]; then
+  (cd "$root" && { HEX_OFFLINE=1 mix deps.get >/dev/null 2>&1 || mix deps.get; })
+fi
+if [ -f "$root/Cargo.toml" ]; then
+  (cd "$root" && { cargo fetch --offline >/dev/null 2>&1 || cargo fetch; })
+fi
 
 # Context indexes (tgrep, CodeGraph, zvec). Delta has no SessionStart hook, so
 # feed the index maintainer (installed by stack/install.sh) the payload that
-# hook would send. It is bounded, per-worktree locked, and fail-open; run it
-# detached so creating the checkout is not delayed. Set DELTA_PREPARE_INDEXES=0
-# to skip (for example on short-lived subagent copies when many agents run at
-# once).
+# hook would send. It is bounded, per-worktree locked, and fail-open; it runs
+# in its own session, so creating the checkout is not delayed and ending this
+# script's process group does not stop it. Set DELTA_PREPARE_INDEXES=0 to skip
+# (for example on short-lived subagent copies when many agents run at once).
 ensure="$HOME/.local/share/zetta-delta/ensure-context-indexes.py"
 if [ "${DELTA_PREPARE_INDEXES:-1}" != 0 ] && [ -f "$ensure" ] && command -v python3 >/dev/null 2>&1; then
   log="${DELTA_SCRATCH_DIR:-${TMPDIR:-/tmp}}/context-indexes.log"
-  python3 -c 'import json,sys;print(json.dumps({"hook_event_name":"SessionStart","cwd":sys.argv[1]}))' "$root" \
-    | nohup python3 "$ensure" >>"$log" 2>&1 &
+  python3 - "$ensure" "$root" "$log" <<'PY'
+import json, subprocess, sys
+ensure, root, log = sys.argv[1:4]
+with open(log, "ab") as out:
+    child = subprocess.Popen([sys.executable, ensure], stdin=subprocess.PIPE, stdout=out, stderr=out,
+                             start_new_session=True)
+    child.stdin.write(json.dumps({"hook_event_name": "SessionStart", "cwd": root}).encode())
+    child.stdin.close()
+PY
 fi
 
 echo "prepare: $root -> slot $slot"
