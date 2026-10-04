@@ -123,6 +123,7 @@ Only after the user is satisfied with the result:
 sh {{SKILL_DIR}}/scripts/bon.sh clean <RUN>
 ```
 
-It deletes the snapshot ref and every saved patch. If the user wants to keep
-the losing attempts, copy the patches first; they sit in the directory shown
-in each PATCH line.
+It deletes the snapshot ref and every saved patch, and sweeps abandoned runs:
+this checkout's runs untouched for 30 days, and any whose checkout is gone.
+If the user wants to keep the losing attempts, copy the patches first; they
+sit in the directory shown in each PATCH line.
