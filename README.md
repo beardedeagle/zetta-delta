@@ -383,7 +383,7 @@ pinned commit, with this repository's patches applied in order:
 |---|---|---|
 | tgrep | microsoft/tgrep v1.0.11 | none |
 | semble | MinishLab/semble v0.6.1 | none |
-| codegraph | colbymchenry/codegraph v1.6.2 | inline Rust tests count as callers; Elixir |
+| codegraph | colbymchenry/codegraph v1.6.2 | inline Rust tests count as callers; Elixir; a root-only ignore rule such as `/tmp/` no longer hides same-named folders deeper down |
 | zvec-grep | zvec-ai/zvec-grep v0.2.2 | Metal tensor opt-out; node-llama-cpp 3.22.1 (Metal tensor kernels on Apple M5) |
 | rtk | rtk-ai/rtk v0.51.0 | a failed command no longer prints a TOML filter's `on_empty` "ok" |
 | ctx7, githits, caveman | npm 0.5.12, 0.25.1, 2.0.0 | none |

@@ -1,0 +1,84 @@
+From 5a9d9b413bc450289f0da18422b632d3533cc5bd Mon Sep 17 00:00:00 2001
+From: beardedeagle <randy@heroictek.com>
+Date: Sat, 3 Oct 2026 21:55:53 -0500
+Subject: [PATCH 3/3] fix: anchor git-reported ignored directories to the root
+
+buildScopeIgnore seeds its matcher with every path that
+`git ls-files -o -i --exclude-standard --directory` reports, so nested
+.gitignore effects prune the watcher the same way they prune the indexer
+(#1728). Git reports those paths relative to the repository root, but
+they were added as bare patterns. A one-segment entry such as `tmp/`,
+reported because a root-only rule `/tmp/` matched the top-level folder,
+then matched every folder named tmp at any depth, so tracked source under
+lib/tmp/ silently dropped out of the index and the watcher. Generated
+.gitignore files anchor names like this routinely (Elixir's lists /deps/,
+/doc/, /cover/, and /tmp/), and deps and tmp are deliberately left out
+of the default ignore list so real source is never hidden.
+
+Anchor each reported path with a leading slash. Entries with more than
+one segment were already anchored by gitignore rules, so only the
+one-segment case changes. Root-level rules keep applying everywhere they
+should: buildDefaultIgnore already merges the root .gitignore,
+.git/info/exclude, and core.excludesFile with their own semantics.
+---
+ __tests__/extraction.test.ts | 30 ++++++++++++++++++++++++++++++
+ src/extraction/index.ts      |  4 +++-
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/__tests__/extraction.test.ts b/__tests__/extraction.test.ts
+index c6a522d..10c2511 100644
+--- a/__tests__/extraction.test.ts
++++ b/__tests__/extraction.test.ts
+@@ -8639,6 +8639,36 @@ describe('Nested non-submodule git repos', () => {
+     expect(scope.ignores('pkg/build/out.ts')).toBe(true);
+   });
+ 
++  it('buildScopeIgnore keeps same-named dirs below a root-only ignore rule', async () => {
++    const { execFileSync } = await import('child_process');
++    const git = (cwd: string, ...args: string[]) =>
++      execFileSync('git', args, { cwd, stdio: 'pipe' });
++
++    // Generated .gitignore files anchor names like /tmp/ and /deps/ (Elixir) to
++    // the root; a same-named folder deeper down is still project source.
++    const root = path.join(tempDir, 'anchored-gi-root');
++    fs.mkdirSync(path.join(root, 'tmp'), { recursive: true });
++    fs.mkdirSync(path.join(root, 'lib', 'tmp'), { recursive: true });
++    git(root, 'init', '-q');
++    git(root, 'config', 'user.email', 'test@test.com');
++    git(root, 'config', 'user.name', 'Test');
++    fs.writeFileSync(path.join(root, '.gitignore'), '/tmp/\n');
++    fs.writeFileSync(path.join(root, 'tmp', 'scratch.ts'), 'export const s = 1;\n');
++    fs.writeFileSync(path.join(root, 'lib', 'tmp', 'keep.ts'), 'export const k = 1;\n');
++    git(root, 'add', '.gitignore', 'lib/tmp/keep.ts');
++    git(root, 'commit', '-q', '-m', 'init');
++
++    const scope = buildScopeIgnore(root);
++    expect(scope.ignores('tmp/')).toBe(true);
++    expect(scope.ignores('tmp/scratch.ts')).toBe(true);
++    expect(scope.ignores('lib/tmp/')).toBe(false);
++    expect(scope.ignores('lib/tmp/keep.ts')).toBe(false);
++    const files = scanDirectory(root);
++    expect(await scanDirectoryAsync(root)).toEqual(files);
++    expect(files).toContain('lib/tmp/keep.ts');
++    expect(files).not.toContain('tmp/scratch.ts');
++  });
++
+   it.each(['filesystem', 'untracked', 'tracked'])(
+     'keeps Java packages named build while excluding build output (%s, #1642)',
+     async (mode) => {
+diff --git a/src/extraction/index.ts b/src/extraction/index.ts
+index 0ca3145..ea98bdc 100644
+--- a/src/extraction/index.ts
++++ b/src/extraction/index.ts
+@@ -895,8 +895,10 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
+   // core.excludesFile. Seed ignored-untracked directories from git so nested
+   // `.gitignore` effects prune the watcher identically to the indexer (#1728).
+   const rootMatcher = buildDefaultIgnore(rootDir);
++  // Git reports these paths relative to the root; anchor them so a root-only
++  // rule such as `/tmp/` does not prune same-named directories deeper down.
+   for (const dir of listGitIgnoredDirectories(rootDir)) {
+-    rootMatcher.add(dir);
++    rootMatcher.add(`/${dir}`);
+   }
+   return new ScopeIgnore(
+     rootMatcher,

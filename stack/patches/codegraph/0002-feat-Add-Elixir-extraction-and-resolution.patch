@@ -1,7 +1,7 @@
 From f55b9f6487117a9e7fd989f42d2d269b9c39aef5 Mon Sep 17 00:00:00 2001
 From: beardedeagle <randy@heroictek.com>
 Date: Sat, 3 Oct 2026 19:47:52 -0500
-Subject: [PATCH 2/2] feat: Add Elixir extraction and resolution
+Subject: [PATCH 2/3] feat: Add Elixir extraction and resolution
 
 Index Elixir (.ex, .exs) with the tree-sitter-elixir grammar from the
 locked tree-sitter-wasms dependency (0.1.13), copied into
