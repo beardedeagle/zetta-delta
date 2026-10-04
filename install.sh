@@ -5,6 +5,9 @@
 # Also generates personal-AGENTS.generated.md (context router plus Ponytail)
 # in $XDG_STATE_HOME/zetta-delta (default ~/.local/state/zetta-delta) for
 # pasting into Settings > Rules > Personal AGENTS.md; --clean removes it.
+# If any file it would write exists, it changes nothing without --force; with
+# --force it first saves each file it changes under
+# $XDG_STATE_HOME/zetta-delta/backups/<UTC time>/, which --clean keeps.
 # Run it from a clone, or piped from curl with ZETTA_DELTA_REF set (README).
 #
 # Required (a custom provider's id is "custom:" + sha256 of its base URL; see README):
@@ -71,14 +74,20 @@ while (($#)); do
   shift
 done
 
-# The generated rules wait here until pasted into Delta; --clean removes them.
+# The generated rules wait here until pasted into Delta; --clean removes them
+# and keeps the backups.
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zetta-delta"
 [[ $STATE_DIR == /* ]] || die "XDG_STATE_HOME must be an absolute path"
-readonly STATE_DIR
+RULES_OUT="$STATE_DIR/personal-AGENTS.generated.md"
+BACKUP_DIR="$STATE_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+readonly STATE_DIR RULES_OUT BACKUP_DIR
 if ((CLEAN && !HELP)); then
-  if [[ ! -e $STATE_DIR ]]; then info "nothing to remove: $STATE_DIR does not exist"
-  elif ((DRY_RUN)); then info "would remove $STATE_DIR"
-  else rm -rf -- "$STATE_DIR"; info "removed $STATE_DIR"
+  if [[ ! -e $RULES_OUT ]]; then info "nothing to remove: $RULES_OUT does not exist"
+  elif ((DRY_RUN)); then info "would remove $RULES_OUT"
+  else rm -f -- "$RULES_OUT"; info "removed $RULES_OUT"
+  fi
+  if [[ -d $STATE_DIR/backups ]]; then info "kept the backups in $STATE_DIR/backups"
+  elif ((!DRY_RUN)) && [[ -d $STATE_DIR ]]; then rmdir -- "$STATE_DIR" 2>/dev/null || true
   fi
   exit 0
 fi
@@ -208,18 +217,37 @@ delta_config_dir() {
 }
 CONFIG_DIR="$(delta_config_dir)"
 PROFILES_DIR="$CONFIG_DIR/profiles"
-SKILL_DIR="$SKILL_ROOT/orchestrate"
 [[ -f $CONFIG_DIR/settings.json ]] \
   || warn "no settings.json in $CONFIG_DIR; is that Delta's config directory?"
 
 # --------------------------------------------------------------- writing ---
+# Every file goes through install_file or install_output. While PLANNING is 1
+# they only record the destination in PLANNED, so the install can refuse
+# before it changes anything.
+
+PLANNING=0
+PLANNED=()
+
+backup() { # DEST: save DEST under BACKUP_DIR before it changes
+  local saved="$BACKUP_DIR/${1#/}"
+  [[ -d $BACKUP_DIR ]] || info "saving the files this install changes under $BACKUP_DIR"
+  mkdir -p -- "$(dirname -- "$saved")"
+  cp -p -- "$1" "$saved"
+}
+
+commit_file() { # TMP DEST: move a finished TMP into place, saving the DEST it changes
+  chmod 0644 "$1"
+  if [[ -e $2 ]] && ! cmp -s -- "$1" "$2"; then backup "$2"; fi
+  mv -f -- "$1" "$2"
+  info "wrote $2"
+}
 
 # install_file SRC DEST [render [SED_EXPR...]]: copy, optionally substituting placeholders.
 # Extra sed expressions fill placeholders specific to one rendering.
 install_file() {
   local src="$1" dest="$2" mode="${3:-copy}" tmp
   shift "$(( $# > 2 ? 3 : 2 ))"
-  if [[ -e $dest && $FORCE -ne 1 ]]; then die "$dest exists; rerun with --force to overwrite"; fi
+  if ((PLANNING)); then PLANNED+=("$dest"); return; fi
   if ((DRY_RUN)); then info "would write $dest"; return; fi
   mkdir -p -- "$(dirname -- "$dest")"
   tmp="$(mktemp "${dest}.XXXXXX")"
@@ -234,9 +262,18 @@ install_file() {
   else
     cp -- "$src" "$tmp"
   fi
-  chmod 0644 "$tmp"
-  mv -f -- "$tmp" "$dest"
-  info "wrote $dest"
+  commit_file "$tmp" "$dest"
+}
+
+install_output() { # DEST CMD [ARG...]: write CMD's output to DEST
+  local dest="$1" tmp
+  shift
+  if ((PLANNING)); then PLANNED+=("$dest"); return; fi
+  if ((DRY_RUN)); then info "would write $dest"; return; fi
+  mkdir -p -- "$(dirname -- "$dest")"
+  tmp="$(mktemp "${dest}.XXXXXX")"
+  "$@" > "$tmp"
+  commit_file "$tmp" "$dest"
 }
 
 profile() { install_file "$SCRIPT_DIR/profiles/$1.toml.tmpl" "$PROFILES_DIR/$1.toml" render; }
@@ -321,23 +358,15 @@ install_profile() { # $1=profile name: a scout template, or a MODELS entry
     -e "s|{{THINKING}}|$thinking|g" -e '/^thinking_effort = ""$/d'
 }
 
-# Retire superseded profiles first, so they free their slots.
-if ((PRUNE_LEGACY)); then
-  for old in $LEGACY_PROFILES; do
-    f="$PROFILES_DIR/$old.toml"
-    [[ -e $f ]] || continue
-    if ((DRY_RUN)); then info "would retire $f"; else mv -f -- "$f" "$f.retired"; info "retired $f -> $f.retired"; fi
-  done
-fi
-
-# Profiles this install does not manage take their slots first.
+# Profiles this install does not manage take their slots first; with
+# --prune-legacy, superseded ones are retired before anything is written.
 others="" n_others=0 legacy=""
 for f in "$PROFILES_DIR"/*.toml; do
   [[ -e $f ]] || continue
   n="$(basename -- "$f" .toml)"
   if [[ $BUILTIN_PROFILES == *" $n "* ]] || configured "$n"; then continue; fi
   if [[ $LEGACY_PROFILES == *" $n "* ]]; then
-    if ((PRUNE_LEGACY)); then continue; fi  # retired above (or would be, in a dry run)
+    if ((PRUNE_LEGACY)); then continue; fi  # retired below (or would be, in a dry run)
     legacy+=" $n"
   fi
   others+=" $n"
@@ -353,7 +382,6 @@ for p in $order; do
     continue
   fi
   if ((n_others + n_installed < CUSTOM_SLOTS)); then
-    install_profile "$p"
     INSTALLED+="$p "
     n_installed=$((n_installed + 1))
   else
@@ -372,20 +400,6 @@ if [[ -n $skipped ]]; then
     fi
   done
 fi
-
-# ----------------------------------------------------------------- skills --
-# Each skill is self-contained under $SKILL_ROOT, with its own copy of the
-# roster below. install_file renders {{SKILL_DIR}} from SKILL_DIR.
-
-readonly SKILLS="orchestrate adversarial isolated"
-install_file "$SCRIPT_DIR/skills/orchestrate/SKILL.md" "$SKILL_DIR/SKILL.md"
-install_file "$SCRIPT_DIR/skills/orchestrate/references/best-of-n.md" \
-             "$SKILL_DIR/references/best-of-n.md" render
-install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
-install_file "$SCRIPT_DIR/skills/adversarial/SKILL.md" "$SKILL_ROOT/adversarial/SKILL.md"
-SKILL_DIR="$SKILL_ROOT/isolated"
-install_file "$SCRIPT_DIR/skills/isolated/SKILL.md" "$SKILL_DIR/SKILL.md" render
-install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
 
 # ----------------------------------------------------------------- roster --
 
@@ -471,24 +485,6 @@ generate_roster() {
 }
 
 roster="$(generate_roster)" # generated once, so every skill's copy is identical
-for skill in $SKILLS; do
-  roster_dest="$SKILL_ROOT/$skill/references/roster.md"
-  if [[ -e $roster_dest && $FORCE -ne 1 ]]; then die "$roster_dest exists; rerun with --force to overwrite"; fi
-done
-for skill in $SKILLS; do
-  roster_dest="$SKILL_ROOT/$skill/references/roster.md"
-  if ((DRY_RUN)); then info "would write $roster_dest"; continue; fi
-  mkdir -p -- "$(dirname -- "$roster_dest")"
-  tmp="$(mktemp "${roster_dest}.XXXXXX")"
-  printf '%s\n' "$roster" > "$tmp"
-  chmod 0644 "$tmp"
-  mv -f -- "$tmp" "$roster_dest"
-  info "wrote $roster_dest"
-done
-if ((DRY_RUN)); then
-  info "roster:"
-  printf '%s\n' "$roster" | sed 's/^/  | /'
-fi
 
 # ------------------------------------------------------------------ rules --
 # Personal rules = context router + Ponytail's always-on text, generated from
@@ -541,30 +537,75 @@ generate_rules() {
   fi
 }
 
-rules_out="$STATE_DIR/personal-AGENTS.generated.md"
 if [[ -z $PONYTAIL_DIR || ! -f $PONYTAIL_DIR/AGENTS.md ]]; then
   warn "ponytail not found; generated rules contain the context router only (set PONYTAIL_DIR)"
 fi
+
+# ---------------------------------------------------------------- install --
+# Every file the install writes, in order. Each skill is self-contained under
+# $SKILL_ROOT with its own copy of the roster; install_file renders
+# {{SKILL_DIR}} from SKILL_DIR.
+
+readonly SKILLS="orchestrate adversarial isolated"
+
+write_bundle() {
+  local p skill SKILL_DIR="$SKILL_ROOT/orchestrate"
+  for p in $INSTALLED; do install_profile "$p"; done
+  install_file "$SCRIPT_DIR/skills/orchestrate/SKILL.md" "$SKILL_DIR/SKILL.md"
+  install_file "$SCRIPT_DIR/skills/orchestrate/references/best-of-n.md" \
+               "$SKILL_DIR/references/best-of-n.md" render
+  install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
+  install_file "$SCRIPT_DIR/skills/adversarial/SKILL.md" "$SKILL_ROOT/adversarial/SKILL.md"
+  SKILL_DIR="$SKILL_ROOT/isolated"
+  install_file "$SCRIPT_DIR/skills/isolated/SKILL.md" "$SKILL_DIR/SKILL.md" render
+  install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
+  for skill in $SKILLS; do
+    install_output "$SKILL_ROOT/$skill/references/roster.md" printf '%s\n' "$roster"
+  done
+  install_output "$RULES_OUT" generate_rules
+}
+
+# Plan first: without --force, refuse before anything changes.
+PLANNING=1
+write_bundle
+PLANNING=0
+existing=""
+for f in "${PLANNED[@]}"; do
+  if [[ -e $f ]]; then existing+=$'\n  '"$f"; fi
+done
+if [[ -n $existing ]] && ((!FORCE)); then
+  die "these files exist; rerun with --force to replace them (it saves each one it changes first):$existing"
+fi
+
+if ((PRUNE_LEGACY)); then
+  for old in $LEGACY_PROFILES; do
+    f="$PROFILES_DIR/$old.toml"
+    [[ -e $f ]] || continue
+    if ((DRY_RUN)); then info "would retire $f"; continue; fi
+    if [[ -e $f.retired ]] && ! cmp -s -- "$f" "$f.retired"; then backup "$f.retired"; fi
+    mv -f -- "$f" "$f.retired"
+    info "retired $f -> $f.retired"
+  done
+fi
+
+write_bundle
 if ((DRY_RUN)); then
-  info "would write $rules_out"
+  info "roster:"
+  printf '%s\n' "$roster" | sed 's/^/  | /'
 else
-  mkdir -p -- "$STATE_DIR"
-  tmp="$(mktemp "${rules_out}.XXXXXX")"
-  generate_rules > "$tmp"
-  chmod 0644 "$tmp"
-  mv -f -- "$tmp" "$rules_out"
-  rules_bytes=$(wc -c < "$rules_out" | tr -d ' ')
-  info "wrote $rules_out ($rules_bytes bytes)"
+  rules_bytes=$(wc -c < "$RULES_OUT" | tr -d ' ')
+  info "$RULES_OUT: $rules_bytes bytes"
   # Delta re-sends these rules every turn and shows no size cap; the budget is ours.
   ((rules_bytes <= 10240)) || warn "generated rules are $rules_bytes bytes, over the 10240-byte budget; trim before adding more"
 fi
+[[ ! -d $BACKUP_DIR ]] || info "the files this install changed were saved under $BACKUP_DIR"
 
 info ""
 info "Next:"
 info "  1. Set the built-in Scout, Worker, and Reviewer models in Settings > Subagents"
 info "     to match the roster, then confirm every custom profile loaded without errors."
 info "  2. Settings > Rules > Personal AGENTS.md: add the contents of"
-info "     $rules_out"
+info "     $RULES_OUT"
 info "     (replace any earlier DELTA_CONTEXT_ROUTER and PONYTAIL blocks),"
 info "     then remove the file with install.sh --clean."
 }

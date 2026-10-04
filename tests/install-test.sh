@@ -85,9 +85,29 @@ r=$(env -i $base $prov "$BASH_BIN" "$ROOT/install.sh" --dry-run --force 2>&1)
 has "clone run: installs from the clone" "$r" "would write $T/delta/profiles/qwen-max.toml"
 check "clone run: nothing fetched" "$(fetched)" "none"
 
+# clone ARGS...: run the clone's install.sh over the install above; print the output and the exit status.
+# shellcheck disable=SC2086
+clone() { out=$(env -i $base $prov "$BASH_BIN" "$ROOT/install.sh" "$@" 2>&1); printf '%s\nexit=%s\n' "$out" "$?"; }
+snapshot() { (cd "$T" && find delta home -type f | LC_ALL=C sort | xargs cksum); }
+state=$T/home/.local/state/zetta-delta
+printf 'name = "old"\n' > "$T/delta/profiles/candidate.toml" # a superseded profile
+before=$(snapshot)
+r=$(clone --prune-legacy)
+has "no --force: refused" "$r" "rerun with --force"
+has "no --force: names every file in the way" "$r" "$state/personal-AGENTS.generated.md"
+check "no --force: nothing changed, nothing retired" "$(snapshot)" "$before"
+
+printf '# local edit\n' >> "$T/home/.agents/skills/adversarial/SKILL.md"
+r=$(clone --force --prune-legacy)
+has "--force: exit 0" "$r" "exit=0"
+check "--force: the edited file saved first" "$(tail -n 1 "$state"/backups/*/"${T#/}"/home/.agents/skills/adversarial/SKILL.md)" "# local edit"
+check "--force: the edit replaced" "$(cmp -s "$ROOT/skills/adversarial/SKILL.md" "$T/home/.agents/skills/adversarial/SKILL.md" && echo same)" "same"
+check "--force: unchanged files not saved" "$(find "$state/backups" -name '*.toml' -o -name bon.sh | wc -l | tr -d ' ')" "0"
+check "--prune-legacy: retired" "$(cd "$T/delta/profiles" && ls candidate.toml*)" "candidate.toml.retired"
+
 r=$(run "$ROOT/install.sh" "" --clean)
-has "clean: removes the state folder" "$r" "removed $T/home/.local/state/zetta-delta"
-check "clean: folder gone, nothing fetched" "$(ls -A "$T/home/.local/state") $(fetched)" " none"
+has "clean: removes the generated rules" "$r" "removed $state/personal-AGENTS.generated.md"
+check "clean: keeps only the backups, nothing fetched" "$(ls -A "$state") $(fetched)" "backups none"
 r=$(run "$ROOT/install.sh" "" --clean)
 has "clean again: nothing to remove" "$r" "nothing to remove"
 
