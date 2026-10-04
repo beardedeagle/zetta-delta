@@ -20,8 +20,8 @@
 # Optional lanes (each installs its profiles when set):
 #   MINIMAX_PROVIDER     plus MINIMAX_BILLING=plan|metered    (default metered)
 #                        -> minimax (worker; also best-of-N candidate with plan billing)
-#   GPT_PROVIDER         ChatGPT subscription -> gpt-sol (worker, candidate), gpt-astra (reviewer)
-#   GROK_PROVIDER        Grok subscription    -> grok (worker, reviewer, candidate)
+#   GPT_PROVIDER         ChatGPT subscription (openai-subscribed) -> gpt-sol (worker, candidate), gpt-astra (reviewer)
+#   GROK_PROVIDER        Grok subscription (x_ai-subscribed) -> grok (worker, reviewer, candidate)
 #   COPILOT_PROVIDER     GitHub Copilot       -> scout-gemini
 #   LOCAL_PROVIDER       plus LOCAL_MODEL (local inference) -> scout-local
 # Delta offers at most 7 custom profiles. The installer installs them in this
@@ -145,7 +145,7 @@ ORCHESTRATOR_FAMILY="${ORCHESTRATOR_FAMILY:-Kimi}"
 BUILTIN_SCOUT_MODEL="${BUILTIN_SCOUT_MODEL:-glm-5.3-flash}"
 BUILTIN_SCOUT_LANE="${BUILTIN_SCOUT_LANE:-Z.AI Coding Plan}"
 BUILTIN_SCOUT_FAMILY="${BUILTIN_SCOUT_FAMILY:-GLM}"
-BUILTIN_WORKER_MODEL="${BUILTIN_WORKER_MODEL:-kimi-for-coding}"
+BUILTIN_WORKER_MODEL="${BUILTIN_WORKER_MODEL:-k3}"
 BUILTIN_WORKER_LANE="${BUILTIN_WORKER_LANE:-Kimi Code}"
 BUILTIN_WORKER_FAMILY="${BUILTIN_WORKER_FAMILY:-Kimi}"
 BUILTIN_REVIEWER_MODEL="${BUILTIN_REVIEWER_MODEL:-glm-5.3}"

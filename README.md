@@ -64,7 +64,7 @@ flowchart TD
   U[You: /orchestrate task] --> O["Top-level thread<br/>k3 · Kimi Code<br/>+ SKILL.md + roster.md"]
   O -->|SCOUT block| S["Scout (built-in)<br/>glm-5.3-flash · Z.AI"]
   O -->|SCOUT block| SQ["scout-qwen<br/>qwen3.8-flash · Qwen plan"]
-  O -->|ASSIGNMENT| W["Worker (built-in)<br/>kimi-for-coding · Kimi Code"]
+  O -->|ASSIGNMENT| W["Worker (built-in)<br/>k3 · Kimi Code"]
   O -->|ASSIGNMENT| WQ["qwen-max<br/>qwen3.8-max · Qwen plan"]
   W -->|merges back on success| O
   WQ -->|merges back on success| O
@@ -144,6 +144,9 @@ EOF
 Changing a provider's base URL changes its id; rerun the installer with
 `--force` afterwards.
 
+Delta's built-in subscription providers have fixed ids: `openai-subscribed`
+(ChatGPT) and `x_ai-subscribed` (Grok).
+
 ## 3. Install
 
 ### With curl
@@ -185,8 +188,8 @@ export KIMI_PROVIDER=<id> ZAI_PROVIDER=<id> QWEN_PROVIDER=<id>
 export ZAI_TIER=pro QWEN_TIER=standard            # your real tiers
 # Optional lanes:
 export MINIMAX_PROVIDER=<id> MINIMAX_BILLING=plan  # or metered
-export GPT_PROVIDER=<id>                           # ChatGPT subscription
-export GROK_PROVIDER=<id>                          # Grok subscription
+export GPT_PROVIDER=openai-subscribed              # ChatGPT subscription
+export GROK_PROVIDER=x_ai-subscribed               # Grok subscription
 export COPILOT_PROVIDER=<id>                       # GitHub Copilot
 export LOCAL_PROVIDER=<id> LOCAL_MODEL=<served model id> LOCAL_FAMILY=GLM
 
@@ -224,7 +227,7 @@ into the roster.
 | Max Agents Overall | Twice that (12 at the default); go higher only once a shared admission proxy enforces provider limits |
 | Allow model overrides | On (lets you name a model no profile pins; the skill passes none otherwise) |
 | Scout model | `glm-5.3-flash` (Z.AI Coding Plan), effort high |
-| Worker model | `kimi-for-coding` (Kimi Code), effort high |
+| Worker model | `k3` (Kimi Code), effort high |
 | Reviewer model | `glm-5.3` (Z.AI Coding Plan), effort high |
 
 Set these three in Settings > Subagents > Profiles (Delta saves them as
