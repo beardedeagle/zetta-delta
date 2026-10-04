@@ -6,7 +6,9 @@
 #   bon.sh begin  RUN SLUG TREE   candidate: confirm this copy matches the snapshot
 #   bon.sh export RUN SLUG TREE   candidate: save the patch, restore this copy
 #   bon.sh apply  RUN SLUG        parent: apply one candidate's patch here
-#   bon.sh clean  RUN             parent: drop the snapshot ref and saved patches
+#   bon.sh clean  RUN             parent: drop the snapshot ref and saved patches, and
+#                                 sweep abandoned runs (this checkout's, 30+ days
+#                                 old, or any whose checkout is gone)
 #
 # Delta hides exit codes, so the last line is always "RESULT: ok: ..." or
 # "RESULT: failed: ..."; read that line.
@@ -109,9 +111,12 @@ case $cmd in
     git cat-file -e "$3^{tree}" 2>/dev/null || die "tree $3 is not in this copy; run begin first"
     patch="$dir/$2.patch"
     end=$(tree_now)
-    git diff --binary "$3" "$end" > "$patch"
+    # Plumbing without rename detection: diff settings (colour, prefixes, external
+    # drivers) cannot change the patch, and every path appears under its own name,
+    # so apply can stage each one.
+    git diff-tree -p --binary --no-renames "$3" "$end" > "$patch"
     # Undo the attempt in the working tree only, so Delta's merge-back is empty.
-    [ ! -s "$patch" ] || git apply -R "$patch"
+    [ ! -s "$patch" ] || git apply --whitespace=nowarn -R "$patch"
     now=$(tree_now)
     [ "$now" = "$3" ] \
       || die "this copy did not return to the snapshot (tree $now) and would merge into the parent; report STATUS: failed"
@@ -125,8 +130,8 @@ case $cmd in
     patch="$dir/$2.patch"
     [ -f "$patch" ] || die "no patch at $patch"
     if [ ! -s "$patch" ]; then ok "$2 made no changes; nothing to apply"; exit 0; fi
-    if git apply --check "$patch" 2>/dev/null; then
-      git apply "$patch"
+    if git apply --whitespace=nowarn --check "$patch" 2>/dev/null; then
+      git apply --whitespace=nowarn "$patch"
       ok "applied $2 cleanly"
       exit 0
     fi
@@ -135,11 +140,13 @@ case $cmd in
     git apply --numstat "$patch" | cut -f3- | while IFS= read -r f; do
       if [ -e "$f" ]; then git add -- "$f"; fi
     done
-    if git apply --3way "$patch"; then
+    if git apply --whitespace=nowarn --3way "$patch"; then
       ok "applied $2 with a three-way merge; the patched paths are staged, tell the user"
-    else
-      die "conflicts in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')- resolve them or ask the user; the patched paths are staged"
+      exit 0
     fi
+    conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+    [ -n "$conflicts" ] || die "the three-way apply of $2 failed without conflicts; see the error above. Nothing was applied; the patched paths are staged"
+    die "conflicts in: $conflicts- resolve them or ask the user; the patched paths are staged"
     ;;
   clean)
     [ $# -eq 1 ] || die "usage: bon.sh clean RUN"
@@ -147,7 +154,25 @@ case $cmd in
     enter_root
     git update-ref -d "refs/orchestrate/$1" 2>/dev/null || true
     rm -rf -- "${CACHE:?}/$1"
-    ok "removed snapshot $1 and its patches"
+    # Also sweep runs nobody cleaned up: this checkout's runs untouched for 30
+    # days, and any run whose checkout is gone.
+    swept=0
+    for old in "$CACHE"/bon-*; do
+      [ -d "$old" ] || continue
+      owner=$(cat "$old/parent" 2>/dev/null || true)
+      if [ -n "$owner" ] && [ -d "$owner" ]; then
+        [ "$owner" = "$root" ] || continue
+        [ -n "$(find "$old" -prune -mtime +30)" ] || continue
+      fi
+      git update-ref -d "refs/orchestrate/${old##*/}" 2>/dev/null || true
+      rm -rf -- "$old"
+      swept=$((swept + 1))
+    done
+    if [ "$swept" -gt 0 ]; then
+      ok "removed snapshot $1 and its patches, and $swept abandoned run(s) older than 30 days or without a checkout"
+    else
+      ok "removed snapshot $1 and its patches"
+    fi
     ;;
   *)
     die "usage: bon.sh snapshot | begin RUN SLUG TREE | export RUN SLUG TREE | apply RUN SLUG | clean RUN"

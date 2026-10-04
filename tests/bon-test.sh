@@ -77,6 +77,18 @@ r=$(delta "$T/parent" "$(bon apply "$RUN" glm)")
 check "apply conflict reported" "$(printf %s "$r" | cut -c1-34)" "RESULT: failed: conflicts in: a.tx"
 if grep -q '<<<<<<<' "$T/parent/a.txt"; then echo "PASS conflict markers present"; else echo "FAIL no conflict markers"; fail=1; fi
 
+# Three-way path with a rename: the candidate renames u.txt, which is untracked
+# in the parent, and edits a.txt, which the parent has since edited elsewhere.
+cd "$T/parent" && git read-tree "$TREE" && git checkout-index -a -f && git clean -qfd && git reset -q
+mkcopy "$T/copy3"
+check "begin copy3" "$(delta "$T/copy3" "$(bon begin "$RUN" deepseek "$TREE")")" "RESULT: ok: copy matches snapshot $RUN"
+mv "$T/copy3/u.txt" "$T/copy3/v.txt"; printf 'one\ntwo-parent\nthree-deepseek\n' > "$T/copy3/a.txt"
+check "export copy3" "$(delta "$T/copy3" "$(bon export "$RUN" deepseek "$TREE")" | cut -c1-23)" "RESULT: ok: patch saved"
+printf 'one-later\ntwo-parent\nthree\n' > "$T/parent/a.txt"
+check "apply rename three-way" "$(delta "$T/parent" "$(bon apply "$RUN" deepseek)" | cut -c1-58)" "RESULT: ok: applied deepseek with a three-way merge; the p"
+check "rename three-way: both edits kept" "$(tr '\n' ' ' < "$T/parent/a.txt")" "one-later two-parent three-deepseek "
+check "rename three-way: file renamed" "$( [ -e "$T/parent/u.txt" ] && echo u; [ -e "$T/parent/v.txt" ] && echo v)" "v"
+
 # Guards.
 mkdir -p "$T/stale" && cp -R "$T/copy2/." "$T/stale/" && printf 'drift\n' > "$T/stale/a.txt"
 prefix "begin detects drift" "$(delta "$T/stale" "$(bon begin "$RUN" qwen "$TREE")")" "RESULT: failed: this copy differs from snapshot $RUN"
@@ -94,9 +106,17 @@ if [ "$(id -u)" != 0 ]; then  # root reads unreadable files
   chmod 644 "$T/locked/locked.txt"
 fi
 
-check "clean" "$(delta "$T/parent" "$(bon clean "$RUN")")" "RESULT: ok: removed snapshot $RUN and its patches"
-check "clean removed ref" "$(git -C "$T/parent" for-each-ref refs/orchestrate | wc -l | tr -d ' ')" "0"
-check "clean removed cache" "$( [ -e "$T/cache/delta-orch/$RUN" ] && echo present || echo gone)" "gone"
+# Abandoned runs: one of this checkout's, 31 days old; one whose checkout is
+# gone; a recent one of this checkout and an old one of another, both kept.
+C=$T/cache/delta-orch
+mkrun() { mkdir -p "$C/$1" && printf '%s\n' "$2" > "$C/$1/parent" && git -C "$T/parent" update-ref "refs/orchestrate/$1" HEAD; }
+mkrun bon-20200101-000000 "$T/parent"; touch -t "$(date -v-31d +%Y%m%d%H%M 2>/dev/null || date -d '31 days ago' +%Y%m%d%H%M)" "$C/bon-20200101-000000"
+mkrun bon-20200102-000000 "$T/no-such-checkout"
+mkrun bon-20200103-000000 "$T/parent"
+mkrun bon-20200104-000000 "$T/copy2"; touch -t 202001010000 "$C/bon-20200104-000000"
+check "clean" "$(delta "$T/parent" "$(bon clean "$RUN")")" "RESULT: ok: removed snapshot $RUN and its patches, and 2 abandoned run(s) older than 30 days or without a checkout"
+check "clean removed the run's ref and the abandoned ones'" "$(git -C "$T/parent" for-each-ref --format='%(refname:short)' refs/orchestrate | tr '\n' ' ')" "orchestrate/bon-20200103-000000 orchestrate/bon-20200104-000000 "
+check "clean removed the run's cache and the abandoned ones'" "$(cd "$C" && printf '%s ' *)" "bon-20200103-000000 bon-20200104-000000 "
 left=0
 for f in "${TMPDIR:-/tmp}"/bon-index.*; do if [ -e "$f" ]; then left=$((left + 1)); fi; done
 check "no temp index files left" "$left" "0"
