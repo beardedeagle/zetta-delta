@@ -1,36 +1,26 @@
-# zetta-delta: multi-model orchestration for Delta (v4)
-
-v4 is v2's pinned-profile design (v3's override-only design works against
-Delta's spawn tool, which says to omit the model unless the user asks for
-one), plus:
-
-- Provider ids in Delta's real form, `custom:<sha256 of base URL>` (section 2).
-- `qwen-max` effort `xhigh`; Delta rejects efforts a model does not list.
-- One custom profile per model, pinned to its model and thinking level; the
-  task block sets its role (worker, reviewer, or best-of-N candidate). The
-  orchestrator passes no model unless you name one, and the install fits
-  Delta's limit of 7 custom profiles (section 3).
-- Three or four models per role across the plan lanes and the optional
-  ChatGPT, Grok, and Copilot lanes.
-- Workers and Reviewers never revert, discard, stash, or delete pre-existing
-  uncommitted work unless told to. Their isolated copies merge back on
-  success, so a revert there would land in your checkout.
-- The orchestrator copies each block's RULES word for word.
-- Installs from a clone or with `curl | bash`, pinned to a commit (section 3).
-- `deploy.env.example`: a template for your lane settings.
-- Context router and Ponytail rules, written into Delta's Personal AGENTS.md by
-  the installer (section 6), and task blocks that use them: router-first search,
-  `rtk` for shell output, terse reports, and a simplicity check in reviews.
-- `.agents/prepare` example also warms the context indexes per checkout.
-- `/adversarial` and `/isolated`: two more ways to run a thread, for any
-  task (section 8).
-- `stack/install.sh` builds and installs the context tools the rules route
-  to, at pinned upstream releases plus this repository's patches (section 9).
+# zetta-delta: multi-model orchestration for Delta
 
 Run one Delta thread as an orchestrator that hands work to subagents on
 different providers, keeps each provider within its limits, has every change
 reviewed by a different model family, and spends per-token money only when
 you allow it.
+
+The installer adds:
+
+- One custom subagent profile per model, pinned to its model and thinking
+  level; the task block sets its role (worker, reviewer, or best-of-N
+  candidate). The orchestrator passes no model unless you name one, and the
+  install fits Delta's limit of 7 custom profiles (section 3).
+- The `/orchestrate` skill, with a roster of models, lanes, budgets, and
+  reviewer order generated for your accounts.
+- `/adversarial` and `/isolated`: two more ways to run a thread, for any
+  task (section 8).
+- The context router and Ponytail rules, written into Delta's Personal
+  AGENTS.md (section 6).
+
+`stack/install.sh` builds and installs the context tools those rules route to
+(section 9), and `examples/agents-prepare.sh` gives each checkout its own
+ports and test names (section 5).
 
 ## How it works
 
@@ -61,33 +51,30 @@ What happens when you type `/orchestrate <task>`:
 
 ```mermaid
 flowchart TD
-  U[You: /orchestrate task] --> O["Top-level thread<br/>k3 · Kimi Code<br/>+ SKILL.md + roster.md"]
-  O -->|SCOUT block| S["Scout (built-in)<br/>glm-5.3-flash · Z.AI"]
-  O -->|SCOUT block| SQ["scout-qwen<br/>qwen3.8-flash · Qwen plan"]
-  O -->|ASSIGNMENT| W["Worker (built-in)<br/>k3 · Kimi Code"]
-  O -->|ASSIGNMENT| WQ["qwen-max<br/>qwen3.8-max · Qwen plan"]
+  U[You: /orchestrate task] --> O["Top-level thread<br/>k3 (Kimi Code)<br/>+ SKILL.md + roster.md"]
+  O -->|SCOUT block| S["Scout (built-in)<br/>glm-5.3-flash (Z.AI)"]
+  O -->|SCOUT block| SQ["scout-qwen<br/>qwen3.8-flash (Qwen plan)"]
+  O -->|ASSIGNMENT| W["Worker (built-in)<br/>k3 (Kimi Code)"]
+  O -->|ASSIGNMENT| WQ["qwen-max<br/>qwen3.8-max (Qwen plan)"]
   W -->|merges back on success| O
   WQ -->|merges back on success| O
-  O -->|REVIEW block| R["Reviewer (built-in)<br/>glm-5.3 · Z.AI"]
-  O -->|REVIEW block| RD["deepseek-pro<br/>deepseek-v4-pro · Qwen plan"]
+  O -->|REVIEW block| R["Reviewer (built-in)<br/>glm-5.3 (Z.AI)"]
+  O -->|REVIEW block| RD["deepseek-pro<br/>deepseek-v4-pro (Qwen plan)"]
   R -->|verdict| O
   RD -->|verdict| O
   O --> F[Report to you]
 ```
 
-Why not a profile: a profile defines a child that some parent delegates to.
-Delta has no profile for top-level threads, and its docs do not describe
-subagents starting subagents of their own. A skill is how you give the
-top-level agent a role on demand.
-
-Why the built-ins stay: Delta's Scout, Worker, and Reviewer carry Delta's own
-tuning. You pin their models in Settings. The task rules they lack travel in
-the task blocks the skill sends, so built-in and custom profiles follow the
-same rules. Custom profiles exist only for what the built-ins cannot do:
-more scout families, more model families on other lanes, and the local lane.
-Each custom model gets one profile that works, reviews, or competes in
-best-of-N as its task block says; the built-in Worker and Reviewer serve as
-best-of-N candidates the same way.
+Delta's built-in Scout, Worker, and Reviewer keep Delta's own tuning; you pin
+their models in Settings (section 4). The rules travel in the task blocks the
+skill sends, so built-in and custom profiles follow the same ones: router-first
+search, `rtk` for shell output, terse reports, a simplicity check in reviews,
+and never reverting, discarding, stashing, or deleting uncommitted work that
+was there before the task unless told to. Custom profiles add more scout
+families, more model families on other lanes, and the local lane. Each custom
+model's profile works, reviews, or competes in best-of-N as its task block
+says; the built-in Worker and Reviewer serve as best-of-N candidates the same
+way.
 
 ## Contents
 
@@ -103,18 +90,19 @@ best-of-N candidates the same way.
 | `skills/orchestrate/scripts/bon.sh` | same `scripts/`, and `~/.agents/skills/isolated/scripts/` | Always; best-of-N snapshot, patch handoff, apply, cleanup |
 | `skills/adversarial/SKILL.md` | `~/.agents/skills/adversarial/` | Always |
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
-| `tests/bon-test.sh` | — | Not installed; regression check for `bon.sh`: `sh tests/bon-test.sh` |
-| `tests/install-test.sh` | — | Not installed; regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
-| `tests/prepare-test.sh` | — | Not installed; regression check for `examples/agents-prepare.sh`: `sh tests/prepare-test.sh` |
+| `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
+| `tests/install-test.sh` | Not installed | Regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
+| `tests/prepare-test.sh` | Not installed | Regression check for `examples/agents-prepare.sh`: `sh tests/prepare-test.sh` |
 | `references/roster.md` | each skill's `references/` | Generated by the installer, the same copy in each skill |
-| `rules/personal-AGENTS.md` | — | Source of the router section of the generated rules |
+| `rules/personal-AGENTS.md` | Not installed | Source of the router block in Personal AGENTS.md |
 | Router and Ponytail blocks | `~/.config/delta/AGENTS.md` (Settings > Rules > Personal AGENTS.md) | Generated on every run; replaces only those two blocks and keeps the rest of the file |
 | `examples/agents-prepare.sh` | your project's `.agents/prepare` | By hand, per project |
-| `stack/install.sh` | — | Run by hand; builds and installs the context tools (section 9) |
-| `stack/patches/<tool>/` | — | Applied in order to each tool's pinned upstream release |
+| `stack/install.sh` | Not installed | Run by hand; builds and installs the context tools (section 9) |
+| `stack/patches/<tool>/` | Not installed | Applied in order to each tool's pinned upstream release |
 | `stack/context-indexes/ensure-context-indexes.py` | `~/.local/share/zetta-delta/` | By `stack/install.sh`; tests: `python3 -m unittest` in that folder |
-| `deploy.env.example` | — | Template for `deploy.env` (ignored by git), sourced before `install.sh` to repeat an install |
-| `install.sh` | — | — |
+| `stack/zvec-grep/verify-install.py` | `~/.local/share/zvec-grep/` | By `stack/install.sh`, pinned to the zvec-grep it installs; tests: `python3 -m unittest` in that folder |
+| `deploy.env.example` | Not installed | Template for `deploy.env` (ignored by git), sourced before `install.sh` to repeat an install |
+| `install.sh` | Not installed | Run by hand (section 3) |
 
 The Delta config directory is the folder containing `settings.json`:
 `~/Library/Application Support/delta` on macOS.
@@ -161,7 +149,7 @@ latest commit is the first field of
 ref=<commit>
 curl -fsSL "https://raw.githubusercontent.com/beardedeagle/zetta-delta/$ref/install.sh" \
   | ZETTA_DELTA_REF=$ref KIMI_PROVIDER=<id> ZAI_PROVIDER=<id> QWEN_PROVIDER=<id> \
-    ZAI_TIER=pro QWEN_TIER=standard bash -s -- --dry-run
+    ZAI_TIER=<tier> QWEN_TIER=<tier> bash -s -- --dry-run
 ```
 
 Drop `--dry-run` to install, and add `--force` when reinstalling. Without
@@ -185,7 +173,7 @@ temporary copy of the repository when it exits.
 
 ```bash
 export KIMI_PROVIDER=<id> ZAI_PROVIDER=<id> QWEN_PROVIDER=<id>
-export ZAI_TIER=pro QWEN_TIER=standard            # your real tiers
+export ZAI_TIER=<tier> QWEN_TIER=<tier>          # your real tiers
 # Optional lanes:
 export MINIMAX_PROVIDER=<id> MINIMAX_BILLING=plan  # or metered
 export GPT_PROVIDER=openai-subscribed              # ChatGPT subscription
@@ -201,10 +189,11 @@ To repeat an install, keep the settings in a file: copy
 `deploy.env.example` to `deploy.env` (git ignores it), fill it in, and run
 `. ./deploy.env && ./install.sh --force`.
 
-`--prune-legacy` renames superseded profiles to `*.toml.retired`: the v1
-profiles (`scout-fast`, `scout-deep`, `worker-kimi`, `reviewer-glm`), which the
-built-ins replace, and the earlier v4 role profiles (`worker-*`,
-`reviewer-*`, `candidate*`), which the per-model profiles replace. Run
+`--prune-legacy` renames profiles from earlier releases of this repository to
+`*.toml.retired`: `scout-fast`, `scout-deep`, `worker-kimi`, and
+`reviewer-glm`, which the built-ins replace, and the role profiles
+`worker-*`, `reviewer-*`, and `candidate*`, which the per-model profiles
+replace. Run
 `./install.sh --help` for every tuning variable, including overrides if you
 pin the built-ins to models other than the defaults below.
 
@@ -239,13 +228,14 @@ The built-in models must match the roster; if you choose others, pass the
 
 **LLM Providers**
 
-- Model Preferences (LLM Providers > each provider): leave every row on
-  `Global · …`. Provider-specific choices take precedence over profile models
+- Model Preferences (LLM Providers > each provider): leave every row on its
+  Global choice. Provider-specific choices take precedence over profile models
   and would silently reroute them.
-- Models Shown in Picker: hide the duplicates the roster routes around, so
-  nobody picks them by accident: the DeepSeek API copy of `deepseek-v4-pro`
-  (metered) and the Qwen-plan copy of `glm-5.3` (flat, but it spends the Qwen
-  plan's quota on GLM, which the roster runs on Z.AI).
+- Models Shown in Picker: hide every copy of a model that the roster runs on
+  another provider, so nobody picks it by accident. For example, a metered
+  API copy of `deepseek-v4-pro`, which the roster runs on the Qwen plan, or
+  the Qwen plan's copy of `glm-5.3`, which would spend Qwen quota on a model
+  the roster runs on Z.AI.
 
 ## 5. Per-checkout test isolation
 
@@ -266,8 +256,8 @@ fail-open and in its own session, so ending prepare does not stop it. Set `DELTA
 when many short-lived subagent copies are created at once.
 
 The maintainer indexes Git repositories, plus the non-Git folders listed in
-`~/.config/zetta-delta/index-roots`, one per line: `~/scripts` makes that
-folder one root, and `~/projects/*` makes each folder inside it its own root.
+`~/.config/zetta-delta/index-roots`, one per line: `~/notes` makes that
+folder one root, and `~/src/*` makes each folder inside it its own root.
 Without the file it indexes Git repositories only. State for non-Git folders
 lives in `~/Library/Caches/context-indexes/` (`~/.cache/context-indexes/`
 off macOS), never in the folder. It never starts a
@@ -278,8 +268,9 @@ retrying until you build one by hand. Only one first zg build runs at a time
 on the machine (a lock in `~/Library/Caches/context-indexes/`): a checkout
 that would start a second one is queued there and reports zg as
 unavailable, and its build starts when the running one ends. The maintainer's zg
-runs use 2 embedding contexts (as fast as zg's default 8 here, at about a
-third of the memory) unless `ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` is set.
+runs use 2 embedding contexts, not zg's default 8, unless
+`ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` is set. Before each zg build it runs the
+zg guard (section 9) and skips zg when the guard fails.
 Keep vendored clones or bulky folders
 out of an index with a `.gitignore` entry in that root; every tool honors it.
 
@@ -299,8 +290,8 @@ by hand:
 cd /abs/repo && printf '.delta/\n' >> .sembleignore && printf '/.sembleignore\n' >> .git/info/exclude
 ```
 
-Semble never evicts its cache, so every checkout it searched leaves about
-50 MB in `~/Library/Caches/semble` after Delta deletes the checkout. On the
+Semble never evicts its cache, so every checkout it searched leaves a cache
+in `~/Library/Caches/semble` after Delta deletes the checkout. On the
 same runs the maintainer removes the caches of that root's deleted Delta
 checkouts, and only those: Semble's own `semble clear orphans` would also
 remove the cache of a folder on an unmounted drive.
@@ -318,18 +309,15 @@ plugin (`PONYTAIL`, labelled with the plugin's version; the newest folder under
 only those blocks and keeps the rest of the file after them; like every file it
 changes, it needs `--force` when the file exists and saves the old one first.
 It refuses while a block lacks its START or END line. Rerun it after updating
-Ponytail. Earlier versions wrote `personal-AGENTS.generated.md` to
-`~/.local/state/zetta-delta/` for pasting; `./install.sh --clean` removes that
-file, and its folder unless that holds backups.
+Ponytail. `./install.sh --clean` removes the `personal-AGENTS.generated.md`
+that earlier releases left in `~/.local/state/zetta-delta/`, and that folder
+unless it holds backups.
 
-| Codex mechanism | Delta replacement |
-|---|---|
-| Context router in `~/.codex/AGENTS.md` | The router section of the rules |
-| MCP tools (semble, codegraph, zvec, githits) | The same tools' CLIs, named per question class in the router |
-| PreToolUse RTK rewrite hook | The RTK section of the rules, plus `rtk` in the task blocks. A transparent shim is not possible: Delta runs commands as `/bin/sh -c '<cmd> \| cat'`, which reads no startup files, and RTK does not rewrite pipelines |
-| SessionStart index hook | The rules' index step: agents run the maintainer once per folder per thread (`.agents/prepare`, section 5, can also start it) |
-| Caveman proxy, hooks, MCP | Caveman's skills in `~/.agents/skills` and its local `toon encode`, named in the rules; `caveman tools mem` only on request, since project memory goes to the llm-wiki, which only the top-level thread writes (subagents report `LEARNED:` items). Delta's model traffic stays uncompressed: the proxy compresses a streaming request only when it carries Caveman's MCP retrieve tool, which Delta cannot add. The task blocks ask for terse reports instead |
-| Ponytail plugin hooks | Ponytail's `AGENTS.md` text in the rules, always at full level. Reviewers check simplicity against it |
+The router names a context tool's CLI for each kind of question, has agents
+run the index maintainer once per folder per thread (`.agents/prepare`,
+section 5, can also start it), and sends shell commands through `rtk`.
+Ponytail's text applies at full level, and reviewers check simplicity against
+it.
 
 The generated Ponytail section changes one sentence: "Grep every caller"
 becomes "Find every caller (codegraph where the language is covered, otherwise
@@ -338,9 +326,8 @@ installer keeps the text verbatim and warns.
 
 The tools themselves come from `stack/install.sh` (section 9).
 
-The rules add about 10 KB to every thread's context; the installer prints the
-exact size and warns above 10,240 bytes. The router pays that back when it
-replaces grep-and-read loops.
+The rules load into every thread's context; the installer prints their size
+and warns above 10,240 bytes.
 
 Smoke test (new thread, any model):
 
@@ -367,8 +354,8 @@ layout; qwen-max makes no changes. Then spawn deepseek-pro to report
 its model with no review. Stop after reporting; do not plan or dispatch work.
 ```
 
-Confirm each spawn line in the thread (`Agent spawned: … (profile · model)`)
-names the expected model; that label is Delta's, not the subagent's self-report.
+Confirm that each spawn line in the thread names the expected profile and
+model; that label is Delta's, not the subagent's self-report.
 
 ## 8. Use
 
@@ -450,11 +437,20 @@ removes on exit. Where things go:
 - The index maintainer: `~/.local/share/zetta-delta/`, where the rules and
   `.agents/prepare` run it. List non-Git folders to index in
   `~/.config/zetta-delta/index-roots` (section 5).
+- zvec-grep installs as version `<release>+zetta-delta.<hash>`, where the
+  hash covers its patches. The installer then copies the zg guard
+  (`stack/zvec-grep/verify-install.py`) to `~/.local/share/zvec-grep/`, pins
+  it to the package files it just installed, and checks them. An existing
+  guard and pin are first saved under
+  `~/.local/share/zvec-grep/restores/<UTC time>/`. The index maintainer runs
+  the guard before each zg build and skips zg when it fails, so a zvec-grep
+  installed some other way stays unused until you rerun
+  `stack/install.sh zvec-grep` or restore the saved pin.
 
 At the end it warns about any command it installed that another copy earlier
 on `PATH` shadows.
 
-## Limits and next steps
+## Limits
 
 - Budgets are enforced per orchestrator thread by instruction, not by Delta.
   A shared admission proxy (per-provider concurrency, window budgets,
@@ -467,6 +463,3 @@ on `PATH` shadows.
   Their turn order, isolation, and stopping rules are instructions the
   thread's model follows; Delta enforces only that a subagent sees what the
   thread sends it.
-- Nested delegation remains untested. If a future Delta lets subagents spawn
-  subagents, an orchestrator profile becomes possible; this design works
-  either way.

@@ -44,7 +44,7 @@ index 413e20e..528e0c8 100644
  ///   6. head/tail_lines      — keep first/last N lines
  ///   7. max_lines            — absolute line cap
 -///   8. on_empty             — message if result is empty
-+///   8. on_empty             — message if result is empty and the command succeeded
++///   8. on_empty             - message if result is empty and the command succeeded
  use super::constants::RTK_META_COMMANDS;
  use crate::core::user_dirs;
  use crate::core::user_env;
@@ -87,7 +87,7 @@ index 413e20e..528e0c8 100644
      }
  
 -    // 8. on_empty
-+    // 8. on_empty — success only. The message says "nothing to report" (e.g. `mix compile: ok`),
++    // 8. on_empty - success only. The message says "nothing to report" (e.g. `mix compile: ok`),
 +    //    but a failed command's stdout is empty because its errors went to stderr.
      let result = lines.join("\n");
 -    if result.trim().is_empty()

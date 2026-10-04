@@ -1,7 +1,7 @@
 # Delta subagent profile: read-only scout on a locally served model (optional; installed when
 # LOCAL_PROVIDER and LOCAL_MODEL are set). No request windows or per-token cost, but slower:
 # use it for bulk or background questions. Add thinking_effort if the served model supports it.
-name = "Scout · {{LOCAL_MODEL}} (local)"
+name = "Scout ({{LOCAL_MODEL}}, local)"
 description = "Read-only reconnaissance on the local model lane: bulk or background questions where latency matters less than conserving plan quotas. Spawn only from the orchestrate skill with a SCOUT block."
 worktree = "shared"
 prompt = '''

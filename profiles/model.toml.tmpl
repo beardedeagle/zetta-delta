@@ -3,7 +3,7 @@
 # install.sh renders one per model, <name>.toml, each pinned to its model and
 # thinking level. An empty level drops the thinking_effort line: MiniMax-M3
 # rejects its options by name, and Delta then uses its default, on.
-name = "{{MODEL_ID}} · {{LANE}}"
+name = "{{MODEL_ID}} ({{LANE}})"
 description = "{{MODEL_ID}} on {{LANE}}. Roles: {{ROLES}}. {{USE}}. Spawn only from the orchestrate, adversarial, or isolated skill, with the block that skill names for the role."
 worktree = "isolated"
 prompt = '''

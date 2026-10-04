@@ -13,9 +13,15 @@
 #   ctx7 githits caveman                                         npm -g, pinned versions
 #   index-maintainer  context-indexes/ -> ~/.local/share/zetta-delta/
 #
+# zvec-grep's version is stamped <release>+zetta-delta.<hash of its patches>,
+# and the index maintainer's zg guard (zvec-grep/verify-install.py, copied to
+# ~/.local/share/zvec-grep/) is pinned to the installed files, so the maintainer
+# refuses zg if anything else replaces it. An earlier guard and pin are saved
+# under ~/.local/share/zvec-grep/restores/<UTC time>/ first.
+#
 # Needs git, curl, and tar, plus per tool: cargo (tgrep, rtk, codegraph's
 # native kernel), uv (semble), node >= 22 and npm (codegraph, zvec-grep, ctx7,
-# githits, caveman), python3 (index-maintainer).
+# githits, caveman), python3 (zvec-grep, index-maintainer).
 #
 # Settings:
 #   PREFIX                  every command lands in $PREFIX/bin (default ~/.local):
@@ -72,6 +78,7 @@ CODEGRAPH_INSTALL_DIR="${CODEGRAPH_INSTALL_DIR:-$HOME/.codegraph}"
 CODEGRAPH_BIN_DIR="${CODEGRAPH_BIN_DIR:-$PREFIX/bin}"
 export UV_TOOL_BIN_DIR="${UV_TOOL_BIN_DIR:-$PREFIX/bin}"
 readonly MAINTAINER_DIR="$HOME/.local/share/zetta-delta"  # the rules run it from here
+readonly ZG_GUARD_DIR="$HOME/.local/share/zvec-grep"     # the maintainer runs the zg guard from here
 for v in PREFIX UV_TOOL_BIN_DIR CODEGRAPH_INSTALL_DIR CODEGRAPH_BIN_DIR; do
   [[ ${!v} == /* ]] || die "$v must be an absolute path"
 done
@@ -88,7 +95,7 @@ for t in codegraph zvec-grep ctx7 githits caveman; do
     (( $(node -p 'process.versions.node.split(".")[0]') >= 22 )) || die "$t needs node >= 22"
   fi
 done
-if selected index-maintainer; then need python3 index-maintainer; fi
+for t in zvec-grep index-maintainer; do if selected "$t"; then need python3 "$t"; fi; done
 
 # ---------------------------------------------------------------- sources --
 
@@ -137,14 +144,32 @@ install_semble() { # the mcp extra keeps semble's MCP server working for other a
   uv tool install --force --quiet "semble[mcp] @ file://$dir"
 }
 
-install_zvec_grep() { # pack the patched source, then install the package from the tarball
-  local dir tgz
+install_zvec_grep() { # pack the patched source under a stamped version, install it, pin the zg guard to it
+  local dir tgz stamp pkg saved f
   dir="$(fetch_source zvec-grep)"
+  stamp="$(while IFS= read -r f; do cat -- "$f"; done < <(patches zvec-grep) | git hash-object --stdin)"
   (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error \
+     && npm pkg set "version=$(node -p 'require("./package.json").version')+zetta-delta.${stamp:0:12}" \
      && npm pack --pack-destination "$WORK" --loglevel=error >/dev/null)
   tgz=("$WORK"/zvec-zvec-grep-*.tgz)
   [[ -f ${tgz[0]} ]] || die "zvec-grep: npm pack produced no tarball"
   npm install -g --prefix "$PREFIX" --no-audit --no-fund --loglevel=error "${tgz[0]}"
+  pkg="$PREFIX/lib/node_modules/@zvec/zvec-grep"
+  [[ -f $pkg/package.json ]] || die "zvec-grep: no package at $pkg after the install"
+  if [[ -e $ZG_GUARD_DIR/local-install.json || -e $ZG_GUARD_DIR/verify-install.py ]]; then
+    saved="$ZG_GUARD_DIR/restores/$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p -- "$saved"
+    for f in local-install.json verify-install.py; do
+      if [[ -e $ZG_GUARD_DIR/$f ]]; then cp -p -- "$ZG_GUARD_DIR/$f" "$saved/"; fi
+    done
+    info "zvec-grep: saved the previous zg guard and pin under $saved"
+  fi
+  mkdir -p -- "$ZG_GUARD_DIR"
+  cp -- "$STACK_DIR/zvec-grep/verify-install.py" "$ZG_GUARD_DIR/"
+  chmod 0755 "$ZG_GUARD_DIR/verify-install.py"
+  if ! { python3 "$ZG_GUARD_DIR/verify-install.py" --pin "$pkg" && python3 "$ZG_GUARD_DIR/verify-install.py" "$pkg"; }; then
+    die "zvec-grep: the zg guard does not accept the build just installed"
+  fi
 }
 
 install_codegraph() { # upstream's self-contained bundle, linked like upstream's install.sh does
@@ -188,6 +213,7 @@ plan() { # describe tool $1's install
     IFS='|' read -r name url tag commit <<<"$entry"
     n=$(patches "$1" | wc -l | tr -d ' ')
     info "$1: $url $tag ($commit) + $n patch(es)"
+    [[ $1 != zvec-grep ]] || info "$1: stamps the version with the patches' hash and pins the zg guard in $ZG_GUARD_DIR"
     return
   fi
   for e in "${NPM_TOOLS[@]}"; do
