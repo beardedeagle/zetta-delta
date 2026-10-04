@@ -183,7 +183,17 @@ RULES:
 - Your copy merges into the parent's checkout when you finish successfully, including deletions. Run `git status --porcelain` before you start and again before you finish. Leave only the changes the follow-up needs; undo anything else your commands changed. Never revert, discard, stash, or delete uncommitted changes or untracked files that were already there unless FOLLOW-UP says to.
 - Do not commit, push, create branches, or rewrite history.
 - Navigate with the context tool router in your rules and prefix shell commands per its RTK section. End any command you cite as evidence with `; echo "exit=$?"`, without piping the command itself.
-Finish with the Result block, with PATCH: none.
+
+Finish with exactly this block and nothing after it, written tersely: fragments are fine, filler is not, technical substance stays intact.
+
+## Result
+STATUS: done | blocked | failed
+ANSWER: your answer, findings, or what you changed and why.
+EVIDENCE: path:line references, commands with their `exit=` lines, sources; or "none".
+PATCH: none
+VERIFICATION: each VERIFY command you ran and its `exit=` line; or "none".
+RISKS: weaknesses of your answer, assumptions, and gaps; or "none".
+LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas, conventions), with evidence; or "none".
 ```
 
 ### 6. Clean up

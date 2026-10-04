@@ -405,7 +405,7 @@ generate_roster() {
   printf 'This thread draws on its own lane too; leave headroom there.\n\n'
 
   printf '## Profiles\n\n'
-  printf 'A profile takes only the roles listed here; the task block you send sets the role.\n\n'
+  printf 'A profile takes only the roles listed here; the block you send sets the role, and each skill says which of its blocks each role may take.\n\n'
   printf '| Spawn as | Model | Lane | Family | Billing | Worktree | Roles | Use for |\n'
   printf '|---|---|---|---|---|---|---|---|\n'
   printf '| Scout (built-in) | %s | %s | %s | flat | shared | scout | Default read-only recon |\n' \

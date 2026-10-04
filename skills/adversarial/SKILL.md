@@ -75,13 +75,9 @@ RULES:
 - The other side's changes from earlier turns, listed under CHANGES in TRANSCRIPT, are its work or evidence: do not undo or weaken them; dispute them in your report. You may revise your own. Uncommitted changes and untracked files that predate the room are the user's work: change them only as TASK requires, and never revert, discard, stash, or delete them.
 - Do not commit, push, create branches, or rewrite history.
 - Navigate with the context tool router in your rules and prefix shell commands per its RTK section. End any command you cite as evidence with `; echo "exit=$?"`, without piping the command itself.
-- Write the report tersely: fragments are fine, filler is not, technical substance stays intact.
-Finish with the Turn report.
-```
 
-Every turn ends with:
+Finish with exactly this report and nothing after it, written tersely: fragments are fine, filler is not, technical substance stays intact.
 
-```
 ## Turn
 STATUS: done | blocked
 SIDE: DEFENDER | CHALLENGER, round <n>
@@ -89,19 +85,13 @@ POSITION: what you did or now hold, in 2-6 sentences.
 POINTS: one per line, with evidence. Defender: each point still standing from the challenger's last turn and how you answered it (fixed, refuted, conceded). Challenger: each break or refutation still standing, new or carried over, and each you withdraw. Or "none".
 CHANGES: one line per path you changed and why; or "none".
 VERIFICATION: each VERIFY command you ran and its `exit=` line; or "none".
-VERDICT: CONTINUE | ACCEPT | CONCEDE | AGREE
+VERDICT: one of
+  CONTINUE: the other side answers next.
+  ACCEPT (challenger only): nothing is left standing; the defender's work or answer holds.
+  CONCEDE (defender only): the work or answer does not hold; POSITION says why.
+  AGREE (either side): both sides now hold the same position, stated in POSITION.
 LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas, conventions), with evidence; or "none".
 ```
-
-Verdicts:
-
-- CONTINUE: the other side answers next.
-- ACCEPT, challenger only: nothing is left standing; the defender's work or
-  answer holds.
-- CONCEDE, defender only: the work or answer does not hold; POSITION says
-  why.
-- AGREE, either side: both sides now hold the same position, stated in
-  POSITION.
 
 A verdict the side may not give counts as CONTINUE.
 
