@@ -271,8 +271,8 @@ are skipped with a note. A first zg build runs detached for up to 30 minutes;
 if it times out, the hook removes the partial index it created and stops
 retrying until you build one by hand. Only one first zg build runs at a time
 on the machine (a lock in `~/Library/Caches/context-indexes/`): a checkout
-that would start a second one reports zg as unavailable, and its next zg
-search after the running build ends starts its own. The maintainer's zg
+that would start a second one is queued there and reports zg as
+unavailable, and its build starts when the running one ends. The maintainer's zg
 runs use 2 embedding contexts (as fast as zg's default 8 here, at about a
 third of the memory) unless `ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` is set.
 Keep vendored clones or bulky folders
@@ -296,9 +296,9 @@ cd /abs/repo && printf '.delta/\n' >> .sembleignore && printf '/.sembleignore\n'
 
 Semble never evicts its cache, so every checkout it searched leaves about
 50 MB in `~/Library/Caches/semble` after Delta deletes the checkout. On the
-same runs the maintainer also runs `semble clear orphans`, which removes
-caches whose folder is gone and keeps caches of remote repositories. A folder
-on an unmounted drive also looks gone; its cache is rebuilt on its next search.
+same runs the maintainer removes the caches of that root's deleted Delta
+checkouts, and only those: Semble's own `semble clear orphans` would also
+remove the cache of a folder on an unmounted drive.
 
 ## 6. Context rules (Personal AGENTS.md)
 

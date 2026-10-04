@@ -286,11 +286,37 @@ def semble_skip_delta(root, deadline):
             f.write(("\n" if old and not old.endswith("\n") else "") + ".delta/\n")
 
 
+def semble_cache_folder():
+    # Where Semble keeps its indexes: SEMBLE_CACHE_LOCATION when absolute, else the platform cache folder.
+    override = os.environ.get("SEMBLE_CACHE_LOCATION", "")
+    if override and Path(override).is_absolute():
+        return Path(override)
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Caches/semble"
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "semble"
+
+
 def semble_clear_orphans(root, deadline):
     # Semble never evicts its cache, so each Delta checkout it searched leaves an entry (~50 MB) after
-    # Delta deletes the checkout. This drops entries whose folder is gone; remote-repository caches stay.
-    if shutil.which("semble"):
-        run(["semble", "clear", "orphans"], root, deadline)
+    # Delta deletes the checkout. Drop only those: entries for a folder under this root's .delta/ that
+    # is gone. Semble's own `clear orphans` would also drop caches of folders on unmounted drives.
+    # An entry counts only when its key is the sha256 of its root_path, as Semble checks; any other
+    # layout is left alone.
+    checkouts = root / ".delta"
+    for metadata in sorted(semble_cache_folder().glob("*/index*/metadata.json")):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("semble cache scan exceeded hook budget")
+        entry = metadata.parent.parent
+        try:
+            source = json.loads(metadata.read_text(encoding="utf-8")).get("root_path")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(source, str) or not source:
+            continue
+        source = Path(source).expanduser().resolve()
+        if (hashlib.sha256(str(source).encode()).hexdigest() == entry.name and source.is_relative_to(checkouts)
+                and not source.exists() and entry.is_dir() and not entry.is_symlink()):
+            shutil.rmtree(entry)
 
 
 def git_files(root, deadline, check=True):
@@ -496,6 +522,40 @@ def zg_first_build_lock():
     return cache_dir() / "zg-first-build.lock"
 
 
+def zg_queue():
+    # Roots whose first zg build waits for the machine lock, one per line.
+    return cache_dir() / "zg-first-build.queue"
+
+
+def queue_zg(root):
+    with safe_open(zg_queue()) as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        if str(root) not in f.read().splitlines():
+            f.write(str(root) + "\n")
+
+
+def start_queued_zg():
+    # Run the maintainer once for each waiting root: the first to take the machine lock starts its
+    # build, and the others queue again behind it.
+    try:
+        with safe_open(zg_queue()) as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            roots = f.read().splitlines()
+            f.seek(0)
+            f.truncate()
+        for line in roots:
+            if not (Path(line).is_absolute() and Path(line).is_dir()):
+                continue
+            log = os.open(cache_dir() / "zg-queue.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+            try:
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--zg-queued", line],
+                                 cwd=line, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+            finally:
+                os.close(log)
+    except (OSError, RuntimeError) as error:
+        note("zg queue: " + str(error).splitlines()[0][:180])
+
+
 def wait_for_lock(lock, deadline):
     while True:
         try:
@@ -561,8 +621,9 @@ def build_zg_in_background(root, stamp):
         try:
             fcntl.flock(machine_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            # Two hooks raced past the check in ensure; no state is written, so a later hook here retries.
-            raise RuntimeError("another zg first build is running on this machine") from None
+            # Two hooks raced past the check in ensure: wait in the queue for the running build.
+            queue_zg(root)
+            raise RuntimeError("another zg first build is running on this machine; this one is queued") from None
         existed = index.exists()
         outcome = {"retry_after": time.time() + 600}  # a failed build backs off before the next attempt
         try:
@@ -576,12 +637,16 @@ def build_zg_in_background(root, stamp):
             outcome = {"gave_up": stamp}
             raise
         finally:
-            with safe_open(state_dir / "codex-context-indexes.lock") as lock:
-                wait_for_lock(lock, time.monotonic() + BUDGET_SECONDS)
-                state_path = state_dir / "codex-context-indexes.json"
-                state = load_state(state_path)
-                state["zg"] = outcome
-                save_state(state_dir, state_path, state)
+            try:
+                with safe_open(state_dir / "codex-context-indexes.lock") as lock:
+                    wait_for_lock(lock, time.monotonic() + BUDGET_SECONDS)
+                    state_path = state_dir / "codex-context-indexes.json"
+                    state = load_state(state_path)
+                    state["zg"] = outcome
+                    save_state(state_dir, state_path, state)
+            finally:
+                fcntl.flock(machine_lock, fcntl.LOCK_UN)
+                start_queued_zg()
 
 
 def ensure(root, names, deadline):
@@ -618,8 +683,9 @@ def ensure(root, names, deadline):
                         note(f"zg skipped: a first build here ({count} files) outlasts its "
                              f"{BACKGROUND_SECONDS // 60}-minute background budget; build it by hand if wanted")
                     elif lock_held(zg_first_build_lock()):
-                        note("zg first build waits for another one running on this machine; "
-                             "zg is unavailable here until a later search starts it")
+                        queue_zg(root)
+                        note("zg first build is queued behind another one running on this machine; "
+                             "zg is unavailable here until it finishes")
                     else:
                         note(start_background_zg(root, state_dir, stamp))
                     continue
@@ -648,7 +714,11 @@ def main():
     signal.signal(signal.SIGALRM, deadline_expired)
     signal.alarm(BUDGET_SECONDS)
     try:
-        selected = selection(read_payload())
+        if len(sys.argv) == 3 and sys.argv[1] == "--zg-queued":  # started by start_queued_zg
+            root = Path(sys.argv[2])
+            selected = (root, ["zg"]) if project_root(root) == root else None
+        else:
+            selected = selection(read_payload())
         if selected:
             ensure(*selected, deadline)
     except Exception as error:

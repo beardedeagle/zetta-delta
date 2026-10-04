@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Run: python3 ~/.codex/hooks/test_ensure_context_indexes.py"""
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,9 +23,10 @@ class HookTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
         # Keep cache-held maintenance files, including the machine-wide zg lock, out of the real cache.
-        # Keep the user's index-roots file out of the tests too.
+        # Keep the user's index-roots file and Semble cache out of the tests too.
         cache = patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.base / "cache"),
-                                        "XDG_CONFIG_HOME": str(self.base / "config")})
+                                        "XDG_CONFIG_HOME": str(self.base / "config"),
+                                        "SEMBLE_CACHE_LOCATION": str(self.base / "semble-cache")})
         cache.start()
         self.addCleanup(cache.stop)
         self.root = self.base / "repo"
@@ -377,6 +380,7 @@ else:
         with patch.object(module.shutil, "which", return_value="/usr/bin/true"), \
              patch.object(module, "zg_preflight") as preflight, \
              patch.object(module, "start_background_zg", return_value="started") as start, \
+             patch.object(module, "start_queued_zg") as start_next, \
              patch.object(module, "maintain_zg") as maintain:
             module.ensure(self.root, ["zg"], time.monotonic() + 5)
             preflight.assert_called_once()
@@ -389,6 +393,7 @@ else:
             maintain.side_effect = lambda *args: (self.root / ".zvec-grep").mkdir(exist_ok=True)
             module.build_zg_in_background(self.root, "stamp")
             maintain.assert_called_once()
+            start_next.assert_called_once()  # a finished build hands the machine to the next queued one
             module.ensure(self.root, ["zg"], time.monotonic() + 5)
             start.assert_called_once()
             self.assertEqual(maintain.call_count, 2, "a built index refreshes inline")
@@ -407,13 +412,27 @@ else:
                 fcntl.flock(other_build, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 module.ensure(self.root, ["zg"], time.monotonic() + 5)
                 start.assert_not_called()
-                self.assertIn("another one running on this machine", note.call_args.args[0])
+                self.assertIn("queued behind another one running on this machine", note.call_args.args[0])
                 with self.assertRaisesRegex(RuntimeError, "another zg first build"):
                     module.build_zg_in_background(self.root, "stamp")  # a hook that raced past the check
                 maintain.assert_not_called()
+            self.assertEqual(module.zg_queue().read_text(), f"{self.root}\n", "queued once")
             self.assertNotIn("zg", json.loads(state.read_text()), "a deferred build sets no backoff")
-            module.ensure(self.root, ["zg"], time.monotonic() + 5)
+            with patch.object(module.subprocess, "Popen") as popen:
+                module.start_queued_zg()  # what the running build does when it ends
+            self.assertEqual(popen.call_args.args[0][-2:], ["--zg-queued", str(self.root)])
+            self.assertEqual(module.zg_queue().read_text(), "")
+            module.ensure(self.root, ["zg"], time.monotonic() + 5)  # what that maintainer run does
             start.assert_called_once()
+        # The queued run's entry point: a real root reaches ensure for zg alone; anything else is ignored.
+        path = os.pathsep.join([str(self.bin), str(Path(shutil.which("git")).parent)])
+        for target, expected in ((self.root, "zg is not installed"), (self.base / "nowhere", "")):
+            if shutil.which("zg", path=path):
+                self.skipTest("a real zg sits next to git; this check would start a real build")
+            done = subprocess.run([sys.executable, str(HOOK), "--zg-queued", str(target)], capture_output=True,
+                                  text=True, timeout=8, env=dict(self.env, PATH=path))
+            self.assertEqual(done.returncode, 0)
+            self.assertIn(expected, done.stderr)
 
     def test_zg_runs_with_two_embedding_contexts_unless_set(self):
         spec = importlib.util.spec_from_file_location("index_hook", HOOK)
@@ -544,23 +563,27 @@ else:
         self.assertEqual(ignore.read_text(), "dist/\n")  # committed files are never edited
         self.assertIn("committed .sembleignore lacks .delta/", note.call_args.args[0])
 
-    def test_roots_with_delta_checkouts_clear_semble_orphans(self):
+    def test_semble_cleanup_drops_only_deleted_delta_checkouts(self):
         spec = importlib.util.spec_from_file_location("index_hook", HOOK)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        calls, fake = self.base / "semble-calls", self.bin / "semble"
-        fake.write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\n')
-        fake.chmod(0o755)
-        with patch.dict(os.environ, PATH=self.env["PATH"]):
-            module.ignore_indexes(self.root, time.monotonic() + 5)
-            self.assertFalse(calls.exists())  # no .delta/, no cleanup
-            (self.root / ".delta").mkdir()
-            module.ignore_indexes(self.root, time.monotonic() + 5)
-            self.assertEqual(calls.read_text(), "clear orphans\n")
-            fake.write_text("#!/bin/sh\nexit 3\n")
-            with patch.object(module, "note") as note:
-                module.ignore_indexes(self.root, time.monotonic() + 5)  # a failure is noted, not raised
-            self.assertEqual(note.call_args.args[0], "semble: semble exited 3")
+        cache = Path(os.environ["SEMBLE_CACHE_LOCATION"])
+
+        def entry(source, key=None):
+            folder = cache / (key or hashlib.sha256(str(source.resolve()).encode()).hexdigest())
+            (folder / "index").mkdir(parents=True)
+            (folder / "index/metadata.json").write_text(json.dumps({"root_path": str(source)}))
+            return folder
+
+        checkouts = self.root / ".delta/worktrees"
+        (checkouts / "live").mkdir(parents=True)
+        deleted = entry(checkouts / "deleted")
+        kept = [entry(checkouts / "live"),
+                entry(self.base / "unmounted-drive/project"),  # gone, but not a Delta checkout of this root
+                entry(checkouts / "remote", key="0" * 64)]  # key is not its path: not Semble's local entry
+        module.ignore_indexes(self.root, time.monotonic() + 5)
+        self.assertFalse(deleted.exists())
+        self.assertEqual([folder.exists() for folder in kept], [True, True, True])
 
 
 if __name__ == "__main__":
