@@ -295,6 +295,55 @@ class InstallerTests(unittest.TestCase):
         command = (path / "isolated/SKILL.md").read_text().strip()
         self.assertEqual(shlex.split(command), ["sh", str(path / "isolated/scripts/bon.sh"), "fixture-probe"])
 
+    def test_excess_parent_skill_path_keeps_backups_in_the_install_directory(self):
+        run = self.base / "run"
+        run.mkdir()
+        skills = self.base / "custom-skills"
+        previous = skills / "orchestrate/SKILL.md"
+        previous.parent.mkdir(parents=True)
+        previous.write_text("old custom skill\n")
+        # Extra parents clamp at / for the target, but previously escaped the
+        # backup prefix. The entire target and any escaped backup stay in this fixture.
+        relative = "../" * len(run.parts) + str(skills).lstrip("/")
+        result = self.install("--force", "--skill-dir", relative, cwd=run)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backups = list((self.base / "state/zetta-delta/backups").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertRegex(backups[0].name, r"^\d{8}T\d{6}Z-\d+$")
+        saved = backups[0] / str(previous).lstrip("/")
+        self.assertEqual(saved.read_text(), "old custom skill\n")
+        body = previous.read_text()
+        command = next(match.group(1) for match in re.finditer(r"`(sh [^`]+ snapshot)`", body))
+        self.assertEqual(shlex.split(command), ["sh", str(skills / "orchestrate/scripts/bon.sh"), "snapshot"])
+
+    def test_skill_normalization_preserves_symlink_parent_semantics(self):
+        physical = self.base / "physical/parent"
+        child = physical / "child"
+        child.mkdir(parents=True)
+        alias = self.base / "alias"
+        alias.symlink_to(child, target_is_directory=True)
+        skills = physical / "custom-skills"
+        previous = skills / "orchestrate/SKILL.md"
+        previous.parent.mkdir(parents=True)
+        previous.write_text("old physical skill\n")
+        result = self.install("--force", "--skill-dir", "alias/../custom-skills")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backups = list((self.base / "state/zetta-delta/backups").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / str(previous).lstrip("/")).read_text(), "old physical skill\n")
+        self.assertFalse((self.base / "custom-skills").exists())
+        self.assertTrue(alias.is_symlink())
+        command = next(match.group(1) for match in re.finditer(r"`(sh [^`]+ snapshot)`", previous.read_text()))
+        self.assertEqual(shlex.split(command), ["sh", str(skills / "orchestrate/scripts/bon.sh"), "snapshot"])
+
+    def test_nondirectory_skill_parent_refuses_before_writes(self):
+        parent = self.base / "file-parent"
+        parent.write_text("keep this file\n")
+        result = self.install("--skill-dir", str(parent / "skills"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNoWrites()
+        self.assertEqual(parent.read_text(), "keep this file\n")
+
     def test_template_token_skill_directory_refuses_before_writes(self):
         result = self.install("--skill-dir", str(self.base / "skills{{UNKNOWN}}"))
         self.assertNotEqual(result.returncode, 0)

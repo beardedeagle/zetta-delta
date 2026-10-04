@@ -67,6 +67,82 @@ class IndexRegressions(unittest.TestCase):
         child.write_text("x = 222\n")
         self.assertNotEqual(before, self.hook.fingerprint(self.root, time.monotonic() + 5))
 
+    def test_nested_git_exclusions_reindex_a_ready_broader_zg_corpus(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        self.git(nested, "init", "-q")
+        (nested / "tracked.py").write_text("tracked = 1\n")
+        self.git(nested, "add", "tracked.py")
+        (nested / "cache.py").write_text("cache = 1\n")
+        generated = nested / "generated"
+        generated.mkdir()
+        (generated / "source.py").write_text("generated = 1\n")
+        index = self.root / ".zvec-grep"
+        index.mkdir()
+        manifest = index / "manifest.json"
+        manifest.write_text(json.dumps({"rootPaths": [{"absolutePath": str(self.root), "include": ["nested/**"]}]}))
+        self.hook.ignore_indexes(self.root, time.monotonic() + 10)
+        inventory = self.hook.write_git_inventory(self.root, time.monotonic() + 10)
+        manifest.write_text(json.dumps({"rootPaths": [{"absolutePath": str(self.root),
+                                                        "include": ["nested/**"], "ignoreFiles": [str(inventory)]}]}))
+        exclude = nested / ".git/info/exclude"
+        original = exclude.read_text()
+        indexes = []
+        original_run = self.hook.run
+        # Source bytes stay unchanged. Keep their metadata fixed too, since
+        # macOS bookkeeping can change ctime while the fixture reads them.
+        fixed = {path: path.lstat() for path in (self.root / "main.py", nested / "tracked.py",
+                                                nested / "cache.py", generated / "source.py",
+                                                self.root / ".git/info/exclude")}
+        original_lstat = Path.lstat
+
+        def source_stat(path):
+            return fixed[path] if path in fixed else original_lstat(path)
+
+        def fake_native(argv, root, deadline, **kwargs):
+            if argv[0] != "/usr/bin/sandbox-exec":
+                return original_run(argv, root, deadline, **kwargs)
+            native = argv[3:]
+            self.assertEqual(native[0], "zg")
+            if native[1] == "index":
+                indexes.append(native)
+            else:
+                self.assertEqual(native[1], "status")
+            return subprocess.CompletedProcess(argv, 0, "Workspace index is ready\n", "")
+
+        def maintain():
+            self.hook.ensure(self.root, ["zg"], time.monotonic() + 10)
+            return self.hook.fingerprint(self.root, time.monotonic() + 10, "zg")
+
+        with patch.object(self.hook, "zg_preflight", return_value=("fixture-model", str(self.base / "models"))), \
+             patch.object(self.hook, "zg_index_usable", return_value=True), \
+             patch.object(self.hook, "run", side_effect=fake_native), \
+             patch.object(Path, "lstat", source_stat):
+            first = maintain()
+            self.assertEqual(len(indexes), 1)
+            self.assertEqual(maintain(), first)
+            self.assertEqual(len(indexes), 1)
+            exclude.write_text(original + "\ncache.py\n")
+            ignored_file = maintain()
+            self.assertNotEqual(ignored_file, first)
+            self.assertEqual(len(indexes), 2)
+            self.assertIn("nested/cache.py", json.loads(inventory.read_text())["ignored"])
+            exclude.write_text(original + "\ncache.py\ngenerated/\n")
+            ignored_directory = maintain()
+            self.assertNotEqual(ignored_directory, ignored_file)
+            self.assertEqual(len(indexes), 3)
+            self.assertIn("nested/generated/", json.loads(inventory.read_text())["ignored"])
+            exclude.write_text(original + "\ncache.py\ngenerated/\nnonexistent-file\n")
+            self.assertEqual(maintain(), ignored_directory)
+            self.assertEqual(len(indexes), 3)
+            exclude.write_text(original)
+            self.assertNotEqual(maintain(), ignored_directory)
+            self.assertEqual(len(indexes), 4)
+            self.assertNotIn("nested/cache.py", json.loads(inventory.read_text())["ignored"])
+        self.assertIn("nested/tracked.py", json.loads(inventory.read_text())["tracked"])
+        for invocation in indexes:
+            self.assertIn(inventory, invocation)
+
     def test_empty_index_directory_obeys_first_build_admission(self):
         (self.root / ".zvec-grep").mkdir()
         with patch.object(self.hook, "zg_preflight"), \

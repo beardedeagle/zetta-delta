@@ -84,7 +84,6 @@ done
 if ((!CLEAN && !HELP)); then
   [[ $SKILL_ROOT != *$'\n'* && $SKILL_ROOT != *$'\r'* ]] || die "--skill-dir must not contain line breaks"
   [[ ! $SKILL_ROOT =~ \{\{[A-Z_]*\}\} ]] || die "--skill-dir must not contain template placeholder syntax"
-  [[ $SKILL_ROOT == /* ]] || SKILL_ROOT="$PWD/$SKILL_ROOT"
 fi
 
 # Earlier versions left the rules here for pasting into Delta; --clean removes
@@ -328,14 +327,14 @@ delta_config_dir() {
     *)                    die "unsupported OS; set DELTA_CONFIG_DIR" ;;
   esac
 }
-# Resolve existing directory components before .. so a symlinked parent keeps
-# its filesystem meaning. Destinations below this directory are never resolved:
+# Resolve installation roots component by component before .. so a symlinked
+# parent keeps its filesystem meaning. Destinations below them are never resolved:
 # dangling profile/rule links remain entries for preflight and link backups.
-canonical_config_dir() {
-  local path="$1" resolved="" rest part candidate
+canonical_dir() {
+  local path="$1" label="$2" resolved="" rest part candidate
   if [[ $path =~ ^[A-Za-z]:[\\/] || $path == \\\\* ]]; then
-    command -v cygpath >/dev/null 2>&1 || die "Windows config paths need cygpath; use an absolute POSIX DELTA_CONFIG_DIR"
-    path="$(cygpath -u -- "$path")" || die "could not convert Delta's config directory"
+    command -v cygpath >/dev/null 2>&1 || die "Windows $label paths need cygpath; use an absolute POSIX path"
+    path="$(cygpath -u -- "$path")" || die "could not convert $label directory"
   fi
   [[ $path == /* ]] || path="$PWD/$path"
   [[ $path != //* ]] || resolved=/
@@ -349,14 +348,15 @@ canonical_config_dir() {
       *)
         candidate="$resolved/$part"
         if [[ -d $candidate ]]; then resolved="$(cd -- "$candidate" && pwd -P)"
-        elif [[ -e $candidate || -L $candidate ]]; then die "Delta config path component is not a directory: $candidate"
+        elif [[ -e $candidate || -L $candidate ]]; then die "$label path component is not a directory: $candidate"
         else resolved="$candidate"
         fi ;;
     esac
   done
   printf '%s\n' "${resolved:-/}"
 }
-CONFIG_DIR="$(canonical_config_dir "$(delta_config_dir)")"
+CONFIG_DIR="$(canonical_dir "$(delta_config_dir)" "Delta config")"
+SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"
 PROFILES_DIR="$CONFIG_DIR/profiles"
 [[ -f $CONFIG_DIR/settings.json ]] \
   || warn "no settings.json in $CONFIG_DIR; is that Delta's config directory?"
