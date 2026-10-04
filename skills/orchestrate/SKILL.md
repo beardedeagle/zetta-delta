@@ -73,7 +73,16 @@ RULES:
 - Search with the context tool router in your rules: tgrep for exact text, semble for unknown locations, codegraph for structure, zg for prose, ctx7 and githits for external docs and OSS. Do not start with rg, grep, or find.
 - Cite evidence as path:line. Write "unknown" rather than guess.
 - Keep the report under about 400 words.
-Finish with the Report block.
+
+Finish with exactly this block and nothing after it, written tersely: fragments are fine, filler is not, technical substance stays intact.
+
+## Report
+STATUS: done | blocked | failed
+SUMMARY: 2-5 sentences answering the question.
+FILES: none
+VERIFICATION: the commands or sources you used.
+RISKS: uncertainty, gaps, or follow-up questions; or "none".
+LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas, conventions), with evidence; or "none".
 ```
 
 ### Worker
@@ -95,7 +104,16 @@ RULES:
 - Navigate with the context tool router in your rules and prefix shell commands per its RTK section; never re-search code a tool already returned.
 - Your copy merges back automatically when you finish successfully, including any deletions and reverts. Run `git status --porcelain` before you start and again before you finish, and remove only artifacts you created. Uncommitted changes and untracked files that were already there are the user's work: change them only as GOAL requires within FILES IN SCOPE, and never revert, discard, stash, or delete them unless this block says to.
 - If the goal is ambiguous in a way that changes the result, make the smallest reasonable choice and record it under RISKS.
-Finish with the Report block.
+
+Finish with exactly this block and nothing after it, written tersely: fragments are fine, filler is not, technical substance stays intact.
+
+## Report
+STATUS: done | blocked | failed
+SUMMARY: 2-5 sentences.
+FILES: one line per changed path with a note; or "none".
+VERIFICATION: each command run and its result, with the `exit=` line for each VERIFY command; or "not run: <reason>".
+RISKS: open concerns, assumptions, follow-ups; or "none".
+LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas, conventions), with evidence; or "none".
 ```
 
 ### Review
@@ -112,33 +130,9 @@ RULES:
 - Inspect with `rtk git diff --no-compact HEAD -- <PATHS>`; use `rtk git status --porcelain` to find new files. Use codegraph for callers and impact, tgrep for exact usages, per the router in your rules.
 - Check, in order: correctness against ACCEPTANCE; error handling and failure modes; security; concurrency and resources; tests (do they exercise the change, can they fail); simplicity per the Ponytail section of your rules (unrequested abstractions, avoidable dependencies, boilerplate, reimplemented helpers, corner cuts missing a `ponytail:` note); consistency with surrounding code and project rules.
 - Report real issues. At most five nits, marked as nits. If you find nothing, say what you checked.
-Finish with the Review block.
-```
 
-### Candidate
+Finish with exactly this block and nothing after it, written tersely: fragments are fine, filler is not, technical substance stays intact.
 
-Best-of-N only. Follow `references/best-of-n.md`.
-
-### Result blocks
-
-Write every field tersely: fragments are fine, filler is not, technical
-substance stays intact. These reports land in the orchestrator's context.
-
-Every Scout and Worker ends with:
-
-```
-## Report
-STATUS: done | blocked | failed
-SUMMARY: 2-5 sentences.
-FILES: one line per changed path with a note; or "none".
-VERIFICATION: each command run and its result, with the `exit=` line for each VERIFY command; or "not run: <reason>".
-RISKS: open concerns, assumptions, follow-ups; or "none".
-LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas, conventions), with evidence; or "none".
-```
-
-Every Reviewer ends with:
-
-```
 ## Review
 VERDICT: approve | approve-with-nits | changes-required
 FINDINGS: one per line by severity (blocker, major, minor, nit): severity, path:line, problem, suggested fix. Or "none".
@@ -146,6 +140,10 @@ CHECKED: what was examined and how.
 VERIFICATION: each command run and its result, with the `exit=` line for each VERIFY command; or "not run: <reason>".
 LEARNED: durable project facts worth keeping in the llm-wiki (decisions, gotchas, conventions), with evidence; or "none".
 ```
+
+### Candidate
+
+Best-of-N only. Follow `references/best-of-n.md`.
 
 ## Procedure
 

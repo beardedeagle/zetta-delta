@@ -316,7 +316,7 @@ Once pasted, `./install.sh --clean` removes the file and its folder.
 | MCP tools (semble, codegraph, zvec, githits) | The same tools' CLIs, named per question class in the router |
 | PreToolUse RTK rewrite hook | The RTK section of the rules, plus `rtk` in the task blocks. A transparent shim is not possible: Delta runs commands as `/bin/sh -c '<cmd> \| cat'`, which reads no startup files, and RTK does not rewrite pipelines |
 | SessionStart index hook | The rules' index step: agents run the maintainer once per folder per thread (`.agents/prepare`, section 5, can also start it) |
-| Caveman proxy, hooks, MCP | Caveman's skills in `~/.agents/skills` and its local `toon encode`, named in the rules; `caveman tools mem` only on request, since project memory goes to the llm-wiki, which only the top-level thread writes (subagents report `LEARNED:` items). Delta's model traffic stays uncompressed: the proxy compresses a streaming request only when it carries Caveman's MCP retrieve tool, which Delta cannot add. Result blocks ask for terse reports instead |
+| Caveman proxy, hooks, MCP | Caveman's skills in `~/.agents/skills` and its local `toon encode`, named in the rules; `caveman tools mem` only on request, since project memory goes to the llm-wiki, which only the top-level thread writes (subagents report `LEARNED:` items). Delta's model traffic stays uncompressed: the proxy compresses a streaming request only when it carries Caveman's MCP retrieve tool, which Delta cannot add. The task blocks ask for terse reports instead |
 | Ponytail plugin hooks | Ponytail's `AGENTS.md` text in the rules, always at full level. Reviewers check simplicity against it |
 
 The generated Ponytail section changes one sentence: "Grep every caller"
