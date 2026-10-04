@@ -367,6 +367,25 @@ Ask for best-of-N explicitly ("best-of-3 across Kimi, GLM, and Qwen") or let
 the skill choose it for a high-risk unit. If another orchestrator thread is
 running, say so; the skill halves its budgets.
 
+In best-of-N, two to four models from different families each attempt the
+same unit in their own copy and hand back a patch through `bon.sh`. The thread
+judges the patches and applies only the winner, which then gets the usual
+review.
+
+```mermaid
+flowchart TD
+  O["Orchestrator thread<br/>bon.sh snapshot"] --> C1["Candidate<br/>model family 1<br/>own copy"]
+  O --> C2["Candidate<br/>model family 2<br/>own copy"]
+  O --> C3["Candidate<br/>model family 3<br/>own copy"]
+  C1 -->|report and patch| J["Judge: VERIFY, then ACCEPTANCE,<br/>scope, risk, readability"]
+  C2 -->|report and patch| J
+  C3 -->|report and patch| J
+  J -->|clear winner| A["bon.sh apply<br/>the winner lands in your checkout"]
+  J -.->|top two close| Y["You choose"]
+  Y -.-> A
+  A --> R["VERIFY, then review by<br/>another model family"]
+```
+
 Two more skills run a thread a different way. Each takes any task: a change,
 a question, research, an investigation.
 
@@ -384,6 +403,24 @@ Name the sides ("defend with qwen-max, challenge with grok") or a round limit
 to change the defaults. The thread reports both final positions and picks no
 winner unless you ask.
 
+```mermaid
+sequenceDiagram
+  actor U as You
+  participant T as Thread (moderator)
+  participant D as Defender
+  participant C as Challenger from another family
+  U->>T: /adversarial task
+  loop Each round, up to the limit (5 by default)
+    T->>D: Turn block with every earlier turn
+    D-->>T: Turn report, its changes merged into your checkout
+    Note over T,D: CONCEDE or AGREE ends the room
+    T->>C: Turn block with every earlier turn
+    C-->>T: Turn report, its changes merged into your checkout
+    Note over T,C: ACCEPT or AGREE ends the room
+  end
+  T-->>U: Both final positions, no winner unless you ask
+```
+
 ```
 /isolated <task or question>
 ```
@@ -394,6 +431,22 @@ each changes comes back as a patch through `bon.sh`, so nothing lands until
 you choose. The thread shows every result word for word, side by side; you
 keep one, its patch is applied, and follow-ups go only to the models you
 pick.
+
+```mermaid
+flowchart TD
+  U["You: /isolated task"] --> T["Thread<br/>bon.sh snapshot"]
+  T --> P1["Participant<br/>model family 1<br/>own copy"]
+  T --> P2["Participant<br/>model family 2<br/>own copy"]
+  T --> P3["Participant<br/>model family 3<br/>own copy"]
+  P1 -->|result and patch| V["Every result shown<br/>word for word, side by side"]
+  P2 -->|result and patch| V
+  P3 -->|result and patch| V
+  V --> K{"You keep one?"}
+  K -->|yes| A["bon.sh apply<br/>its patch lands in your checkout"]
+  K -->|no| N["Nothing lands"]
+  A --> F["Follow-ups go only to<br/>the participants you pick"]
+  N --> F
+```
 
 ## 9. Context tools
 
@@ -459,7 +512,3 @@ on `PATH` shadows.
   ignored build output does not merge back from isolated workers. Untracked,
   non-ignored artifacts do, which is why every block requires a clean
   `git status`.
-- `/adversarial` and `/isolated` have not run in a live Delta thread yet.
-  Their turn order, isolation, and stopping rules are instructions the
-  thread's model follows; Delta enforces only that a subagent sees what the
-  thread sends it.
