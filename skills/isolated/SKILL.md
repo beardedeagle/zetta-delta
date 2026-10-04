@@ -110,8 +110,11 @@ VERIFY: <identical, or "none">
    proceed.
 4. If the task is ambiguous in a way that changes the result, ask once before
    spawning anything.
-5. Pick the participants: the profiles the user names; otherwise three from
-   the roster's Best-of-N candidates table, each from a different family,
+5. Pick the participants from the profiles whose roster roles include
+   candidate: those run in an isolated copy, which the patch handback needs.
+   If the user names another profile, say it cannot take part and why. Take
+   the profiles the user names; otherwise three from the roster's Best-of-N
+   candidates table, each from a different family,
    fewer if the budgets allow fewer, never more than four. Give each a slug
    derived from its model, such as `kimi-for-coding` or `qwen3-8-max`.
 6. Post the setup: each participant's profile, model, family, and slug;

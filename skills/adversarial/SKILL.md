@@ -109,10 +109,12 @@ A verdict the side may not give counts as CONTINUE.
    whether to proceed with those changes included.
 4. If the task is ambiguous in a way that changes the result, ask once before
    spawning anything.
-5. Pick the sides: the profiles the user names; otherwise the built-in Worker
-   defends, and the first entry in the roster's reviewer preference order
-   whose family differs from the defender's challenges. Any profile whose roster roles include worker or reviewer may
-   take either side.
+5. Pick the sides from the profiles whose roster roles include worker or
+   reviewer; any of them may take either side. If the user names another
+   profile, say it cannot take part and why. Take the profiles the user
+   names; otherwise the built-in Worker defends, and the first entry in the
+   roster's reviewer preference order whose family differs from the
+   defender's challenges.
 6. Post the setup: each side's profile, model, and family; the round limit;
    SCOPE.
 
