@@ -53,7 +53,7 @@ What happens when you type `/orchestrate <task>`:
    `references/roster.md`: the models, lanes, budgets, and reviewer order the
    installer generated for your accounts.
 3. It plans, then calls Delta's subagent tool once per unit of work, naming a
-   profile (`Worker`, `qwen-max`, `Reviewer`, ...) and sending a filled-in
+   profile (`worker`, `qwen-max`, `reviewer`, ...) and sending a filled-in
    task block that carries the rules.
 4. Delta runs each subagent in its own conversation and worktree, on the
    profile's model, and returns its final report to the thread.
@@ -63,7 +63,7 @@ What happens when you type `/orchestrate <task>`:
 flowchart TD
   U[You: /orchestrate task] --> O["Top-level thread<br/>k3 · Kimi Code<br/>+ SKILL.md + roster.md"]
   O -->|SCOUT block| S["Scout (built-in)<br/>glm-5.3-flash · Z.AI"]
-  O -->|SCOUT block| SL["scout-local<br/>DGX Spark lane"]
+  O -->|SCOUT block| SQ["scout-qwen<br/>qwen3.8-flash · Qwen plan"]
   O -->|ASSIGNMENT| W["Worker (built-in)<br/>kimi-for-coding · Kimi Code"]
   O -->|ASSIGNMENT| WQ["qwen-max<br/>qwen3.8-max · Qwen plan"]
   W -->|merges back on success| O
@@ -219,8 +219,8 @@ into the roster.
 | Setting | Value |
 |---|---|
 | Enable Sub-agents | Only When Asked |
-| Max Agents Per Thread | 6 |
-| Max Agents Overall | 12 (raise to 16–24 once a shared admission proxy enforces provider limits) |
+| Max Agents Per Thread | The installer's `THREAD_CAP` (default 6), which the roster uses as its all-lanes budget |
+| Max Agents Overall | Twice that (12 at the default); go higher only once a shared admission proxy enforces provider limits |
 | Allow model overrides | On (lets you name a model no profile pins; the skill passes none otherwise) |
 | Scout model | `glm-5.3-flash` (Z.AI Coding Plan), effort high |
 | Worker model | `kimi-for-coding` (Kimi Code), effort high |
@@ -238,9 +238,10 @@ The built-in models must match the roster; if you choose others, pass the
 - Model Preferences (LLM Providers > each provider): leave every row on
   `Global · …`. Provider-specific choices take precedence over profile models
   and would silently reroute them.
-- Models Shown in Picker: hide metered duplicates (the DeepSeek API copy of
-  `deepseek-v4-pro`, the Qwen-plan copy of `glm-5.3`) so nobody picks them by
-  accident.
+- Models Shown in Picker: hide the duplicates the roster routes around, so
+  nobody picks them by accident: the DeepSeek API copy of `deepseek-v4-pro`
+  (metered) and the Qwen-plan copy of `glm-5.3` (flat, but it spends the Qwen
+  plan's quota on GLM, which the roster runs on Z.AI).
 
 ## 5. Per-checkout test isolation
 
@@ -330,8 +331,9 @@ installer keeps the text verbatim and warns.
 
 The tools themselves come from `stack/install.sh` (section 9).
 
-The rules add about 7 KB to every thread's context. The router pays that back
-when it replaces grep-and-read loops.
+The rules add about 10 KB to every thread's context; the installer prints the
+exact size and warns above 10,240 bytes. The router pays that back when it
+replaces grep-and-read loops.
 
 Smoke test (new thread, any model):
 
