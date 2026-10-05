@@ -15,6 +15,8 @@ The installer adds:
   reviewer order generated for your accounts.
 - `/adversarial` and `/isolated`: two more ways to run a thread, for any
   task (section 8).
+- `/pr-review`: independent PR or commit-range review across configured model
+  families, followed by cross-family verification of every finding (section 8).
 - The context router and Ponytail rules, written into Delta's Personal
   AGENTS.md (section 6).
 
@@ -92,6 +94,7 @@ way.
 | `references/identity-registry.json` | each installed skill's `references/` | Generated provider lanes, billing/budgets, and exact model-family bindings |
 | `skills/adversarial/SKILL.md` | `~/.agents/skills/adversarial/` | Always |
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
+| `skills/pr-review/SKILL.md` | `~/.agents/skills/pr-review/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
 | `tests/install-test.sh` | Not installed | Regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
 | `tests/prepare-test.sh` | Not installed | Regression check for `examples/agents-prepare.sh`: `sh tests/prepare-test.sh` |
@@ -385,6 +388,24 @@ Confirm that each spawn line in the thread names the expected profile and
 model; that label is Delta's, not the subagent's self-report.
 
 ## 8. Use
+
+```
+/pr-review <PR URL, PR number, or main...feature_branch>
+```
+
+The thread pins the comparison, plans from changed-file and hunk metadata,
+and sizes independent review assignments to each model's capacity. It considers
+every configured profile, selects useful perspectives across model families,
+and queues work within lane and thread limits. Small changes may use fewer
+models; larger changes may need several waves. Reviewers read changed hunks
+and retrieve focused context as needed.
+
+Every original finding gets a separate vet pass from another model family
+before deduplication. The review covers bugs, security, regressions, privacy/PII,
+data governance, idiomatic code, anti-patterns, test value, and unnecessary code.
+The report preserves finder/vetter identities, rejected and unresolved claims,
+and coverage gaps. Review setup and any tests use disposable snapshots as needed;
+the skill requires source and your checkout to remain unchanged.
 
 ```
 /orchestrate <task, constraints, and how you will judge it done>
