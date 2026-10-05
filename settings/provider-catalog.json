@@ -1,0 +1,171 @@
+{
+  "version": 1,
+  "providers": {
+    "kimi": {
+      "name": "Kimi Code",
+      "base_url": "https://api.kimi.ai/coding/v1",
+      "api_mode": "open_ai_chat_completions",
+      "models": [
+        {
+          "id": "k3",
+          "context_window": 1048576,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "id": "kimi-for-coding",
+          "context_window": 1048576,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "id": "kimi-for-coding-highspeed",
+          "context_window": 262144,
+          "max_output_tokens": 65536,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "on"
+          ]
+        },
+        {
+          "id": "k3-256k",
+          "context_window": 262144,
+          "max_output_tokens": 65536,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ]
+    },
+    "zai": {
+      "name": "Z.AI Coding Plan",
+      "base_url": "https://api.z.ai/api/coding/paas/v4",
+      "api_mode": "open_ai_chat_completions",
+      "models": [
+        {
+          "id": "glm-5.3",
+          "context_window": 1048576,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "reasoning_efforts": [
+            "max",
+            "low",
+            "high"
+          ]
+        },
+        {
+          "id": "glm-5.3-flash",
+          "context_window": 1048576,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "reasoning_efforts": [
+            "max",
+            "low",
+            "high"
+          ]
+        }
+      ]
+    },
+    "qwen": {
+      "name": "Qwen Token Plan",
+      "base_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+      "api_mode": "open_ai_chat_completions",
+      "models": [
+        {
+          "id": "deepseek-v4-pro",
+          "context_window": 1000000,
+          "max_output_tokens": 384000,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "high",
+            "max"
+          ]
+        },
+        {
+          "id": "qwen3.8-max",
+          "context_window": 1000000,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        },
+        {
+          "id": "qwen3.8-flash",
+          "context_window": 1000000,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "context_window": 1000000,
+          "max_output_tokens": 384000,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "id": "glm-5.3",
+          "context_window": 1000000,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ]
+    },
+    "minimax": {
+      "name": "MiniMax",
+      "base_url": "https://api.minimax.io/anthropic",
+      "api_mode": "anthropic",
+      "models": [
+        {
+          "id": "MiniMax-M3",
+          "context_window": 1000000,
+          "max_output_tokens": 131072,
+          "interleaved_reasoning": true,
+          "parallel_tool_calls": true,
+          "reasoning_efforts": [
+            "on",
+            "off"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -22,7 +22,9 @@ class InstallerTests(unittest.TestCase):
         self.bundle = self.base / "bundle"
         self.bundle.mkdir()
         shutil.copy2(ROOT / "install.sh", self.bundle / "install.sh")
-        for directory in ("profiles", "rules", "skills"):
+        for filename in ("bootstrap.sh", "Brewfile"):
+            shutil.copy2(ROOT / filename, self.bundle / filename)
+        for directory in ("profiles", "rules", "skills", "scripts", "settings"):
             shutil.copytree(ROOT / directory, self.bundle / directory)
         self.home = self.base / "home"
         self.config = self.base / "delta"
@@ -32,6 +34,13 @@ class InstallerTests(unittest.TestCase):
         curl = self.base / "bin/curl"
         curl.write_text("#!/bin/sh\nexit 77\n")
         curl.chmod(0o755)
+        for name in ("gh", "rtk", "tgrep", "semble", "codegraph", "zg", "ctx7", "githits", "caveman", "pgrep"):
+            tool = self.base / "bin" / name
+            tool.write_text("#!/bin/sh\nexit " + ("1" if name == "pgrep" else "0") + "\n")
+            tool.chmod(0o755)
+        python = self.base / "bin/python3"
+        python.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        python.chmod(0o755)
         self.env = {
             "PATH": str(self.base / "bin") + ":/usr/bin:/bin",
             "HOME": str(self.home), "TMPDIR": str(self.base / "tmp"),
@@ -168,6 +177,158 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"]),
                          ("custom:k", "k3", "Kimi", "Kimi Code"))
 
+    def test_missing_settings_and_runtime_tools_refuse_before_writes(self):
+        settings = self.config / "settings.json"
+        settings.unlink()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no settings.json", result.stderr)
+        self.assertNoWrites()
+        settings.write_text("{}\n")
+        (self.base / "bin/gh").unlink()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gh not found", result.stderr)
+        self.assertNoWrites()
+
+    def test_builtin_pins_match_roster_and_preserve_other_settings(self):
+        worker = self.config / "profiles/worker.toml"
+        worker.parent.mkdir()
+        before = 'worktree = "isolated"\nprompt = "Keep this prompt"\n[model.any]\nmodel = "custom:q/qwen3.8-max"\nthinking_effort = "low"\nother = true\n'
+        worker.write_text(before)
+        refused = self.install()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(worker.read_text(), before)
+        result = self.install("--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import tomllib
+        data = tomllib.loads(worker.read_text())
+        self.assertEqual(data["model"]["any"], {"model": "custom:k/k3", "thinking_effort": "high", "other": True})
+        self.assertEqual(data["prompt"], "Keep this prompt")
+        saved = list((self.base / "state/zetta-delta/backups").glob("*/" + str(worker).lstrip("/")))
+        self.assertEqual(saved[0].read_text(), before)
+
+    def test_configure_delta_seeds_scrubbed_providers_and_preserves_local_secrets(self):
+        settings = self.config / "settings.json"
+        local = {"version": 1, "native": {"private_canary": "LOCAL_SECRET_CANARY", "custom_providers": []},
+                 "portable": {"appearance": "dark", "subagent_defaults": {"unrelated": True}}}
+        settings.write_text(json.dumps(local))
+        providers = json.loads((self.bundle / "settings/provider-catalog.json").read_text())["providers"]
+        import hashlib
+        ids = {name.upper() + "_PROVIDER": "custom:" + hashlib.sha256(providers[name]["base_url"].encode()).hexdigest()
+               for name in ("kimi", "zai", "qwen")}
+        result = self.install("--configure-delta", "--force", **ids)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(settings.read_text())
+        self.assertEqual(data["native"]["private_canary"], "LOCAL_SECRET_CANARY")
+        self.assertNotIn("LOCAL_SECRET_CANARY", result.stdout + result.stderr)
+        self.assertNotIn("LOCAL_SECRET_CANARY", (self.bundle / "settings/provider-catalog.json").read_text())
+        self.assertEqual(data["portable"]["appearance"], "dark")
+        self.assertEqual(data["portable"]["subagent_concurrency"], {"maximum_per_parent": 6, "maximum_total": 12})
+        self.assertEqual(data["portable"]["subagent_defaults"], {"unrelated": True, "allow_parent_model_override": True})
+        self.assertEqual(len(data["native"]["custom_providers"]), 3)
+        self.assertTrue(all(row["headers"] == [] for row in data["native"]["custom_providers"]))
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+        saved = list((self.base / "state/zetta-delta/backups").glob("*/" + str(settings).lstrip("/")))
+        self.assertEqual(saved[0].stat().st_mode & 0o777, 0o600)
+        provider = data["native"]["custom_providers"][0]
+        provider["headers"] = [{"name": "Authorization", "value": "LOCAL_HEADER_CANARY"}]
+        settings.write_text(json.dumps(data))
+        result = self.install("--configure-delta", "--force", **ids)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("LOCAL_HEADER_CANARY", result.stdout + result.stderr)
+        self.assertEqual(json.loads(settings.read_text())["native"]["custom_providers"][0]["headers"], provider["headers"])
+
+    def test_configure_delta_initializes_missing_settings_and_provider_ids(self):
+        (self.config / "settings.json").unlink()
+        result = self.install("--configure-delta", KIMI_PROVIDER="", ZAI_PROVIDER="", QWEN_PROVIDER="", THREAD_CAP="8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads((self.config / "settings.json").read_text())
+        self.assertEqual(data["portable"]["subagent_concurrency"], {"maximum_per_parent": 8, "maximum_total": 16})
+        import tomllib
+        pins = {name: tomllib.loads((self.config / "profiles" / (name + ".toml")).read_text())["model"]["any"]["model"]
+                for name in ("scout", "worker", "reviewer")}
+        self.assertTrue(pins["worker"].endswith("/k3"))
+        self.assertTrue(pins["reviewer"].endswith("/glm-5.3"))
+        registry = json.loads((self.home / ".agents/skills/pr-review/references/identity-registry.json").read_text())
+        bindings = {row["provider_id"] + "/" + row["model_id"] for row in registry["models"]}
+        self.assertTrue(set(pins.values()) <= bindings)
+
+    def test_bootstrap_orders_prerequisites_tools_and_configuration(self):
+        stack = self.bundle / "stack"
+        stack.mkdir()
+        order = self.base / "tmp/order"
+        (stack / "install.sh").write_text('#!/bin/sh\nprintf "STACK\\n" >> "$TMPDIR/order"\n')
+        brew = self.base / "bin/brew"
+        brew.write_text('#!/bin/sh\ncase "$1" in bundle) printf "BREW\\n" >> "$TMPDIR/order";; '
+                        '--prefix) printf "%s\\n" ' + shlex.quote(str(self.base / "brew")) + ';; *) exit 2;; esac\n')
+        brew.chmod(0o755)
+        env = {key: value for key, value in self.env.items() if key not in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER")}
+        dry = subprocess.run([BASH, str(self.bundle / "bootstrap.sh"), "--dry-run"], env=env,
+                             cwd=self.base, text=True, capture_output=True)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertFalse(order.exists())
+        self.assertNoWrites()
+        ran = subprocess.run([BASH, str(self.bundle / "bootstrap.sh"), "--force"], env=env,
+                             cwd=self.base, text=True, capture_output=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(order.read_text().splitlines(), ["BREW", "STACK"])
+        data = json.loads((self.config / "settings.json").read_text())
+        self.assertEqual(len(data["native"]["custom_providers"]), 4)
+        self.assertEqual(data["portable"]["subagent_concurrency"], {"maximum_per_parent": 8, "maximum_total": 16})
+        self.assertIn("| MiniMax | 2 |", self.roster())
+        self.assertIn("| grok |", self.roster())
+        self.assertIn("| gpt-sol |", self.roster())
+
+    def test_running_delta_and_complex_builtin_layout_refuse_before_writes(self):
+        (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
+        result = self.install("--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("quit Delta", result.stderr)
+        self.assertNoWrites()
+        (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 1\n")
+        worker = self.config / "profiles/worker.toml"
+        worker.parent.mkdir()
+        before = 'model.any.model = "custom:q/qwen3.8-max"\n'
+        worker.write_text(before)
+        result = self.install("--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(worker.read_text(), before)
+        self.assertFalse((self.home / ".agents").exists())
+        self.assertEqual(list((self.base / "state").iterdir()), [])
+
+    def test_all_optional_lanes_keep_primary_families_before_duplicates(self):
+        result = self.install(GPT_PROVIDER="openai-subscribed", GROK_PROVIDER="x_ai-subscribed",
+                              MINIMAX_PROVIDER="custom:m", MINIMAX_BILLING="plan",
+                              COPILOT_PROVIDER="custom:c", LOCAL_PROVIDER="custom:l", LOCAL_MODEL="fixture-local", LOCAL_FAMILY="Qwen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        active = {path.stem for path in (self.config / "profiles").glob("*.toml")} - {"worker", "reviewer", "scout"}
+        self.assertEqual(active, {"qwen-max", "deepseek-pro", "grok", "gpt-sol", "minimax", "scout-gemini", "scout-local"})
+        for name in active:
+            profile = (self.config / "profiles" / (name + ".toml")).read_text()
+            self.assertIn("REVIEW-PR", profile)
+            if not name.startswith("scout-"):
+                self.assertIn("VET", profile)
+                self.assertIn("read-only analysis", profile)
+        self.assertIn("PONYTAIL_START 4.13.0", (self.home / ".config/delta/AGENTS.md").read_text())
+
+    def test_malformed_settings_and_catalog_secrets_refuse_before_writes(self):
+        settings = self.config / "settings.json"
+        settings.write_text('{"native":"LOCAL_SECRET_CANARY"}')
+        result = self.install("--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("LOCAL_SECRET_CANARY", result.stdout + result.stderr)
+        self.assertNoWrites()
+        settings.write_text("{}\n")
+        catalog = self.bundle / "settings/provider-catalog.json"
+        data = json.loads(catalog.read_text())
+        data["providers"]["kimi"]["headers"] = {"Authorization": "CATALOG_SECRET_CANARY"}
+        catalog.write_text(json.dumps(data))
+        result = self.install("--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("CATALOG_SECRET_CANARY", result.stdout + result.stderr)
+        self.assertNoWrites()
+
     def test_flat_lane_cannot_be_declared_metered_elsewhere(self):
         result = self.install(METERED_LANES="Qwen Token Plan")
         self.assertNotEqual(result.returncode, 0)
@@ -179,14 +340,15 @@ class InstallerTests(unittest.TestCase):
                      "COPILOT_PROVIDER": "custom:c", "LOCAL_PROVIDER": "custom:l", "LOCAL_MODEL": "fake-local"}
         first = self.install(**providers)
         self.assertEqual(first.returncode, 0, first.stderr)
-        old = {p.stem: p.read_bytes() for p in (self.config / "profiles").glob("*.toml")}
+        all_before = {p.stem: p.read_bytes() for p in (self.config / "profiles").glob("*.toml")}
+        old = {name: contents for name, contents in all_before.items() if name not in ("worker", "reviewer", "scout")}
         priority = dict(providers, PROFILE_PRIORITY="scout-local scout-gemini gpt-astra")
         refused = self.install(**priority)
         self.assertNotEqual(refused.returncode, 0)
-        self.assertEqual({p.stem: p.read_bytes() for p in (self.config / "profiles").glob("*.toml")}, old)
+        self.assertEqual({p.stem: p.read_bytes() for p in (self.config / "profiles").glob("*.toml")}, all_before)
         second = self.install("--force", **priority)
         self.assertEqual(second.returncode, 0, second.stderr)
-        active = sorted(p.stem for p in (self.config / "profiles").glob("*.toml"))
+        active = sorted(p.stem for p in (self.config / "profiles").glob("*.toml") if p.stem not in ("worker", "reviewer", "scout"))
         self.assertEqual(len(active), 7, active)
         self.assertTrue({"scout-local", "scout-gemini", "gpt-astra"}.issubset(active))
         for name in set(old) - set(active):

@@ -3,7 +3,9 @@
 
 Delta has no MCP servers or hooks: every route below is a CLI. Delta runs each
 command as `/bin/sh -c '<cmd> | cat'`, so use POSIX sh syntax, absolute roots,
-and `cd /abs/root && <cmd>` when a tool needs a working directory. The `| cat`
+and start every shell command with `export PATH={{TOOL_PATH_SH}}:"$PATH";`
+so the installed tools are visible even when Delta was launched from the desktop.
+Use `cd /abs/root && <cmd>` when a tool needs a working directory. The `| cat`
 hides exit codes: end a command whose success matters with `; echo "exit=$?"`
 (with a pipe inside, `$?` is the last stage's). Your working
 directory is the checkout root: one `pwd` gives `/abs/root`. Do not survey with

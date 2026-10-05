@@ -7,6 +7,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 BASH_BIN=${BASH_BIN:-$(command -v bash)}
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
 T=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/install-test.XXXXXX")" && pwd -P)
 fail=0
 trap 'if [ "$fail" = 0 ]; then rm -rf "$T"; else echo "kept $T for inspection"; fi' EXIT
@@ -17,7 +18,15 @@ fetched() { if [ -e "$T/url" ]; then cat "$T/url"; else echo none; fi; }
 # Only directories owned by the installer's bundle fetch count as residue.
 download_residue() { find "$T/tmp" -mindepth 1 -maxdepth 1 -name 'zetta-delta.*' -print; }
 
-mkdir -p "$T/bin" "$T/home" "$T/tmp" "$T/delta" && touch "$T/delta/settings.json"
+mkdir -p "$T/bin" "$T/home" "$T/tmp" "$T/delta"
+printf '{}\n' > "$T/delta/settings.json"
+ln -s "$PYTHON_BIN" "$T/bin/python3"
+for tool in gh rtk tgrep semble codegraph zg ctx7 githits caveman; do
+  printf '#!/bin/sh\nexit 0\n' > "$T/bin/$tool"
+  chmod +x "$T/bin/$tool"
+done
+printf '#!/bin/sh\nexit 1\n' > "$T/bin/pgrep"
+chmod +x "$T/bin/pgrep"
 printf 'system scratch\n' > "$T/tmp/system-scratch"
 # A Ponytail plugin whose cache folder name is not its version, as Codex stores it.
 pt=$T/home/.codex/plugins/cache/ponytail/ponytail/1.0.0
@@ -69,7 +78,7 @@ check "cut-short download: nothing ran" "$(fetched) $(ls -A "$T/delta")" "none s
 r=$(run "$ROOT/install.sh" "$prov ZETTA_DELTA_REF=abc123" --force)
 has "piped install: exit 0" "$r" "exit=0"
 check "piped install: fetched the pinned commit" "$(fetched)" "https://github.com/beardedeagle/zetta-delta/archive/abc123.tar.gz"
-check "piped install: profiles" "$(cd "$T/delta/profiles" && printf '%s ' *)" "deepseek-pro.toml qwen-max.toml scout-deepseek.toml scout-qwen.toml "
+check "piped install: profiles" "$(cd "$T/delta/profiles" && printf '%s ' *)" "deepseek-pro.toml qwen-max.toml reviewer.toml scout-deepseek.toml scout-qwen.toml scout.toml worker.toml "
 check "piped install: skill" "$(cd "$T/home/.agents/skills/orchestrate" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
   "./SKILL.md ./references/best-of-n.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/bon.sh ./scripts/identity.py "
 check "piped install: adversarial skill" "$(cd "$T/home/.agents/skills/adversarial" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \

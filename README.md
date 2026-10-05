@@ -5,6 +5,30 @@ different providers, keeps each provider within its limits, has every change
 reviewed by a different model family, and spends per-token money only when
 you allow it.
 
+For a fresh machine with Delta and Homebrew installed, quit Delta, clone this
+repository, then run:
+
+```bash
+./bootstrap.sh --dry-run
+./bootstrap.sh --force
+```
+
+Bootstrap installs build prerequisites and GitHub CLI from `Brewfile`, builds the
+pinned context tools, and installs the bundle with `--configure-delta`. Its defaults
+match this machine's accounts: Z.AI Max, Qwen Pro, MiniMax plan, ChatGPT/Grok
+subscriptions, and an 8-agent thread limit (16 overall). Override the documented
+environment variables for different plans; concurrency never grants extra quota.
+Set `GPT_PROVIDER=`, `GROK_PROVIDER=`, or `MINIMAX_PROVIDER=` to disable those
+optional lanes. Existing files are backed up before forced replacement.
+
+The bundled provider catalog contains only public endpoints, API modes, and
+allowlisted model capabilities. Credentials, passwords, authorization headers,
+account identifiers, and local paths are excluded. Existing local credentials and
+unrelated settings survive configuration; settings and their backups are private
+(mode 0600). Authenticate providers and subscription accounts in Delta, and run
+`gh auth login` locally for PR targets. Start Delta and verify a real review before
+treating the setup as operational; offline installation does not prove dispatch.
+
 The installer adds:
 
 - One custom subagent profile per model, pinned to its model and thinking
@@ -107,6 +131,9 @@ way.
 | `stack/context-indexes/ensure-context-indexes.py` | `~/.local/share/zetta-delta/` | By `stack/install.sh`; tests: `python3 -m unittest` in that folder |
 | `stack/zvec-grep/verify-install.py` | `~/.local/share/zvec-grep/` | By `stack/install.sh`, pinned to the zvec-grep it installs; tests: `python3 -m unittest` in that folder |
 | `deploy.env.example` | Not installed | Template for `deploy.env` (ignored by git), sourced before `install.sh` to repeat an install |
+| `bootstrap.sh` and `Brewfile` | Not installed | Fresh-machine prerequisites, pinned context tools, and configured bundle installation |
+| `settings/provider-catalog.json` and `scripts/setup.py` | Not installed | Credential-free provider metadata and local settings/built-in rendering |
+| `rules/ponytail/` | Not installed | Bundled public Ponytail 4.13.0 rules, attribution, and MIT license; used when no local plugin exists |
 | `install.sh` | Not installed | Run by hand (section 3) |
 
 The Delta config directory is the folder containing `settings.json`:
@@ -114,7 +141,13 @@ The Delta config directory is the folder containing `settings.json`:
 
 ## 1. Prerequisites
 
-Each provider entry already works in Delta, with `interleaved_reasoning` on for
+Use `bootstrap.sh` for a fresh setup. Direct `install.sh` requires Python 3.11+
+and the runtime commands it checks (`git`, `gh`, `rtk`, and the context CLIs).
+Without `--configure-delta`, initialize Delta's `settings.json` and configure
+provider entries first. With that flag, the installer can create settings and
+merge the bundled provider/model metadata, preserving local credentials.
+
+Authenticate each provider in Delta, with `interleaved_reasoning` on for
 every model and the output limits configured. For the Z.AI Coding Plan, use
 the OpenAI-compatible base URL `https://api.z.ai/api/coding/paas/v4` and confirm
 Delta is on Z.AI's supported-tools list; the plan is limited to those tools.
@@ -190,6 +223,12 @@ export LOCAL_PROVIDER=<id> LOCAL_MODEL=<served model id> LOCAL_FAMILY=GLM
 ./install.sh --prune-legacy     # add --force when reinstalling
 ```
 
+`--configure-delta` also sets delegation to Only When Asked, model overrides on,
+and concurrency to `THREAD_CAP` per thread and twice that overall. It derives
+required provider IDs from the bundled public URLs when not supplied. A conflicting
+endpoint override is refused before writes; custom endpoints can use direct
+installation after configuration in Delta. Quit Delta before either installer runs.
+
 To repeat an install, keep the settings in a file: copy
 `deploy.env.example` to `deploy.env` (git ignores it), fill it in, and run
 `. ./deploy.env && ./install.sh --force`.
@@ -205,7 +244,8 @@ pin the built-ins to models other than the defaults below.
 Delta's spawn tool offers at most 10 profiles: the three built-ins, then
 custom profiles in alphabetical order, dropping the rest without a word.
 The installer counts every other `.toml` already in the profiles folder,
-installs at most the remaining of 7 custom slots in a fixed priority order
+installs at most the remaining of 7 custom slots, prioritizing primary model
+families and optional Gemini/local scouts before duplicate models/scouts
 (`./install.sh --help`; `PROFILE_PRIORITY` puts named profiles first), names
 what it skipped and what takes the slots, and writes only installed profiles
 into the roster. On `--force`, earlier managed selections that are no longer
@@ -229,6 +269,9 @@ reported and refused before writes. Duplicate priorities are refused.
 
 Set these three in Settings > Subagents > Profiles (Delta saves them as
 `worker.toml`, `scout.toml`, and `reviewer.toml` in the profiles folder).
+The installer now pins these three files automatically, preserving unrelated
+settings in supported TOML layouts and backing up changed files under `--force`.
+The table is a verification reference; `--configure-delta` sets the other controls.
 Left at "Same as Parent" or "Provider Default", they resolve to the thread's
 model, so a Kimi thread's Reviewer would be Kimi reviewing Kimi.
 The built-in models must match the roster; if you choose others, pass the
@@ -335,7 +378,8 @@ re-reads the file at the start of each turn. Each run of the installer writes
 two blocks there: the context router from `rules/personal-AGENTS.md`
 (`DELTA_CONTEXT_ROUTER`), then Ponytail's always-on text from the installed
 plugin (`PONYTAIL`, labelled with the plugin's version; the newest folder under
-`~/.codex/plugins/cache/ponytail/ponytail/`, or `PONYTAIL_DIR`). It replaces
+`~/.codex/plugins/cache/ponytail/ponytail/`, or `PONYTAIL_DIR`). A fresh instance
+uses the bundled, MIT-licensed Ponytail rules if no local plugin is found. It replaces
 only those blocks and keeps the rest of the file after them; like every file it
 changes, it needs `--force` when the file exists and saves the old one first.
 It refuses while a block lacks its START or END line. Rerun it after updating
