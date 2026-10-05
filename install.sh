@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install the Delta orchestration bundle: custom subagent profiles, the
-# /orchestrate, /adversarial, and /isolated skills, and a roster generated for
+# /orchestrate, /adversarial, /isolated, and /pr-review skills, and a roster generated for
 # this machine's accounts (one copy in each skill).
 # Also writes the context router and Ponytail into Delta's Personal AGENTS.md
 # (~/.config/delta/AGENTS.md), replacing only those two blocks and keeping the
@@ -830,7 +830,7 @@ personal_rules() { # our blocks, then whatever else RULES_FILE already holds
 # $SKILL_ROOT with its own copy of the roster; install_file renders
 # {{SKILL_DIR}} from SKILL_DIR.
 
-readonly SKILLS="orchestrate adversarial isolated"
+readonly SKILLS="orchestrate adversarial isolated pr-review"
 
 write_bundle() {
   local p skill SKILL_DIR="$SKILL_ROOT/orchestrate"
@@ -844,6 +844,8 @@ write_bundle() {
   SKILL_DIR="$SKILL_ROOT/isolated"
   install_file "$SCRIPT_DIR/skills/isolated/SKILL.md" "$SKILL_DIR/SKILL.md" render
   install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
+  SKILL_DIR="$SKILL_ROOT/pr-review"
+  install_file "$SCRIPT_DIR/skills/pr-review/SKILL.md" "$SKILL_DIR/SKILL.md" render
   for skill in $SKILLS; do
     SKILL_DIR="$SKILL_ROOT/$skill"
     install_output "$SKILL_DIR/references/roster.md" printf '%s\n' "$roster"
