@@ -1,7 +1,9 @@
 <!-- DELTA_SUBAGENT_CONTEXT_START v1 -->
 Context/token stack: apply these rules in every role, even if the task omits RULES.
 Use the task's absolute SOURCE ROOT, otherwise determine your checkout with pwd.
-Keep each lookup scoped; read cited code once, then only missing context.
+Locate needed symbols first; read bounded line ranges, widening only for missing
+evidence. Outside your checkout use SOURCE ROOT-qualified shell reads. Current
+returned source is already read; do not repeat it or default to whole files.
 
 Routes: exact text/identifiers/globs -> tgrep (flags first, --, explicit root);
 unknown implementation -> semble search; known symbols/callers/impact ->
@@ -10,10 +12,11 @@ library/API/CLI docs -> ctx7 library then ctx7 docs; public OSS/package evidence
 -> githits. Keep private evidence out of public queries. Do not start with broad
 ls/find/grep/rg or whole-file dumps. Missing/stale tgrep index -> --no-index,
 not rg. Missing graph/vector coverage -> Semble or focused exact scan/source reads;
-state the gap. Current returned source is already read; similarity is not a call edge.
+state the gap. Similarity is not a call edge.
 
 Every shell command starts with `export PATH={{TOOL_PATH_SH}}:"$PATH";`.
-Use rtk for supported shell filters, rtk proxy for context CLIs and exact bytes.
+After PATH use `rtk git ...`, `rtk proxy tgrep ...`, `rtk proxy semble ...`, etc.;
+use `rtk proxy sed -n 'N,Mp' /abs/file` for bounded source reads/exact bytes.
 Use POSIX sh; print `; echo "exit=$?"` when success matters (pipes can hide failure).
 Before the first indexed lookup in each root, run the bounded index maintainer:
 `rtk proxy python3 -c 'import json,sys;print(json.dumps({"hook_event_name":"SessionStart","cwd":sys.argv[1]}))' /abs/root | rtk proxy python3 ~/.local/share/zetta-delta/ensure-context-indexes.py`.
