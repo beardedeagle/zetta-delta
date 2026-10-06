@@ -95,6 +95,13 @@ def settings(path, roles, identities, thread_cap):
 
 
 def builtin(path, model, effort):
+    metadata = next((entry for provider in load_catalog().values()
+                     for entry in provider["models"]
+                     if model == provider_id(provider) + "/" + entry["id"]), None)
+    if effort is None:
+        effort = "high" if metadata and "high" in metadata["reasoning_efforts"] else ""
+    elif effort and metadata and effort not in metadata["reasoning_efforts"]:
+        raise ValueError("unsupported effort for configured provider/model")
     original = path.read_text() if path.exists() else ""
     parsed = tomllib.loads(original)
     expected = copy.deepcopy(parsed)
@@ -138,7 +145,7 @@ def main():
     profile = commands.add_parser("builtin")
     profile.add_argument("path", type=Path)
     profile.add_argument("--model", required=True)
-    profile.add_argument("--effort", default="high", choices=("", "low", "medium", "high", "xhigh", "max"))
+    profile.add_argument("--effort", choices=("", "off", "on", "low", "medium", "high", "xhigh", "max"))
     args = parser.parse_args()
     try:
         if args.command == "provider-id":

@@ -21,7 +21,7 @@ download_residue() { find "$T/tmp" -mindepth 1 -maxdepth 1 -name 'zetta-delta.*'
 mkdir -p "$T/bin" "$T/home" "$T/tmp" "$T/delta"
 printf '{}\n' > "$T/delta/settings.json"
 ln -s "$PYTHON_BIN" "$T/bin/python3"
-for tool in gh rtk tgrep semble codegraph zg ctx7 githits caveman; do
+for tool in gh rtk tgrep semble codegraph zg ctx7 githits caveman node; do
   printf '#!/bin/sh\nexit 0\n' > "$T/bin/$tool"
   chmod +x "$T/bin/$tool"
 done

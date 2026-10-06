@@ -3,12 +3,14 @@
 import os
 import re
 import json
+import hashlib
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +36,7 @@ class InstallerTests(unittest.TestCase):
         curl = self.base / "bin/curl"
         curl.write_text("#!/bin/sh\nexit 77\n")
         curl.chmod(0o755)
-        for name in ("gh", "rtk", "tgrep", "semble", "codegraph", "zg", "ctx7", "githits", "caveman", "pgrep"):
+        for name in ("gh", "rtk", "tgrep", "semble", "codegraph", "zg", "ctx7", "githits", "caveman", "node", "pgrep"):
             tool = self.base / "bin" / name
             tool.write_text("#!/bin/sh\nexit " + ("1" if name == "pgrep" else "0") + "\n")
             tool.chmod(0o755)
@@ -62,6 +64,10 @@ class InstallerTests(unittest.TestCase):
 
     def roster(self):
         return (self.home / ".agents/skills/orchestrate/references/roster.md").read_text()
+
+    def catalog_id(self, role):
+        providers = json.loads((self.bundle / "settings/provider-catalog.json").read_text())["providers"]
+        return "custom:" + hashlib.sha256(providers[role]["base_url"].encode()).hexdigest()
 
     def test_malformed_markers_refuse_before_any_writes(self):
         cases = [
@@ -185,11 +191,16 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("no settings.json", result.stderr)
         self.assertNoWrites()
         settings.write_text("{}\n")
-        (self.base / "bin/gh").unlink()
-        result = self.install()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("gh not found", result.stderr)
-        self.assertNoWrites()
+        for name in ("gh", "node"):
+            tool = self.base / "bin" / name
+            contents = tool.read_text()
+            tool.unlink()
+            result = self.install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(name + " not found", result.stderr)
+            self.assertNoWrites()
+            tool.write_text(contents)
+            tool.chmod(0o755)
 
     def test_builtin_pins_match_roster_and_preserve_other_settings(self):
         worker = self.config / "profiles/worker.toml"
@@ -199,7 +210,7 @@ class InstallerTests(unittest.TestCase):
         refused = self.install()
         self.assertNotEqual(refused.returncode, 0)
         self.assertEqual(worker.read_text(), before)
-        result = self.install("--force")
+        result = self.install("--force", BUILTIN_WORKER_EFFORT="high")
         self.assertEqual(result.returncode, 0, result.stderr)
         import tomllib
         data = tomllib.loads(worker.read_text())
@@ -248,11 +259,118 @@ class InstallerTests(unittest.TestCase):
         import tomllib
         pins = {name: tomllib.loads((self.config / "profiles" / (name + ".toml")).read_text())["model"]["any"]["model"]
                 for name in ("scout", "worker", "reviewer")}
+        for name in pins:
+            data = tomllib.loads((self.config / "profiles" / (name + ".toml")).read_text())
+            self.assertEqual(data["model"]["any"]["thinking_effort"], "high")
         self.assertTrue(pins["worker"].endswith("/k3"))
         self.assertTrue(pins["reviewer"].endswith("/glm-5.3"))
         registry = json.loads((self.home / ".agents/skills/pr-review/references/identity-registry.json").read_text())
         bindings = {row["provider_id"] + "/" + row["model_id"] for row in registry["models"]}
         self.assertTrue(set(pins.values()) <= bindings)
+
+    def test_settings_link_backups_are_private_snapshots_and_preserve_targets(self):
+        settings = self.config / "settings.json"
+        target = self.config / "original.json"
+        original = '{"native":{"canary":"LOCAL_LINK_CANARY"}}\n'
+        backups = self.base / "state/zetta-delta/backups"
+        backups.mkdir(parents=True)
+        for kind in ("relative", "absolute", "dangling"):
+            with self.subTest(kind=kind):
+                settings.unlink()
+                if kind == "dangling":
+                    target.unlink()
+                else:
+                    target.write_text(original)
+                    target.chmod(0o640)
+                link = str(target) if kind == "absolute" else target.name
+                settings.symlink_to(link)
+                before = set(backups.iterdir())
+                result = self.install("--configure-delta", "--force",
+                                      KIMI_PROVIDER="", ZAI_PROVIDER="", QWEN_PROVIDER="")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                saved = (set(backups.iterdir()) - before).pop() / str(settings).lstrip("/")
+                saved_link = Path(str(saved) + ".link")
+                self.assertTrue(saved_link.is_symlink())
+                self.assertEqual(os.readlink(saved_link), link)
+                self.assertFalse(settings.is_symlink())
+                self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+                if kind == "dangling":
+                    self.assertFalse(saved.exists())
+                    self.assertFalse(target.exists())
+                else:
+                    self.assertFalse(saved.is_symlink())
+                    self.assertEqual(saved.read_text(), original)
+                    self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(target.read_text(), original)
+                    self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+                    self.assertEqual(json.loads(settings.read_text())["native"]["canary"], "LOCAL_LINK_CANARY")
+                    self.assertNotIn("LOCAL_LINK_CANARY", result.stdout + result.stderr)
+
+    def test_builtin_efforts_follow_exact_catalog_identity(self):
+        worker = self.config / "profiles/worker.toml"
+        cases = [
+            (self.catalog_id("minimax"), "MiniMax-M3", "MiniMax", "MiniMax", {}),
+            (self.catalog_id("qwen"), "qwen3.8-max", "Qwen Token Plan", "Qwen", {}),
+            (self.catalog_id("kimi"), "k3", "Kimi Code", "Kimi", {"thinking_effort": "high"}),
+            ("custom:k", "k3", "Kimi Code", "Kimi", {}),
+        ]
+        for provider, model, lane, family, effort in cases:
+            with self.subTest(provider=provider, model=model):
+                result = self.install("--force", MINIMAX_PROVIDER=self.catalog_id("minimax"),
+                                      KIMI_PROVIDER=provider if lane == "Kimi Code" else "custom:k",
+                                      QWEN_PROVIDER=provider if lane == "Qwen Token Plan" else "custom:q",
+                                      BUILTIN_WORKER_PROVIDER=provider, BUILTIN_WORKER_MODEL=model,
+                                      BUILTIN_WORKER_LANE=lane, BUILTIN_WORKER_FAMILY=family)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(tomllib.loads(worker.read_text())["model"]["any"],
+                                 {"model": provider + "/" + model, **effort})
+
+    def test_builtin_explicit_efforts_validate_before_writes(self):
+        minimax = dict(MINIMAX_PROVIDER=self.catalog_id("minimax"), BUILTIN_WORKER_MODEL="MiniMax-M3",
+                       BUILTIN_WORKER_LANE="MiniMax", BUILTIN_WORKER_FAMILY="MiniMax")
+        qwen = dict(QWEN_PROVIDER=self.catalog_id("qwen"), BUILTIN_WORKER_MODEL="qwen3.8-max",
+                    BUILTIN_WORKER_LANE="Qwen Token Plan", BUILTIN_WORKER_FAMILY="Qwen")
+        for extra, effort in ((minimax, "high"), (minimax, "max"), (qwen, "high")):
+            result = self.install("--force", BUILTIN_WORKER_EFFORT=effort, **extra)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("built-in WORKER preflight failed", result.stderr)
+            self.assertNoWrites()
+        for effort in ("on", "off", ""):
+            result = self.install("--force", BUILTIN_WORKER_EFFORT=effort, **minimax)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = tomllib.loads((self.config / "profiles/worker.toml").read_text())["model"]["any"]
+            self.assertEqual(data.get("thinking_effort"), effort or None)
+        result = self.install("--force", BUILTIN_WORKER_EFFORT="xhigh", **qwen)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = tomllib.loads((self.config / "profiles/worker.toml").read_text())["model"]["any"]
+        self.assertEqual(data["thinking_effort"], "xhigh")
+
+    def test_desktop_path_retains_separate_tool_and_runtime_directories(self):
+        custom = self.base / "tools with 'quotes' & $dollar ;"
+        runtime = self.base / "runtime"
+        custom.mkdir()
+        runtime.mkdir()
+        for name, directory in (("githits", custom), ("node", runtime), ("python3", runtime)):
+            (self.base / "bin" / name).rename(directory / name)
+        (custom / "githits").write_text('#!/usr/bin/env node\n')
+        (runtime / "node").write_text('#!/bin/sh\nprintf "RUNTIME_OK\\n"\n')
+        ambient = self.base / "unrelated"
+        ambient.mkdir()
+        path = ":".join(map(str, (custom, runtime, ambient, self.base / "bin"))) + ":/usr/bin:/bin"
+        result = self.install(PATH=path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rules = (self.home / ".config/delta/AGENTS.md").read_text()
+        prefix = re.search(r"`(export PATH=.*?;)`", rules).group(1)
+        command = prefix + ' githits; python3 -c "import tomllib"; printf "%s\\n" "$PATH"'
+        ran = subprocess.run(["/bin/sh", "-e", "-c", command],
+                             env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)},
+                             cwd=self.base, capture_output=True, text=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.splitlines()[0], "RUNTIME_OK")
+        directories = ran.stdout.splitlines()[1].split(":")
+        self.assertIn(str(custom), directories)
+        self.assertEqual(directories.count(str(runtime)), 1)
+        self.assertNotIn(str(ambient), directories)
 
     def test_bootstrap_orders_prerequisites_tools_and_configuration(self):
         stack = self.bundle / "stack"

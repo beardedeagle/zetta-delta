@@ -36,7 +36,8 @@
 #   ORCHESTRATOR_MODEL=k3  ORCHESTRATOR_LANE="Kimi Code"  ORCHESTRATOR_FAMILY=Kimi
 #   BUILTIN_{SCOUT,WORKER,REVIEWER}_{MODEL,LANE,FAMILY}  (see README)
 #   BUILTIN_{SCOUT,WORKER,REVIEWER}_{PROVIDER,BILLING,LIMIT}
-#   BUILTIN_{SCOUT,WORKER,REVIEWER}_EFFORT   default high; empty omits the pin
+#   BUILTIN_{SCOUT,WORKER,REVIEWER}_EFFORT   high if catalog-supported; otherwise unpinned
+#     Empty omits the pin; explicit known-model efforts must be supported.
 #     Known lanes infer their provider, billing, and shared limit. API/custom
 #     lanes need an explicit provider id and limit; unknown lanes also need
 #     billing=flat|metered. Roles sharing a lane must agree on billing/limit.
@@ -140,7 +141,8 @@ if ((HELP)); then usage; exit 0; fi
 # The same PATH prefix travels in the generated rules to Delta's POSIX shell.
 TOOL_BIN="${PREFIX:-$HOME/.local}/bin"
 export PATH="$TOOL_BIN:$PATH"
-for tool in python3 git gh rtk tgrep semble codegraph zg ctx7 githits caveman; do
+REQUIRED_TOOLS=(python3 git gh rtk tgrep semble codegraph zg ctx7 githits caveman node)
+for tool in "${REQUIRED_TOOLS[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found; run bootstrap.sh from a clone first"
 done
 python3 -c 'import tomllib' 2>/dev/null || die "Python 3.11 or later is required; run bootstrap.sh first"
@@ -183,9 +185,6 @@ BUILTIN_WORKER_FAMILY="${BUILTIN_WORKER_FAMILY:-Kimi}"
 BUILTIN_REVIEWER_MODEL="${BUILTIN_REVIEWER_MODEL:-glm-5.3}"
 BUILTIN_REVIEWER_LANE="${BUILTIN_REVIEWER_LANE:-Z.AI Coding Plan}"
 BUILTIN_REVIEWER_FAMILY="${BUILTIN_REVIEWER_FAMILY:-GLM}"
-BUILTIN_SCOUT_EFFORT="${BUILTIN_SCOUT_EFFORT-high}"
-BUILTIN_WORKER_EFFORT="${BUILTIN_WORKER_EFFORT-high}"
-BUILTIN_REVIEWER_EFFORT="${BUILTIN_REVIEWER_EFFORT-high}"
 
 # Values are substituted with sed and written into Markdown, so restrict them.
 check() { # $1=name $2=value $3=regex $4=hint
@@ -380,9 +379,23 @@ canonical_dir() {
 }
 CONFIG_DIR="$(canonical_dir "$(delta_config_dir)" "Delta config")"
 SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"
-[[ $TOOL_BIN != *$'\n'* && $TOOL_BIN != *$'\r'* ]] || die "tool directory must not contain line breaks"
-TOOL_BIN="$(canonical_dir "$TOOL_BIN" "tool")"
-TOOL_PATH="$TOOL_BIN:$(dirname -- "$(command -v python3)"):$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin"
+# Preserve the tools preflight actually accepted, plus their runtime/build tools.
+# Do not import unrelated ambient PATH entries into desktop rules.
+TOOL_PATH=""
+add_tool_dir() {
+  local directory="$1"
+  [[ $directory != *$'\n'* && $directory != *$'\r'* && $directory != *:* ]] \
+    || die "tool directory must not contain line breaks or colons"
+  directory="$(canonical_dir "$directory" "tool")"
+  [[ $directory != *$'\n'* && $directory != *$'\r'* && $directory != *:* ]] \
+    || die "resolved tool directory must not contain line breaks or colons"
+  [[ ":$TOOL_PATH:" != *":$directory:"* ]] || return 0
+  TOOL_PATH="${TOOL_PATH:+$TOOL_PATH:}$directory"
+}
+add_tool_dir "$TOOL_BIN"
+for tool in "${REQUIRED_TOOLS[@]}" npm uv cargo brew; do
+  if tool_command="$(command -v "$tool")"; then add_tool_dir "$(dirname -- "$tool_command")"; fi
+done
 PROFILES_DIR="$CONFIG_DIR/profiles"
 [[ -f $CONFIG_DIR/settings.json ]] \
   || ((CONFIGURE_DELTA)) || die "no settings.json in $CONFIG_DIR; initialize Delta or use --configure-delta"
@@ -397,8 +410,10 @@ python3 "$SCRIPT_DIR/scripts/setup.py" settings "${SETTINGS_ARGS[@]}" >/dev/null
   || die "Delta settings preflight failed"
 render_builtin() {
   local role="$1" provider="BUILTIN_${1}_PROVIDER" model="BUILTIN_${1}_MODEL" effort="BUILTIN_${1}_EFFORT"
+  local -a effort_args=()
+  [[ -z ${!effort+x} ]] || effort_args=(--effort "${!effort}")
   python3 "$SCRIPT_DIR/scripts/setup.py" builtin "$PROFILES_DIR/$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]').toml" \
-    --model "${!provider}/${!model}" --effort "${!effort}"
+    --model "${!provider}/${!model}" ${effort_args[@]+"${effort_args[@]}"}
 }
 for role in SCOUT WORKER REVIEWER; do render_builtin "$role" >/dev/null || die "built-in $role preflight failed"; done
 
@@ -414,8 +429,14 @@ backup() { # DEST: save DEST under BACKUP_DIR before it changes
   local saved="$BACKUP_DIR/${1#/}"
   [[ -d $BACKUP_DIR ]] || info "saving the files this install changes under $BACKUP_DIR"
   mkdir -p -- "$(dirname -- "$saved")"
-  cp -Pp -- "$1" "$saved"
-  [[ $1 != "$CONFIG_DIR/settings.json" ]] || chmod 0600 "$saved"
+  if [[ $1 == "$CONFIG_DIR/settings.json" ]]; then
+    # Keep the link for restoration and snapshot its content privately without
+    # changing the original target's permissions. A dangling link has no content.
+    [[ ! -L $1 ]] || cp -Pp -- "$1" "$saved.link"
+    if [[ -e $1 ]]; then (umask 077; cat -- "$1" > "$saved"); fi
+  else
+    cp -Pp -- "$1" "$saved"
+  fi
 }
 
 commit_file() { # TMP DEST: move a finished TMP into place, saving the DEST it changes

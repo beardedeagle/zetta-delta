@@ -25,8 +25,10 @@ The bundled provider catalog contains only public endpoints, API modes, and
 allowlisted model capabilities. Credentials, passwords, authorization headers,
 account identifiers, and local paths are excluded. Existing local credentials and
 unrelated settings survive configuration; settings and their backups are private
-(mode 0600). Authenticate providers and subscription accounts in Delta, and run
-`gh auth login` locally for PR targets. Start Delta and verify a real review before
+(mode 0600). Settings symlinks are saved separately as `settings.json.link`, with
+an independent content snapshot at `settings.json` when the target exists; the
+original target is untouched. Authenticate providers and subscription accounts in
+Delta, and run `gh auth login` locally for PR targets. Start Delta and verify a real review before
 treating the setup as operational; offline installation does not prove dispatch.
 
 The installer adds:
@@ -228,6 +230,13 @@ and concurrency to `THREAD_CAP` per thread and twice that overall. It derives
 required provider IDs from the bundled public URLs when not supplied. A conflicting
 endpoint override is refused before writes; custom endpoints can use direct
 installation after configuration in Delta. Quit Delta before either installer runs.
+
+Built-in effort defaults to `high` only when the exact provider/model identity in
+the bundled catalog supports it; other models remain unpinned. Set
+`BUILTIN_{SCOUT,WORKER,REVIEWER}_EFFORT` to a supported value (including `on`/`off`),
+or to an empty string to omit the pin. Unsupported known-model values fail before
+writes. Generated desktop rules retain the resolved directories of required tools
+and available Node/build/Homebrew runtimes, rather than the entire installer PATH.
 
 To repeat an install, keep the settings in a file: copy
 `deploy.env.example` to `deploy.env` (git ignores it), fill it in, and run
