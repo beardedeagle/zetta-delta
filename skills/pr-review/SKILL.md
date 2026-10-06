@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Thorough Delta PR or commit-range review using independent configured model-family perspectives, workload-sized dispatch waves, and cross-family verification of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review".
+description: Thorough Delta PR or commit-range review using independent configured model-family perspectives, workload-sized dispatch waves, cross-family vetting, and explicit orchestrator adjudication of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review".
 disable-model-invocation: true
 ---
 
@@ -9,9 +9,11 @@ disable-model-invocation: true
 You are the top-level review orchestrator. Maximize useful independent model-family
 perspectives, then have another family verify every original finding. Size the
 work and concurrency to the change; do not optimize away meaningful diversity.
-There are two stages: discovery and vetting. Each stage may need several dispatch
-waves. Findings are evidence-backed claims, not votes or a promise that code is
-bug-free.
+Every finding goes through three stages: independent discovery, cross-family
+vetting, and explicit adjudication by the top-level orchestrator. Discovery and
+vetting may need several dispatch waves; adjudication is a separate evidence pass
+for every finding, not an automatic acceptance of a vet verdict. Findings are
+evidence-backed claims, not votes or a promise that code is bug-free.
 
 ## Delta dispatch contract
 
@@ -149,7 +151,8 @@ focused manifest, project rule, or short code snippet only when a boundary remai
 ambiguous. Do not front-load whole-file reads, caller tracing, or graph traversal
 just to schedule review. There is no required amount of source to read per file.
 
-The orchestrator's large context is for coordination, not a mandate to fill it.
+Use the orchestrator's large context to retain the finding/vet ledger, compare
+evidence across units, and adjudicate every claim. It is not a mandate to fill it.
 Reviewers start with assigned changed hunks, then retrieve enclosing functions,
 contracts, and relevant callers as needed to establish evidence. Read an entire file
 only when that analysis actually needs it; copying a local snapshot does not imply
@@ -205,9 +208,9 @@ Post the target, measurements, model-selection reasons, coverage map, queued wav
 and planned discovery-spawn count including interaction/supplemental units. Give a
 provisional vetting estimate, then the exact planned vet-batch count after discovery;
 do not claim an exact total before the findings exist. Apply any user-supplied total
-spawn/time budget across both stages, follow-ups, and retries; an exhausted budget
-leaves remaining coverage incomplete. Without such a budget, there is no arbitrary
-total-spawn ceiling that cuts off useful family perspectives. Batch related work,
+spawn/time budget across all three stages, follow-ups, and retries; an exhausted
+budget leaves remaining coverage or adjudication incomplete. Without such a budget,
+there is no arbitrary total-spawn ceiling that cuts off useful family perspectives. Batch related work,
 reuse task handles for report corrections, and keep the existing one-retry/one-tie-break
 limits. Track actual work against the plan and explain evidence-driven additions.
 Do not require fresh approval solely because a read-only review is large. Await
@@ -340,7 +343,7 @@ still retain separate cross-family verdicts. New evidence may revise an existing
 claim once through the focused dispute path; do not bounce it indefinitely between
 families or re-review an already covered chunk without a concrete new evidence gap.
 
-## Failure handling and reconciliation
+## Failure handling
 
 - Provider auth/quota/rate errors mark the effective lane unavailable for this run
   before retry selection; do not retry on that lane. Deterministic identity/role/source
@@ -354,22 +357,64 @@ families or re-review an already covered chunk without a concrete new evidence g
   lane usage. Persistent missing fields/verdicts are coverage gaps. Handle completed,
   failed, stopped, and task blocked/partial separately; do not wait forever for a report
   from a terminal failed spawn. Exhausted eligible routes leave the unit incomplete.
-- Only after vetting, cluster findings by root cause and demonstrated trigger, not
-  location alone. Give clusters final F-IDs and retain every raw ID, finder/vetter
-  identity, verdict, and independent evidence. Do not let a confirmed duplicate hide
-  a rejected, unverifiable, or contradictory claim; show material disagreements.
-- The orchestrator may reconcile evidence and severity, but cannot manufacture a
-  CONFIRMED result without a valid cross-family vet. Preserve rejected findings with
-  refutations. Missing-vetter findings are UNVETTED, not false positives or omissions.
+
+## Stage 3 — Mandatory orchestrator adjudication
+
+Adjudicate every original and spillover raw ID after its vet pass, including
+REJECTED and UNVERIFIABLE verdicts. Account explicitly for missing vets as UNVETTED.
+Do not skip adjudication because the finder and vetter agree, the issue seems
+trivial, or another claim appears to be a duplicate. The top-level orchestrator
+performs this third pass; record its actual model/provider/family and disclose any
+family overlap with the finder or vetter. This stage does not require another spawn
+or replace the independent cross-family vet.
+
+For each raw ID, compare the original trigger, impact, and proposed fix against the
+vetter's evidence and refutation. Inspect the decisive frozen-source lines and
+needed callers/contracts when the reports do not establish the conclusion. Decide
+the final claim, severity/category, and fix assessment on evidence; explain why any
+finder/vetter disagreement is resolved. Agreement, majority, report status, and a
+passing test that misses the trigger are not proof.
+
+Retain finder and vetter reports unchanged alongside the adjudication. A final
+CONFIRMED/ADJUSTED disposition requires that raw ID's own valid cross-family vet
+to support the material claim; another raw ID's verdict cannot substitute, even
+for an identical bug. A REJECTED decision requires a concrete refutation. If evidence conflicts,
+use the existing single focused tie-break allowance and re-adjudicate with the new
+evidence; retain DISPUTED if it remains unsettled. Do not promote a rejected or
+unverifiable claim without a supporting cross-family verdict. Preserve UNVERIFIABLE
+and UNVETTED gaps rather than converting them to rejection or confirmation.
+
+If adjudication discovers a new issue, assign a raw ID with the orchestrator as
+finder and route it through Stage 2 and then Stage 3. The same family-inequality and
+bounded spillover rules apply. Mark any raw ID whose third pass cannot finish
+UNADJUDICATED and retain the reason; the review remains incomplete.
+
+Record one adjudication row per raw ID:
+
+```text
+RAW-ID / TARGET: <original ID; frozen comparison>
+FINDER / VETTER: <exact identities; original claim and vet verdict/evidence>
+ADJUDICATOR: <top-level model/provider/family; any family overlap>
+DISPOSITION: CONFIRMED | ADJUSTED | REJECTED | DISPUTED | UNVERIFIABLE | UNVETTED | UNADJUDICATED
+DECISION: <final claim, severity/category, fix assessment; decisive path:line evidence or precise gap; reason for accepting or rejecting each material argument>
+FOLLOW-UP: <focused action needed to settle a gap; or none>
+```
+
+Only after every raw ID has been accounted for, cluster adjudicated findings by
+root cause and demonstrated trigger, not location alone. Give clusters final F-IDs
+and retain every raw ID, all three identities, original verdict, final disposition,
+and evidence. A confirmed duplicate must not hide a rejected, unverifiable,
+unadjudicated, or contradictory claim; show material disagreements.
 
 ## Completion and report
 
 Reconcile the planned coverage map against actual CHECKED reports, source identities,
-terminal units, and the raw-finding vet ledger. Completion requires assessed assigned
-paths/hunks and interaction passes, all nine categories checked or explained as
-not-applicable, and a valid terminal cross-family verdict for every original/spillover
-finding. Differentiate intentional model omissions from failed or unavailable coverage.
-An evidence gap, missing required perspective, UNVETTED/UNVERIFIABLE item, or unresolved
+terminal units, and the raw-finding vet/adjudication ledger. Completion requires
+assessed assigned paths/hunks and interaction passes, all nine categories checked or explained as
+not-applicable, a valid terminal cross-family verdict, and a completed evidence-backed
+adjudication for every original/spillover finding. Differentiate intentional model
+omissions from failed or unavailable coverage. An evidence gap, missing required
+perspective, UNVETTED/UNVERIFIABLE/UNADJUDICATED item, or unresolved
 material dispute makes the review incomplete; never report unconditional merge-ready.
 
 Report in this thread:
@@ -381,9 +426,12 @@ Report in this thread:
    findings and do not inflate with duplicates. For incomplete review, still state
    any demonstrated reasons to withhold merging.
 2. **Confirmed/adjusted findings:** severity order; F-ID, category, source location,
-   concrete trigger/impact, fix, raw IDs, finder and vetter models/families, evidence.
+   concrete trigger/impact, fix, raw IDs, finder/vetter/adjudicator models/families,
+   original vet verdict, final disposition, adjudication rationale, and evidence.
 3. **Rejected and unresolved:** refutations, disputes, UNVERIFIABLE/UNVETTED items,
-   missing evidence, and what would settle them. Separate unrelated pre-existing issues.
+   UNADJUDICATED items, decision rationale, missing evidence, and what would settle
+   them. Preserve the per-raw-ID adjudication ledger, including rejected duplicates.
+   Separate unrelated pre-existing issues.
 4. **Coverage and process:** measured workload, checked categories/paths/interactions,
    model selection/omission reasons, waves and terminal statuses, substitutions,
    effective lanes and metered use, test results, source-integrity checks, and gaps.

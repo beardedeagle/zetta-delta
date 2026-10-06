@@ -42,7 +42,8 @@ The installer adds:
 - `/adversarial` and `/isolated`: two more ways to run a thread, for any
   task (section 8).
 - `/pr-review`: independent PR or commit-range review across configured model
-  families, followed by cross-family verification of every finding (section 8).
+  families, followed by cross-family vetting and explicit orchestrator adjudication
+  of every finding (section 8).
 - The context router and Ponytail rules, written into Delta's Personal
   AGENTS.md (section 6).
 
@@ -455,10 +456,13 @@ and queues work within lane and thread limits. Small changes may use fewer
 models; larger changes may need several waves. Reviewers read changed hunks
 and retrieve focused context as needed.
 
-Every original finding gets a separate vet pass from another model family
-before deduplication. The review covers bugs, security, regressions, privacy/PII,
+Every original finding gets three passes before deduplication: independent discovery,
+vetting by another model family, and explicit adjudication by the orchestrator. The
+third pass includes rejected findings, compares both evidence trails, and records a
+reasoned final disposition. Missing vetting or adjudication leaves the review incomplete.
+The review covers bugs, security, regressions, privacy/PII,
 data governance, idiomatic code, anti-patterns, test value, and unnecessary code.
-The report preserves finder/vetter identities, rejected and unresolved claims,
+The report preserves finder/vetter/adjudicator identities, rejected and unresolved claims,
 and coverage gaps. Review setup and any tests use disposable snapshots as needed;
 the skill requires source and your checkout to remain unchanged.
 
@@ -468,7 +472,8 @@ flowchart TD
   T --> S["Select useful configured perspectives<br/>size assignments and schedule waves"]
   S --> D["Independent discovery<br/>across selected model families"]
   D --> V["Vet every original finding<br/>with a different model family"]
-  V --> R["Deduplicate vetted claims<br/>report findings, identities, and coverage gaps"]
+  V --> A["Orchestrator adjudicates every finding<br/>record evidence and final disposition"]
+  A --> R["Deduplicate adjudicated claims<br/>report findings, identities, and coverage gaps"]
 ```
 
 ### Orchestrate
