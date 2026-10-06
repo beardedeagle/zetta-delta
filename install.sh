@@ -27,8 +27,8 @@
 #   LOCAL_PROVIDER       plus LOCAL_MODEL (local inference) -> scout-local
 # Delta offers at most 7 custom profiles. The installer installs them in this
 # order, after counting every other profile already installed, and names the rest:
-#   scout-qwen scout-deepseek qwen-max deepseek-pro grok gpt-sol minimax
-#   gpt-astra scout-gemini scout-local
+#   qwen-max deepseek-pro grok gpt-sol minimax scout-gemini scout-local
+#   gpt-astra scout-qwen scout-deepseek
 # Optional tuning:
 #   PROFILE_PRIORITY="<names>"  profiles to install first; the rest keep the order above
 #   KIMI_LIMIT=3  LOCAL_LIMIT=2  THREAD_CAP=6  METERED_MAX_SPAWNS=2
@@ -36,6 +36,8 @@
 #   ORCHESTRATOR_MODEL=k3  ORCHESTRATOR_LANE="Kimi Code"  ORCHESTRATOR_FAMILY=Kimi
 #   BUILTIN_{SCOUT,WORKER,REVIEWER}_{MODEL,LANE,FAMILY}  (see README)
 #   BUILTIN_{SCOUT,WORKER,REVIEWER}_{PROVIDER,BILLING,LIMIT}
+#   BUILTIN_{SCOUT,WORKER,REVIEWER}_EFFORT   high if catalog-supported; otherwise unpinned
+#     Empty omits the pin; explicit known-model efforts must be supported.
 #     Known lanes infer their provider, billing, and shared limit. API/custom
 #     lanes need an explicit provider id and limit; unknown lanes also need
 #     billing=flat|metered. Roles sharing a lane must agree on billing/limit.
@@ -45,7 +47,9 @@
 #   ZETTA_DELTA_REF      commit to fetch the bundle at when none is next to this
 #                        script (curl | bash); there is no default
 #
-# Usage: install.sh [--force] [--dry-run] [--prune-legacy] [--skill-dir DIR] [--clean]
+# Usage: install.sh [--force] [--dry-run] [--configure-delta] [--prune-legacy] [--skill-dir DIR] [--clean]
+# --configure-delta merges bundled credential-free providers and subagent settings.
+# Quit Delta before installation. Existing files need --force and are backed up.
 set -euo pipefail
 # One brace group, closed on the last line: bash parses all of it before
 # running any of it, so a download cut short (curl | bash) runs nothing.
@@ -64,6 +68,7 @@ DRY_RUN=0
 PRUNE_LEGACY=0
 CLEAN=0
 HELP=0
+CONFIGURE_DELTA=0
 SKILL_ROOT="${HOME}/.agents/skills"
 
 while (($#)); do
@@ -73,6 +78,7 @@ while (($#)); do
     --prune-legacy) PRUNE_LEGACY=1 ;;
     --skill-dir)    [[ $# -ge 2 ]] || die "--skill-dir needs a value"; SKILL_ROOT="$2"; shift ;;
     --clean)        CLEAN=1 ;;
+    --configure-delta) CONFIGURE_DELTA=1 ;;
     -h|--help)      HELP=1 ;;
     *)              die "unknown argument: $1 (see --help)" ;;
   esac
@@ -132,6 +138,22 @@ if ((HELP)); then usage; exit 0; fi
 
 # ---------------------------------------------------------------- inputs ---
 
+# The same PATH prefix travels in the generated rules to Delta's POSIX shell.
+TOOL_BIN="${PREFIX:-$HOME/.local}/bin"
+export PATH="$TOOL_BIN:$PATH"
+REQUIRED_TOOLS=(python3 git gh rtk tgrep semble codegraph zg ctx7 githits caveman node)
+for tool in "${REQUIRED_TOOLS[@]}"; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool not found; run bootstrap.sh from a clone first"
+done
+python3 -c 'import tomllib' 2>/dev/null || die "Python 3.11 or later is required; run bootstrap.sh first"
+if command -v pgrep >/dev/null 2>&1 && { pgrep -x Delta >/dev/null 2>&1 || pgrep -x delta >/dev/null 2>&1; }; then
+  die "quit Delta before changing its configuration; then rerun the installer"
+fi
+if ((CONFIGURE_DELTA)); then
+  KIMI_PROVIDER="${KIMI_PROVIDER:-$(python3 "$SCRIPT_DIR/scripts/setup.py" provider-id kimi)}"
+  ZAI_PROVIDER="${ZAI_PROVIDER:-$(python3 "$SCRIPT_DIR/scripts/setup.py" provider-id zai)}"
+  QWEN_PROVIDER="${QWEN_PROVIDER:-$(python3 "$SCRIPT_DIR/scripts/setup.py" provider-id qwen)}"
+fi
 : "${KIMI_PROVIDER:?set KIMI_PROVIDER to the Delta provider id for Kimi Code}"
 : "${ZAI_PROVIDER:?set ZAI_PROVIDER to the Delta provider id for the Z.AI Coding Plan}"
 : "${QWEN_PROVIDER:?set QWEN_PROVIDER to the Delta provider id for the Qwen Token Plan}"
@@ -357,9 +379,43 @@ canonical_dir() {
 }
 CONFIG_DIR="$(canonical_dir "$(delta_config_dir)" "Delta config")"
 SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"
+# Preserve the tools preflight actually accepted, plus their runtime/build tools.
+# Do not import unrelated ambient PATH entries into desktop rules.
+TOOL_PATH=""
+add_tool_dir() {
+  local directory="$1"
+  [[ $directory != *$'\n'* && $directory != *$'\r'* && $directory != *:* ]] \
+    || die "tool directory must not contain line breaks or colons"
+  directory="$(canonical_dir "$directory" "tool")"
+  [[ $directory != *$'\n'* && $directory != *$'\r'* && $directory != *:* ]] \
+    || die "resolved tool directory must not contain line breaks or colons"
+  [[ ":$TOOL_PATH:" != *":$directory:"* ]] || return 0
+  TOOL_PATH="${TOOL_PATH:+$TOOL_PATH:}$directory"
+}
+add_tool_dir "$TOOL_BIN"
+for tool in "${REQUIRED_TOOLS[@]}" npm uv cargo brew; do
+  if tool_command="$(command -v "$tool")"; then add_tool_dir "$(dirname -- "$tool_command")"; fi
+done
 PROFILES_DIR="$CONFIG_DIR/profiles"
 [[ -f $CONFIG_DIR/settings.json ]] \
-  || warn "no settings.json in $CONFIG_DIR; is that Delta's config directory?"
+  || ((CONFIGURE_DELTA)) || die "no settings.json in $CONFIG_DIR; initialize Delta or use --configure-delta"
+SETTINGS_ARGS=("$CONFIG_DIR/settings.json" --thread-cap "$THREAD_CAP")
+if ((CONFIGURE_DELTA)); then
+  SETTINGS_ARGS+=(--provider "kimi=$KIMI_PROVIDER" --provider "zai=$ZAI_PROVIDER" --provider "qwen=$QWEN_PROVIDER")
+  [[ -z $MINIMAX_PROVIDER ]] || SETTINGS_ARGS+=(--provider "minimax=$MINIMAX_PROVIDER")
+fi
+# Render into /dev/null before planning writes, so malformed inputs cannot leave
+# partially updated profiles. Live settings never appear in installer output.
+python3 "$SCRIPT_DIR/scripts/setup.py" settings "${SETTINGS_ARGS[@]}" >/dev/null \
+  || die "Delta settings preflight failed"
+render_builtin() {
+  local role="$1" provider="BUILTIN_${1}_PROVIDER" model="BUILTIN_${1}_MODEL" effort="BUILTIN_${1}_EFFORT"
+  local -a effort_args=()
+  [[ -z ${!effort+x} ]] || effort_args=(--effort "${!effort}")
+  python3 "$SCRIPT_DIR/scripts/setup.py" builtin "$PROFILES_DIR/$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]').toml" \
+    --model "${!provider}/${!model}" ${effort_args[@]+"${effort_args[@]}"}
+}
+for role in SCOUT WORKER REVIEWER; do render_builtin "$role" >/dev/null || die "built-in $role preflight failed"; done
 
 # --------------------------------------------------------------- writing ---
 # Every file goes through install_file or install_output. While PLANNING is 1
@@ -373,11 +429,18 @@ backup() { # DEST: save DEST under BACKUP_DIR before it changes
   local saved="$BACKUP_DIR/${1#/}"
   [[ -d $BACKUP_DIR ]] || info "saving the files this install changes under $BACKUP_DIR"
   mkdir -p -- "$(dirname -- "$saved")"
-  cp -Pp -- "$1" "$saved"
+  if [[ $1 == "$CONFIG_DIR/settings.json" ]]; then
+    # Keep the link for restoration and snapshot its content privately without
+    # changing the original target's permissions. A dangling link has no content.
+    [[ ! -L $1 ]] || cp -Pp -- "$1" "$saved.link"
+    if [[ -e $1 ]]; then (umask 077; cat -- "$1" > "$saved"); fi
+  else
+    cp -Pp -- "$1" "$saved"
+  fi
 }
 
 commit_file() { # TMP DEST: move a finished TMP into place, saving the DEST it changes
-  chmod 0644 "$1"
+  if [[ $2 == "$CONFIG_DIR/settings.json" ]]; then chmod 0600 "$1"; else chmod 0644 "$1"; fi
   if [[ -L $2 ]] || { [[ -e $2 ]] && ! cmp -s -- "$1" "$2"; }; then backup "$2"; fi
   mv -f -- "$1" "$2"
   info "wrote $2"
@@ -444,7 +507,8 @@ profile() { install_file "$SCRIPT_DIR/profiles/$1.toml.tmpl" "$PROFILES_DIR/$1.t
 # profile file in the folder takes a slot, ours or not.
 readonly CUSTOM_SLOTS=7
 readonly BUILTIN_PROFILES=" worker scout reviewer "
-readonly PRIORITY="scout-qwen scout-deepseek qwen-max deepseek-pro grok gpt-sol minimax gpt-astra scout-gemini scout-local"
+# Primary families before duplicate models/scouts; still at most seven slots.
+readonly PRIORITY="qwen-max deepseek-pro grok gpt-sol minimax scout-gemini scout-local gpt-astra scout-qwen scout-deepseek"
 # Superseded: v1's profiles (replaced by the built-ins) and v4's role profiles
 # (replaced by one profile per model). --prune-legacy retires them.
 LEGACY_PROFILES=" scout-fast scout-deep worker-kimi reviewer-glm"
@@ -738,6 +802,8 @@ if [[ -z $PONYTAIL_DIR ]]; then
     PONYTAIL_DIR="$(find "$pt_base" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
   fi
 fi
+# Fresh Delta installations need no Codex plugin cache for these rules.
+if [[ ! -f $PONYTAIL_DIR/AGENTS.md ]]; then PONYTAIL_DIR="$SCRIPT_DIR/rules/ponytail"; fi
 
 ponytail_block() { # adapt ponytail's AGENTS.md to Delta and the context router
   local src="$1"
@@ -778,7 +844,7 @@ ponytail_version() { # the plugin's own version; its cache folder's name can dif
 }
 
 generate_rules() {
-  cat -- "$SCRIPT_DIR/rules/personal-AGENTS.md"
+  sed "s|{{TOOL_PATH_SH}}|$(sed_literal "$(shell_argument "$TOOL_PATH")")|g" "$SCRIPT_DIR/rules/personal-AGENTS.md"
   if [[ -n $PONYTAIL_DIR && -f $PONYTAIL_DIR/AGENTS.md ]]; then
     printf '\n<!-- PONYTAIL_START %s -->\n' "$(ponytail_version)"
     ponytail_block "$PONYTAIL_DIR/AGENTS.md"
@@ -834,6 +900,12 @@ readonly SKILLS="orchestrate adversarial isolated pr-review"
 
 write_bundle() {
   local p skill SKILL_DIR="$SKILL_ROOT/orchestrate"
+  if ((CONFIGURE_DELTA)); then
+    install_output "$CONFIG_DIR/settings.json" python3 "$SCRIPT_DIR/scripts/setup.py" settings "${SETTINGS_ARGS[@]}"
+  fi
+  for p in SCOUT WORKER REVIEWER; do
+    install_output "$PROFILES_DIR/$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]').toml" render_builtin "$p"
+  done
   for p in $INSTALLED; do install_profile "$p"; done
   install_file "$SCRIPT_DIR/skills/orchestrate/SKILL.md" "$SKILL_DIR/SKILL.md" render
   install_file "$SCRIPT_DIR/skills/orchestrate/references/best-of-n.md" \
@@ -890,8 +962,17 @@ fi
 
 info ""
 info "Next:"
-info "  1. Set the built-in Scout, Worker, and Reviewer models in Settings > Subagents"
-info "     to match the roster, then confirm every custom profile loaded without errors."
+info "  1. Built-in Scout, Worker, and Reviewer models now match the roster."
+info "     Start Delta and confirm every selected profile loaded without errors."
+if ((CONFIGURE_DELTA)); then
+  info "     Provider/model metadata and subagent limits are configured; authenticate"
+  info "     coding-plan providers and subscription accounts locally in Delta."
+else
+  info "     Set Delta's subagent limits to THREAD_CAP=$THREAD_CAP (overall $((2 * THREAD_CAP))),"
+  info "     or use --configure-delta to set limits and bundled provider metadata."
+fi
+info "     Keep provider Model Preferences on Global so profiles retain their models."
+info "     PR targets require local GitHub authentication: gh auth login."
 info "  2. Nothing to paste: Delta re-reads $RULES_FILE"
 info "     (Settings > Rules > Personal AGENTS.md) at the start of each turn."
 [[ ! -e $RULES_OUT ]] || info "     $RULES_OUT from an earlier install is no longer used; install.sh --clean removes it."

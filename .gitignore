@@ -222,3 +222,5 @@ __marimo__/
 # zetta-delta
 .DS_Store
 deploy.env
+/settings.json
+/Brewfile.lock.json
