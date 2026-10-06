@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import sys
 import tomllib
 from urllib.parse import urlsplit
@@ -94,7 +95,62 @@ def settings(path, roles, identities, thread_cap):
     return json.dumps(data, indent=2) + "\n"
 
 
-def builtin(path, model, effort):
+def profile(original, tool_path):
+    """Add the shared instructions without replacing Delta's base system prompt."""
+    if not tool_path or any(char in tool_path for char in "\r\n"):
+        raise ValueError("invalid tool path")
+    parsed = tomllib.loads(original)
+    prompt = parsed.get("prompt", "")
+    if not isinstance(prompt, str):
+        raise ValueError("invalid profile prompt")
+    start_marker = "<!-- DELTA_SUBAGENT_CONTEXT_START"
+    end_marker = "<!-- DELTA_SUBAGENT_CONTEXT_END -->"
+    if prompt.count(start_marker) != prompt.count(end_marker) or prompt.count(start_marker) > 1:
+        raise ValueError("malformed subagent context markers")
+    if start_marker in prompt:
+        match = re.search(r"(?ms)^<!-- DELTA_SUBAGENT_CONTEXT_START[^\n]* -->\n.*?"
+                          r"^<!-- DELTA_SUBAGENT_CONTEXT_END -->\n?", prompt)
+        if not match:
+            raise ValueError("malformed subagent context block")
+        prompt = prompt[:match.start()] + prompt[match.end():]
+        # The managed prefix owns the separator before the preserved user text.
+        if match.start() == 0:
+            prompt = prompt.removeprefix("\n")
+    context = (CATALOG.parents[1] / "rules/subagent-context.md").read_text()
+    context = context.replace("{{TOOL_PATH_SH}}", shlex.quote(tool_path))
+    expected = copy.deepcopy(parsed)
+    expected["prompt"] = context.rstrip() + ("\n\n" + prompt if prompt else "")
+    block = "prompt = " + json.dumps(expected["prompt"], ensure_ascii=False) + "\n"
+    lines = original.splitlines(keepends=True)
+    if "prompt" not in parsed:
+        rendered = block + original
+    else:
+        # Find a complete root assignment, including multiline strings. The final
+        # parse/equality check refuses layouts we cannot edit without collateral changes.
+        rendered = None
+        for start, line in enumerate(lines):
+            if not re.match(r"\s*(?:prompt|\"prompt\"|'prompt')\s*=", line):
+                continue
+            for end in range(start + 1, len(lines) + 1):
+                try:
+                    assignment = tomllib.loads("".join(lines[start:end]))
+                except tomllib.TOMLDecodeError:
+                    continue
+                if assignment == {"prompt": parsed["prompt"]}:
+                    candidate = "".join(lines[:start]) + block + "".join(lines[end:])
+                    if tomllib.loads(candidate) == expected:
+                        rendered = candidate
+                break
+            if rendered is not None:
+                break
+        if rendered is None:
+            raise ValueError("unsupported profile TOML layout")
+    if tomllib.loads(rendered) != expected:
+        raise ValueError("unsupported profile TOML layout")
+    return rendered
+
+
+def builtin(path, model, effort, tool_path):
     metadata = next((entry for provider in load_catalog().values()
                      for entry in provider["models"]
                      if model == provider_id(provider) + "/" + entry["id"]), None)
@@ -130,7 +186,7 @@ def builtin(path, model, effort):
     # Refuse complex layouts rather than touching strings, comments, or other tables.
     if tomllib.loads(rendered) != expected:
         raise ValueError("unsupported built-in TOML layout; no changes made")
-    return rendered
+    return profile(rendered, tool_path)
 
 
 def main():
@@ -142,10 +198,14 @@ def main():
     config.add_argument("path", type=Path)
     config.add_argument("--provider", action="append", default=[], help="catalog-role=exact-provider-id")
     config.add_argument("--thread-cap", type=int, required=True)
-    profile = commands.add_parser("builtin")
-    profile.add_argument("path", type=Path)
-    profile.add_argument("--model", required=True)
-    profile.add_argument("--effort", choices=("", "off", "on", "low", "medium", "high", "xhigh", "max"))
+    builtin_parser = commands.add_parser("builtin")
+    builtin_parser.add_argument("path", type=Path)
+    builtin_parser.add_argument("--model", required=True)
+    builtin_parser.add_argument("--effort", choices=("", "off", "on", "low", "medium", "high", "xhigh", "max"))
+    builtin_parser.add_argument("--tool-path", required=True)
+    context_parser = commands.add_parser("profile")
+    context_parser.add_argument("path", type=Path, nargs="?", help="profile file, or stdin when omitted")
+    context_parser.add_argument("--tool-path", required=True)
     args = parser.parse_args()
     try:
         if args.command == "provider-id":
@@ -159,8 +219,11 @@ def main():
                 roles.append(role)
                 identities.append(identity)
             sys.stdout.write(settings(args.path, roles, identities, args.thread_cap))
+        elif args.command == "builtin":
+            sys.stdout.write(builtin(args.path, args.model, args.effort, args.tool_path))
         else:
-            sys.stdout.write(builtin(args.path, args.model, args.effort))
+            original = args.path.read_text() if args.path else sys.stdin.read()
+            sys.stdout.write(profile(original, args.tool_path))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         # Never echo settings contents, parser snippets, headers, or credentials.
         print("SETUP: blocked: invalid/unreadable setup input or unsupported built-in layout", file=sys.stderr)

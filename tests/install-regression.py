@@ -215,9 +215,65 @@ class InstallerTests(unittest.TestCase):
         import tomllib
         data = tomllib.loads(worker.read_text())
         self.assertEqual(data["model"]["any"], {"model": "custom:k/k3", "thinking_effort": "high", "other": True})
-        self.assertEqual(data["prompt"], "Keep this prompt")
+        self.assertTrue(data["prompt"].endswith("Keep this prompt"))
         saved = list((self.base / "state/zetta-delta/backups").glob("*/" + str(worker).lstrip("/")))
         self.assertEqual(saved[0].read_text(), before)
+
+    def test_all_shipped_profiles_get_the_same_context_stack_preamble(self):
+        result = self.install(GPT_PROVIDER="openai-subscribed", GROK_PROVIDER="x_ai-subscribed",
+                              MINIMAX_PROVIDER="custom:m", MINIMAX_BILLING="plan",
+                              COPILOT_PROVIDER="custom:c", LOCAL_PROVIDER="custom:l", LOCAL_MODEL="fixture-local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profiles = list((self.config / "profiles").glob("*.toml"))
+        self.assertEqual(len(profiles), 10)
+        blocks = []
+        for path in profiles:
+            data = tomllib.loads(path.read_text())
+            prompt = data.get("prompt", "")
+            with self.subTest(profile=path.name):
+                self.assertEqual(prompt.count("<!-- DELTA_SUBAGENT_CONTEXT_START v1 -->"), 1)
+                self.assertEqual(prompt.count("<!-- DELTA_SUBAGENT_CONTEXT_END -->"), 1)
+                block = prompt.split("<!-- DELTA_SUBAGENT_CONTEXT_END -->", 1)[0]
+                for tool in ("tgrep", "semble", "codegraph", "zg", "ctx7", "githits", "rtk", "caveman"):
+                    self.assertIn(tool, block)
+                self.assertIn("--no-index", block)
+                self.assertIn("SOURCE ROOT", block)
+                self.assertNotIn("system_prompt", data)
+                self.assertNotIn("system_prompt_file", data)
+                blocks.append(block)
+        self.assertEqual(len(set(blocks)), 1)
+
+    def test_builtin_context_keeps_user_prompt_and_reinstall_is_idempotent(self):
+        worker = self.config / "profiles/worker.toml"
+        worker.parent.mkdir()
+        worker.write_text('prompt = """Keep user instructions ✨\nSecond line: \\\"quoted\\\" text."""\n'
+                          'system_prompt = "Keep user base"\nworktree = "isolated"\nuser_flag = true\n'
+                          '[model.any]\nmodel = "custom:q/qwen3.8-max"\nother = true\n')
+        original = tomllib.loads(worker.read_text())
+        first = self.install("--force", BUILTIN_WORKER_EFFORT="high")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        rendered = worker.read_bytes()
+        data = tomllib.loads(rendered.decode())
+        self.assertEqual(data["prompt"].split("<!-- DELTA_SUBAGENT_CONTEXT_END -->\n\n", 1)[1], original["prompt"])
+        for key in ("system_prompt", "worktree", "user_flag"):
+            self.assertEqual(data[key], original[key])
+        self.assertEqual(data["model"]["any"]["other"], True)
+        second = self.install("--force", BUILTIN_WORKER_EFFORT="high")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(worker.read_bytes(), rendered)
+
+    def test_malformed_subagent_context_refuses_before_bundle_writes(self):
+        worker = self.config / "profiles/worker.toml"
+        worker.parent.mkdir()
+        before = 'prompt = "<!-- DELTA_SUBAGENT_CONTEXT_START v1 -->\\nUSER_CANARY"\n[model.any]\nmodel = "custom:k/k3"\n'
+        worker.write_text(before)
+        result = self.install("--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("built-in WORKER preflight failed", result.stderr)
+        self.assertNotIn("USER_CANARY", result.stdout + result.stderr)
+        self.assertEqual(worker.read_text(), before)
+        self.assertFalse((self.home / ".agents").exists())
+        self.assertEqual(list((self.base / "state").iterdir()), [])
 
     def test_configure_delta_seeds_scrubbed_providers_and_preserves_local_secrets(self):
         settings = self.config / "settings.json"
@@ -371,6 +427,14 @@ class InstallerTests(unittest.TestCase):
         self.assertIn(str(custom), directories)
         self.assertEqual(directories.count(str(runtime)), 1)
         self.assertNotIn(str(ambient), directories)
+        for name in ("worker", "reviewer", "scout", "qwen-max"):
+            prompt = tomllib.loads((self.config / "profiles" / (name + ".toml")).read_text())["prompt"]
+            profile_prefix = re.search(r"`(export PATH=.*?;)`", prompt).group(1)
+            profile_ran = subprocess.run(["/bin/sh", "-e", "-c", command.replace(prefix, profile_prefix, 1)],
+                                        env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)},
+                                        cwd=self.base, capture_output=True, text=True)
+            self.assertEqual(profile_ran.returncode, 0, profile_ran.stderr)
+            self.assertEqual(profile_ran.stdout, ran.stdout)
 
     def test_bootstrap_orders_prerequisites_tools_and_configuration(self):
         stack = self.bundle / "stack"

@@ -413,7 +413,7 @@ render_builtin() {
   local -a effort_args=()
   [[ -z ${!effort+x} ]] || effort_args=(--effort "${!effort}")
   python3 "$SCRIPT_DIR/scripts/setup.py" builtin "$PROFILES_DIR/$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]').toml" \
-    --model "${!provider}/${!model}" ${effort_args[@]+"${effort_args[@]}"}
+    --model "${!provider}/${!model}" --tool-path "$TOOL_PATH" ${effort_args[@]+"${effort_args[@]}"}
 }
 for role in SCOUT WORKER REVIEWER; do render_builtin "$role" >/dev/null || die "built-in $role preflight failed"; done
 
@@ -479,7 +479,12 @@ install_file() {
         -e "s|{{BON_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/bon.sh")")|g" \
         -e "s|{{IDENTITY_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/identity.py")")|g" \
         -e "s|{{IDENTITY_REGISTRY}}|$(sed_literal "$(shell_argument "$SKILL_DIR/references/identity-registry.json")")|g" \
-        "$@" -- "$src" > "$tmp"
+        "$@" -- "$src" |
+      if [[ $src == "$SCRIPT_DIR"/profiles/*.toml.tmpl ]]; then
+        python3 "$SCRIPT_DIR/scripts/setup.py" profile --tool-path "$TOOL_PATH"
+      else
+        cat
+      fi > "$tmp"
     if grep -q '{{[A-Z_]*}}' "$tmp"; then rm -f -- "$tmp"; die "unrendered placeholder in $src"; fi
   else
     cp -- "$src" "$tmp"
