@@ -275,6 +275,70 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.home / ".agents").exists())
         self.assertEqual(list((self.base / "state").iterdir()), [])
 
+    def test_selected_custom_template_failures_preserve_settings_and_retirements(self):
+        profiles = self.config / "profiles"
+        profiles.mkdir()
+        for name in ("worker", "reviewer", "scout", "worker-kimi"):
+            (profiles / (name + ".toml")).write_text('prompt = "USER_CANARY"\n[model.any]\nmodel = "custom:old/keep"\n')
+        (profiles / "worker-kimi.toml.retired").write_text("KEEP_RETIRED_CANARY\n")
+        settings = self.config / "settings.json"
+        settings.write_text('{"version":1,"native":{"private_canary":"LOCAL_SECRET_CANARY"}}\n')
+        rules = self.home / ".config/delta/AGENTS.md"
+        rules.parent.mkdir(parents=True)
+        rules.write_text("KEEP_PERSONAL_RULES\n")
+        ids = {role.upper() + "_PROVIDER": self.catalog_id(role) for role in ("kimi", "zai", "qwen")}
+        roots = (self.config, self.home, self.base / "state")
+        def snapshot():
+            return {str(p): p.read_bytes() for root in roots for p in root.rglob("*") if p.is_file()}
+        for template, mutation, flags in (("model", '\nBROKEN_INPUT_CANARY = [\n', ()),
+                                          ("scout-qwen", '\nBROKEN_INPUT_CANARY = [\n', ()),
+                                          ("model", '\nunknown = "{{MISSING_PLACEHOLDER}}"\n', ()),
+                                          ("model", '\nBROKEN_INPUT_CANARY = [\n', ("--dry-run",))):
+            with self.subTest(template=template, mutation=mutation, flags=flags):
+                before = snapshot()
+                source = self.bundle / "profiles" / (template + ".toml.tmpl")
+                original = source.read_text()
+                try:
+                    source.write_text(original + mutation)
+                    result = self.install("--force", "--prune-legacy", "--configure-delta", *flags, **ids)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(snapshot() == before, "installer changed destination files")
+                    self.assertEqual(list((self.base / "state").iterdir()), [])
+                    self.assertEqual(list((self.base / "tmp").iterdir()), [])
+                    self.assertFalse((self.home / ".agents").exists())
+                    self.assertNotIn("BROKEN_INPUT_CANARY", result.stdout + result.stderr)
+                    self.assertNotIn("LOCAL_SECRET_CANARY", result.stdout + result.stderr)
+                finally:
+                    source.write_text(original)
+
+    def test_invalid_shared_context_source_refuses_before_any_writes(self):
+        source = self.bundle / "rules/subagent-context.md"
+        original = source.read_text()
+        for label, content in (("truncated", '<!-- DELTA_SUBAGENT_CONTEXT_START v1 -->\nCONTEXT_CANARY\n'),
+                               ("placeholder", original.replace("Context/token stack:", "{{MISSING_PLACEHOLDER}}")),
+                               ("duplicate", original + original),
+                               ("outside-block", "CONTEXT_CANARY\n" + original),
+                               ("missing", None)):
+            with self.subTest(source=label):
+                try:
+                    if content is None:
+                        source.unlink()
+                    else:
+                        source.write_text(content)
+                    result = self.install("--force")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNoWrites()
+                    self.assertNotIn("CONTEXT_CANARY", result.stdout + result.stderr)
+                finally:
+                    source.write_text(original)
+
+    def test_malformed_unselected_custom_template_does_not_block(self):
+        (self.bundle / "profiles/scout-gemini.toml.tmpl").write_text('BROKEN_INPUT_CANARY = [\n')
+        result = self.install("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNoWrites()
+        self.assertEqual(list((self.base / "tmp").iterdir()), [])
+
     def test_configure_delta_seeds_scrubbed_providers_and_preserves_local_secrets(self):
         settings = self.config / "settings.json"
         local = {"version": 1, "native": {"private_canary": "LOCAL_SECRET_CANARY", "custom_providers": []},

@@ -419,8 +419,8 @@ for role in SCOUT WORKER REVIEWER; do render_builtin "$role" >/dev/null || die "
 
 # --------------------------------------------------------------- writing ---
 # Every file goes through install_file or install_output. While PLANNING is 1
-# they only record the destination in PLANNED, so the install can refuse
-# before it changes anything.
+# they record destinations in PLANNED and validate rendered templates in
+# temporary files, so the install can refuse before it changes anything.
 
 PLANNING=0
 PLANNED=()
@@ -465,12 +465,17 @@ shell_argument() {
 install_file() {
   local src="$1" dest="$2" mode="${3:-copy}" tmp
   shift "$(( $# > 2 ? 3 : 2 ))"
-  if ((PLANNING)); then PLANNED+=("$dest"); return; fi
-  if ((DRY_RUN)); then info "would write $dest"; return; fi
-  mkdir -p -- "$(dirname -- "$dest")"
-  tmp="$(mktemp "${dest}.XXXXXX")"
+  if ((PLANNING)); then
+    PLANNED+=("$dest")
+    [[ $mode == render ]] || return 0
+    tmp="$(mktemp)"
+  else
+    if ((DRY_RUN)); then info "would write $dest"; return; fi
+    mkdir -p -- "$(dirname -- "$dest")"
+    tmp="$(mktemp "${dest}.XXXXXX")"
+  fi
   if [[ $mode == render ]]; then
-    sed -e "s|{{KIMI}}|$KIMI_PROVIDER|g"       -e "s|{{ZAI}}|$ZAI_PROVIDER|g" \
+    if ! sed -e "s|{{KIMI}}|$KIMI_PROVIDER|g"       -e "s|{{ZAI}}|$ZAI_PROVIDER|g" \
         -e "s|{{QWEN}}|$QWEN_PROVIDER|g"       -e "s|{{MINIMAX}}|$MINIMAX_PROVIDER|g" \
         -e "s|{{GPT}}|$GPT_PROVIDER|g"         -e "s|{{GROK}}|$GROK_PROVIDER|g" \
         -e "s|{{COPILOT}}|$COPILOT_PROVIDER|g" -e "s|{{LOCAL}}|$LOCAL_PROVIDER|g" \
@@ -484,11 +489,15 @@ install_file() {
         python3 "$SCRIPT_DIR/scripts/setup.py" profile --tool-path "$TOOL_PATH"
       else
         cat
-      fi > "$tmp"
+      fi > "$tmp"; then
+      rm -f -- "$tmp"
+      die "render preflight failed for $src"
+    fi
     if grep -q '{{[A-Z_]*}}' "$tmp"; then rm -f -- "$tmp"; die "unrendered placeholder in $src"; fi
   else
     cp -- "$src" "$tmp"
   fi
+  if ((PLANNING)); then rm -f -- "$tmp"; return; fi
   commit_file "$tmp" "$dest"
 }
 

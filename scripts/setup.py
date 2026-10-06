@@ -105,11 +105,12 @@ def profile(original, tool_path):
         raise ValueError("invalid profile prompt")
     start_marker = "<!-- DELTA_SUBAGENT_CONTEXT_START"
     end_marker = "<!-- DELTA_SUBAGENT_CONTEXT_END -->"
+    context_block = re.compile(r"(?ms)^<!-- DELTA_SUBAGENT_CONTEXT_START[^\n]* -->\n.*?"
+                               r"^<!-- DELTA_SUBAGENT_CONTEXT_END -->\n?")
     if prompt.count(start_marker) != prompt.count(end_marker) or prompt.count(start_marker) > 1:
         raise ValueError("malformed subagent context markers")
     if start_marker in prompt:
-        match = re.search(r"(?ms)^<!-- DELTA_SUBAGENT_CONTEXT_START[^\n]* -->\n.*?"
-                          r"^<!-- DELTA_SUBAGENT_CONTEXT_END -->\n?", prompt)
+        match = context_block.search(prompt)
         if not match:
             raise ValueError("malformed subagent context block")
         prompt = prompt[:match.start()] + prompt[match.end():]
@@ -118,6 +119,9 @@ def profile(original, tool_path):
             prompt = prompt.removeprefix("\n")
     context = (CATALOG.parents[1] / "rules/subagent-context.md").read_text()
     context = context.replace("{{TOOL_PATH_SH}}", shlex.quote(tool_path))
+    if (context.count(start_marker) != 1 or context.count(end_marker) != 1
+            or not context_block.fullmatch(context) or re.search(r"{{[A-Z_]*}}", context)):
+        raise ValueError("invalid shared subagent context source")
     expected = copy.deepcopy(parsed)
     expected["prompt"] = context.rstrip() + ("\n\n" + prompt if prompt else "")
     block = "prompt = " + json.dumps(expected["prompt"], ensure_ascii=False) + "\n"
