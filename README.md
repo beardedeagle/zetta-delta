@@ -433,6 +433,8 @@ model; that label is Delta's, not the subagent's self-report.
 
 ## 8. Use
 
+### PR review
+
 ```
 /pr-review <PR URL, PR number, or main...feature_branch>
 ```
@@ -450,6 +452,17 @@ data governance, idiomatic code, anti-patterns, test value, and unnecessary code
 The report preserves finder/vetter identities, rejected and unresolved claims,
 and coverage gaps. Review setup and any tests use disposable snapshots as needed;
 the skill requires source and your checkout to remain unchanged.
+
+```mermaid
+flowchart TD
+  U["You: /pr-review PR or range"] --> T["Pin comparison and freeze source<br/>measure changed files and hunks"]
+  T --> S["Select useful configured perspectives<br/>size assignments and schedule waves"]
+  S --> D["Independent discovery<br/>across selected model families"]
+  D --> V["Vet every original finding<br/>with a different model family"]
+  V --> R["Deduplicate vetted claims<br/>report findings, identities, and coverage gaps"]
+```
+
+### Orchestrate
 
 ```
 /orchestrate <task, constraints, and how you will judge it done>
@@ -486,6 +499,8 @@ flowchart TD
 Two more skills run a thread a different way. Each takes any task: a change,
 a question, research, an investigation.
 
+### Adversarial
+
 ```
 /adversarial <task or question, and anything both sides should know>
 ```
@@ -517,6 +532,8 @@ sequenceDiagram
   end
   T-->>U: Both final positions, no winner unless you ask
 ```
+
+### Isolated
 
 ```
 /isolated <task or question>
