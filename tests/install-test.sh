@@ -86,11 +86,15 @@ check "piped install: adversarial skill" "$(cd "$T/home/.agents/skills/adversari
 check "piped install: isolated skill" "$(cd "$T/home/.agents/skills/isolated" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
   "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/bon.sh ./scripts/identity.py "
 check "piped install: pr-review skill" "$(cd "$T/home/.agents/skills/pr-review" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/identity.py "
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/repositories.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
+check "piped install: pr-review-batch skill" "$(cd "$T/home/.agents/skills/pr-review-batch" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/notes.md ./references/repositories.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
 check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/.agents/skills" \
   && cmp -s orchestrate/references/roster.md adversarial/references/roster.md \
   && cmp -s orchestrate/references/roster.md isolated/references/roster.md \
   && cmp -s orchestrate/references/roster.md pr-review/references/roster.md \
+  && cmp -s orchestrate/references/roster.md pr-review-batch/references/roster.md \
+  && cmp -s pr-review/references/review-voice.md pr-review-batch/references/review-voice.md \
   && cmp -s orchestrate/scripts/bon.sh isolated/scripts/bon.sh && echo same)" "same"
 has "piped install: isolated runs its own bon.sh" "$(cat "$T/home/.agents/skills/isolated/SKILL.md")" \
   "sh '$T/home/.agents/skills/isolated/scripts/bon.sh' snapshot"
@@ -125,12 +129,15 @@ check "no --force: nothing changed, nothing retired" "$(snapshot)" "$before"
 
 printf '# local edit\n' >> "$T/home/.agents/skills/adversarial/SKILL.md"
 printf '# local review edit\n' >> "$T/home/.agents/skills/pr-review/SKILL.md"
+printf '# local batch edit\n' >> "$T/home/.agents/skills/pr-review-batch/SKILL.md"
 r=$(clone --force --prune-legacy)
 has "--force: exit 0" "$r" "exit=0"
 check "--force: the edited file saved first" "$(tail -n 1 "$state"/backups/*/"${T#/}"/home/.agents/skills/adversarial/SKILL.md)" "# local edit"
 check "--force: the edit replaced" "$(cmp -s "$ROOT/skills/adversarial/SKILL.md" "$T/home/.agents/skills/adversarial/SKILL.md" && echo same)" "same"
 check "--force: the edited review skill saved first" "$(tail -n 1 "$state"/backups/*/"${T#/}"/home/.agents/skills/pr-review/SKILL.md)" "# local review edit"
 check "--force: the review edit replaced" "$(cmp -s "$ROOT/skills/pr-review/SKILL.md" "$T/home/.agents/skills/pr-review/SKILL.md" && echo same)" "same"
+check "--force: the edited batch skill saved first" "$(tail -n 1 "$state"/backups/*/"${T#/}"/home/.agents/skills/pr-review-batch/SKILL.md)" "# local batch edit"
+check "--force: the batch edit replaced" "$(cmp -s "$ROOT/skills/pr-review-batch/SKILL.md" "$T/home/.agents/skills/pr-review-batch/SKILL.md" && echo same)" "same"
 check "--force: unchanged files not saved" "$(find "$state/backups" -name scout-qwen.toml -o -name scout-deepseek.toml -o -name qwen-max.toml -o -name deepseek-pro.toml -o -name bon.sh | wc -l | tr -d ' ')" "0"
 check "--prune-legacy: retired" "$(cd "$T/delta/profiles" && ls candidate.toml*)" "candidate.toml.retired"
 check "--force: old router replaced, once" "$(grep -c -e '^old router' -e '^<!-- DELTA_CONTEXT_ROUTER_START v1' "$rules")" "1"

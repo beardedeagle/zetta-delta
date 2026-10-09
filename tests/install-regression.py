@@ -129,7 +129,7 @@ class InstallerTests(unittest.TestCase):
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         contents = []
-        for name in ("orchestrate", "adversarial", "isolated", "pr-review"):
+        for name in ("orchestrate", "adversarial", "isolated", "pr-review", "pr-review-batch"):
             skill = self.home / ".agents/skills" / name
             self.assertTrue((skill / "references/identity-registry.json").is_file())
             registry = (skill / "references/identity-registry.json").read_bytes()
@@ -156,32 +156,40 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"], identity["billing"], identity["limit"]),
                          ("custom:k", "k3", "Kimi", "Kimi Code", "flat", 3))
 
-    def test_pr_review_resolves_identity_without_sibling_skills(self):
+    def test_pr_review_skills_resolve_identity_without_sibling_skills(self):
         path = self.base / "skills with 'apostrophe' & space"
-        result = self.install("--skill-dir", str(path))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        skill = path / "pr-review"
-        body = (skill / "SKILL.md").read_text()
-        roster = skill / re.search(r"Read `([^`]+)` relative", body).group(1)
-        reference = skill / re.search(r"follow `([^`]+)` before", body).group(1)
-        self.assertEqual(roster.read_bytes(), (path / "orchestrate/references/roster.md").read_bytes())
-        for sibling in ("orchestrate", "adversarial", "isolated"):
-            shutil.rmtree(path / sibling)
-        self.assertTrue(roster.is_file())
-        command = next(line.strip() for line in reference.read_text().splitlines()
-                       if line.strip().startswith("python3 "))
         models = self.base / "models.json"
         models.write_text(json.dumps([{"provider_id": "custom:k", "model_id": "k3"}]))
-        command = (command.replace("<sanitized-models-json>", shlex.quote(str(models)))
-                   .replace("<exact-provider-id>", "custom:k").replace("<exact-model-id>", "k3"))
-        resolved = subprocess.run(["/bin/sh", "-c", command], cwd=self.base, env=self.env,
-                                  text=True, capture_output=True)
-        self.assertEqual(resolved.returncode, 0, resolved.stderr)
-        lines = resolved.stdout.splitlines()
-        self.assertEqual(lines.pop(), "exit=0", resolved.stdout + resolved.stderr)
-        identity = json.loads("\n".join(lines))
-        self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"]),
-                         ("custom:k", "k3", "Kimi", "Kimi Code"))
+        for name in ("pr-review", "pr-review-batch"):
+            with self.subTest(skill=name):
+                result = self.install("--force", "--skill-dir", str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                skill = path / name
+                body = (skill / "SKILL.md").read_text()
+                roster = skill / re.search(r"Read `([^`]+)` relative", body).group(1)
+                reference = skill / re.search(r"follow `([^`]+)` before", body, re.I).group(1)
+                self.assertEqual(roster.read_bytes(), (path / "orchestrate/references/roster.md").read_bytes())
+                for sibling in path.iterdir():
+                    if sibling != skill:
+                        shutil.rmtree(sibling)
+                self.assertTrue(roster.is_file())
+                for filename in ("repositories.md", "review-voice.md"):
+                    self.assertIn("references/" + filename, body)
+                    self.assertEqual((skill / "references" / filename).read_bytes(),
+                                     (ROOT / "skills/pr-review/references" / filename).read_bytes())
+                self.assertNotIn("llm-wiki-igo", (skill / "references/review-voice.md").read_text())
+                command = next(line.strip() for line in reference.read_text().splitlines()
+                               if line.strip().startswith("python3 "))
+                command = (command.replace("<sanitized-models-json>", shlex.quote(str(models)))
+                           .replace("<exact-provider-id>", "custom:k").replace("<exact-model-id>", "k3"))
+                resolved = subprocess.run(["/bin/sh", "-c", command], cwd=self.base, env=self.env,
+                                          text=True, capture_output=True)
+                self.assertEqual(resolved.returncode, 0, resolved.stderr)
+                lines = resolved.stdout.splitlines()
+                self.assertEqual(lines.pop(), "exit=0", resolved.stdout + resolved.stderr)
+                identity = json.loads("\n".join(lines))
+                self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"]),
+                                 ("custom:k", "k3", "Kimi", "Kimi Code"))
 
     def test_missing_settings_and_runtime_tools_refuse_before_writes(self):
         settings = self.config / "settings.json"

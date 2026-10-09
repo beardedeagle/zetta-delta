@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Thorough Delta PR or commit-range review using independent configured model-family perspectives, workload-sized dispatch waves, cross-family vetting, and explicit orchestrator adjudication of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review".
+description: Thorough Delta review of ONE PR or commit range using independent configured model-family perspectives, workload-sized dispatch waves, cross-family vetting, and explicit orchestrator adjudication of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review" for a single target. Multiple PRs or a repository-only request route to the pr-review-batch skill instead.
 disable-model-invocation: true
 ---
 
@@ -101,6 +101,12 @@ Codex agent APIs or invent tool arguments. Never switch the top-level model.
    compressed excerpts cannot prove complete review coverage.
 
 ## Stage 0 — Freeze, measure, and schedule
+
+### Resolve the repository
+
+Read `references/repositories.md` for PR URLs, numbers, repository slugs, local
+clone paths, and unambiguous shorthand. Multiple PRs or a repository-only request
+route to `pr-review-batch`; this skill freezes one PR or commit range.
 
 ### Resolve the requested comparison
 
@@ -405,6 +411,10 @@ root cause and demonstrated trigger, not location alone. Give clusters final F-I
 and retain every raw ID, all three identities, original verdict, final disposition,
 and evidence. A confirmed duplicate must not hide a rejected, unverifiable,
 unadjudicated, or contradictory claim; show material disagreements.
+
+## Review voice (when posting as the user)
+
+If publication is separately authorized, follow `references/review-voice.md`.
 
 ## Completion and report
 
