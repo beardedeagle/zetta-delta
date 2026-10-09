@@ -15,6 +15,7 @@ REPO = "fixture/project"
 PULLS = f"repos/{REPO}/pulls"
 HEAD = "a" * 40
 OLD = "c" * 40
+BAD_LOGINS = (" owner ", "ow ner", "owner\n", "ow\nner", "owner\t", "ow\x00ner", "ow\x7fner", "ow\u200bner")
 
 
 def pull(number, head=HEAD, repo=REPO):
@@ -113,6 +114,7 @@ else:
         del missing["user"]
         bad_pulls = [missing] + [dict(pull(18), user=user) for user in
                                  (None, {}, {"login": None}, {"login": ""}, {"login": " "}, "owner", [], True)]
+        bad_pulls += [dict(pull(18), user={"login": login}) for login in BAD_LOGINS]
         for bad in bad_pulls:
             with self.subTest(pull=bad):
                 replies = {**self.explicit([[]]), f"{PULLS}/18": bad}
@@ -135,11 +137,26 @@ else:
         self.assertEqual(entry["owner_review"]["state"], "COMMENTED")
 
     def test_other_authors_pending_and_dismissed_are_not_owner_reviews(self):
-        pages = [[review(user="author"), review(state="PENDING", submitted=None),
+        pages = [[review(user="author"), review(user="github-actions[bot]"), review(state="PENDING", submitted=None),
                   review(state="DISMISSED", submitted=None)]]
         result = self.run_intake(self.explicit(pages), "--pr", "12")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(json.loads(result.stdout)["pull_requests"][0]["owner_review"])
+
+    def test_bot_logins_remain_valid_for_self_authored_detection(self):
+        replies = {"user": {"login": "service-bot[bot]"},
+                   f"{PULLS}/12": dict(pull(12), user={"login": "Service-Bot[bot]"})}
+        result = self.run_intake(replies, "--pr", "12")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        own = json.loads(result.stdout)["pull_requests"][0]
+        self.assertEqual((own["classification"], own["review_required"]), ("self-authored", False))
+
+    def test_malformed_authenticated_logins_hold_intake_before_inventory(self):
+        for login in BAD_LOGINS:
+            for org in (None, "fixture"):
+                with self.subTest(login=login, org=org):
+                    self.assert_failure(self.run_intake({"user": {"login": login}}, org=org), "login")
+                    self.assertEqual([json.loads(line)[3] for line in self.calls.read_text().splitlines()], ["user"])
 
     def test_deleted_reviewers_do_not_change_owner_eligibility(self):
         deleted_before = dict(review(99, submitted="2026-10-09T09:00:00Z"), user=None)
@@ -278,6 +295,7 @@ else:
         del missing["user"]
         bad_reviews = [missing] + [dict(review(), user=user) for user in
                                    ({}, {"login": None}, {"login": ""}, "owner", [], True)]
+        bad_reviews += [review(user=login) for login in BAD_LOGINS]
         for bad in bad_reviews:
             with self.subTest(review=bad):
                 self.assert_failure(self.run_intake(self.explicit([[bad]]), "--pr", "12"), "author")

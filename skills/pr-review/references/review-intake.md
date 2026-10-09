@@ -41,6 +41,9 @@ lookup or reviewer dispatch, including PRs opened by the orchestrator under that
 account. Keep them in the inventory with `review_required: false` and
 `owner_review: null` (history was not queried). Use the PR creator, not commit
 authorship or repository ownership. Missing or malformed PR authors hold intake.
+Validate authenticated, PR-author, and review-author logins before identity
+comparisons. Accept alphanumeric/hyphen GitHub names with an optional `[bot]`
+suffix; reject whitespace and control characters rather than trimming them.
 
 For other authors' PRs, select the owner's latest submitted, non-dismissed review
 by `submitted_at`, breaking ties with review ID. APPROVED,

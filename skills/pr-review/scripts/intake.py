@@ -35,6 +35,12 @@ def text(value, field):
     return value
 
 
+def github_login(value, field):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?", value):
+        raise ValueError(f"missing or invalid {field}")
+    return value
+
+
 def positive(value, field):
     if type(value) is not int or value < 1:
         raise ValueError(f"missing or invalid {field}")
@@ -56,7 +62,7 @@ def latest_review(reviews, owner):
             continue
         if not isinstance(review["user"], dict):
             raise ValueError("invalid review author")
-        login = text(review["user"].get("login"), "review author")
+        login = github_login(review["user"].get("login"), "review author")
         if login.casefold() != owner.casefold():
             continue
         state = review.get("state")
@@ -89,8 +95,7 @@ def intake(repo, numbers=None, owner=None):
         raise ValueError("repo must be a verified owner/repo slug")
     if numbers is not None:
         numbers = list(dict.fromkeys(positive(number, "PR number") for number in numbers))
-    if owner is None:
-        owner = text(api("user").get("login"), "authenticated owner login")
+    owner = github_login(api("user").get("login") if owner is None else owner, "authenticated owner login")
     endpoint = f"repos/{repo}/pulls"
     if numbers is None:
         pulls = api(endpoint + "?state=open&per_page=100", paginate=True)
@@ -109,7 +114,7 @@ def intake(repo, numbers=None, owner=None):
         seen.add(number)
         if any(not isinstance(pull.get(field), dict) for field in ("base", "head", "user")):
             raise ValueError(f"PR #{number} lacks base/head/author metadata")
-        author = text(pull["user"].get("login"), f"PR #{number} author")
+        author = github_login(pull["user"].get("login"), f"PR #{number} author")
         base = sha(pull["base"].get("sha"), f"PR #{number} base SHA")
         head = sha(pull["head"].get("sha"), f"PR #{number} head SHA")
         prior = None
@@ -135,7 +140,7 @@ def intake(repo, numbers=None, owner=None):
 def organization_intake(org):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", org):
         raise ValueError("org must be an explicit organization name")
-    owner = text(api("user").get("login"), "authenticated owner login")
+    owner = github_login(api("user").get("login"), "authenticated owner login")
     repositories = api(f"orgs/{org}/repos?type=all&per_page=100", paginate=True)
     groups = []
     seen = set()
