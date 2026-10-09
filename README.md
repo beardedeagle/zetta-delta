@@ -44,6 +44,9 @@ The installer adds:
 - `/pr-review`: independent PR or commit-range review across configured model
   families, followed by cross-family vetting and explicit orchestrator adjudication
   of every finding (section 8).
+- `/pr-review-batch`: one strong reviewer per PR, orchestrator adjudication, and
+  explicitly authorized GitHub reviews for a PR list or all open PRs needing
+  review at their current head (section 8).
 - The context router and Ponytail rules, written into Delta's Personal
   AGENTS.md (section 6).
 
@@ -123,6 +126,8 @@ way.
 | `skills/adversarial/SKILL.md` | `~/.agents/skills/adversarial/` | Always |
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
 | `skills/pr-review/SKILL.md` | `~/.agents/skills/pr-review/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
+| `skills/pr-review-batch/SKILL.md` and `references/notes.md` | `~/.agents/skills/pr-review-batch/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
+| `skills/pr-review/references/{repositories,review-voice}.md` | both PR review skills' `references/` | Always; repository resolution and authorized review-writing rules |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
 | `tests/install-test.sh` | Not installed | Regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
 | `tests/prepare-test.sh` | Not installed | Regression check for `examples/agents-prepare.sh`: `sh tests/prepare-test.sh` |
@@ -474,6 +479,10 @@ model; that label is Delta's, not the subagent's self-report.
 /pr-review <PR URL, PR number, or main...feature_branch>
 ```
 
+This mode reviews one PR or commit range. Repository slugs, clone paths, and
+unambiguous local shorthand resolve through the verified source remote. Multiple
+PRs or a repository-only request route to batch review below.
+
 The thread pins the comparison, plans from changed-file and hunk metadata,
 and sizes independent review assignments to each model's capacity. It considers
 every configured profile, selects useful perspectives across model families,
@@ -500,6 +509,26 @@ flowchart TD
   V --> A["Orchestrator adjudicates every finding<br/>record evidence and final disposition"]
   A --> R["Deduplicate adjudicated claims<br/>report findings, identities, and coverage gaps"]
 ```
+
+### Batch PR review
+
+```
+/pr-review-batch owner/repo 12, 18, 23
+/pr-review-batch owner/repo
+```
+
+Lists accept numbers, URLs, commas, spaces, and bullets. A repository without a
+list means all open PRs needing your review: new PRs and changed heads get a full
+review; a head matching your latest submitted, non-dismissed review is skipped.
+
+Each PR gets one eligible strong reviewer within roster budgets, followed by
+top-level orchestrator vetting and adjudication. This mode does not require a
+separate cross-family vet. It remains read-only until you explicitly authorize
+publication; test execution also requires authorization and a disposable copy.
+Complete reviews with no actionable findings approve without a body; confirmed
+actionable findings request changes. Incomplete evidence holds approval. Reviews
+use your supplied voice or the bundled plain engineering rules, and publication
+rechecks the target and binds the review to the frozen head commit.
 
 ### Orchestrate
 

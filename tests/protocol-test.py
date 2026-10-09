@@ -16,6 +16,7 @@ BON = ROOT / 'skills/orchestrate/scripts/bon.sh'
 BEST = ROOT / 'skills/orchestrate/references/best-of-n.md'
 ISOLATED = ROOT / 'skills/isolated/SKILL.md'
 ORCHESTRATE = ROOT / 'skills/orchestrate/SKILL.md'
+BATCH = ROOT / 'skills/pr-review-batch/SKILL.md'
 
 
 def decisions(path, title):
@@ -29,6 +30,15 @@ def decisions(path, title):
 
 
 class ProtocolAcceptance(unittest.TestCase):
+    def test_batch_publication_never_approves_incomplete_evidence(self):
+        rows = decisions(BATCH, 'Publication decisions')
+        approvals = [(status, evidence) for status, evidence, action in rows if action == 'approve']
+        self.assertEqual(approvals, [('complete', 'no actionable findings, no material gaps (optional nits allowed)')])
+        for status, evidence, action in rows:
+            if status == 'partial/blocked/failed' or evidence == 'unresolved material evidence gap':
+                self.assertTrue(action.startswith('hold-approval'))
+        self.assertIn(('complete', 'confirmed actionable blocker/major/minor', 'request-changes'), rows)
+
     def test_failed_worker_completion_accounts_for_landed_partial_work(self):
         rows = decisions(ORCHESTRATE, 'Completion decisions')
         lookup = {(r[0], r[1]): r[2:] for r in rows}

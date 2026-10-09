@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Install the Delta orchestration bundle: custom subagent profiles, the
-# /orchestrate, /adversarial, /isolated, and /pr-review skills, and a roster generated for
+# /orchestrate, /adversarial, /isolated, /pr-review, and /pr-review-batch skills,
+# and a roster generated for
 # this machine's accounts (one copy in each skill).
 # Also writes the context router and Ponytail into Delta's Personal AGENTS.md
 # (~/.config/delta/AGENTS.md), replacing only those two blocks and keeping the
@@ -910,7 +911,7 @@ personal_rules() { # our blocks, then whatever else RULES_FILE already holds
 # $SKILL_ROOT with its own copy of the roster; install_file renders
 # {{SKILL_DIR}} from SKILL_DIR.
 
-readonly SKILLS="orchestrate adversarial isolated pr-review"
+readonly SKILLS="orchestrate adversarial isolated pr-review pr-review-batch"
 
 write_bundle() {
   local p skill SKILL_DIR="$SKILL_ROOT/orchestrate"
@@ -932,6 +933,14 @@ write_bundle() {
   install_file "$SCRIPT_DIR/skills/orchestrate/scripts/bon.sh" "$SKILL_DIR/scripts/bon.sh"
   SKILL_DIR="$SKILL_ROOT/pr-review"
   install_file "$SCRIPT_DIR/skills/pr-review/SKILL.md" "$SKILL_DIR/SKILL.md" render
+  SKILL_DIR="$SKILL_ROOT/pr-review-batch"
+  install_file "$SCRIPT_DIR/skills/pr-review-batch/SKILL.md" "$SKILL_DIR/SKILL.md" render
+  install_file "$SCRIPT_DIR/skills/pr-review-batch/references/notes.md" "$SKILL_DIR/references/notes.md"
+  for skill in pr-review pr-review-batch; do
+    SKILL_DIR="$SKILL_ROOT/$skill"
+    install_file "$SCRIPT_DIR/skills/pr-review/references/repositories.md" "$SKILL_DIR/references/repositories.md"
+    install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice.md" "$SKILL_DIR/references/review-voice.md"
+  done
   for skill in $SKILLS; do
     SKILL_DIR="$SKILL_ROOT/$skill"
     install_output "$SKILL_DIR/references/roster.md" printf '%s\n' "$roster"
