@@ -52,9 +52,9 @@ SOURCES=(
 )
 # Unpatched npm tools, pinned: tool|package spec|command.
 NPM_TOOLS=(
-  "ctx7|ctx7@0.5.12|ctx7"
-  "githits|githits@0.25.1|githits"
-  "caveman|@caveman-ai/cli@2.0.0|caveman"
+  "ctx7|ctx7@0.5.13|ctx7"
+  "githits|githits@0.26.0|githits"
+  "caveman|@caveman-ai/cli@2.0.1|caveman"
 )
 readonly ALL_TOOLS="tgrep semble codegraph zvec-grep rtk ctx7 githits caveman index-maintainer"
 

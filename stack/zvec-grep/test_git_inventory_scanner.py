@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 PATCH = Path(__file__).parents[1] / "patches/zvec-grep/0003-fix-preserve-exact-effective-Git-exclusions.patch"
+BUILD_PATCH = PATCH.parent / "0004-fix-keep-source-under-build-directories.patch"
 
 
 class GitInventoryScanner(unittest.TestCase):
@@ -42,10 +43,10 @@ class GitInventoryScanner(unittest.TestCase):
         scanner = self.copy / "src/engine/pipeline/indexing/scanner/index.ts"
         scanner.parent.mkdir(parents=True)
         shutil.copy2(source, scanner)
-        if PATCH.exists():
-            subprocess.run(["git", "apply", "--check", str(PATCH)], cwd=self.copy, check=True,
+        for source_patch in (PATCH, BUILD_PATCH):
+            subprocess.run(["git", "apply", "--check", str(source_patch)], cwd=self.copy, check=True,
                            capture_output=True, text=True)
-            subprocess.run(["git", "apply", str(PATCH)], cwd=self.copy, check=True,
+            subprocess.run(["git", "apply", str(source_patch)], cwd=self.copy, check=True,
                            capture_output=True, text=True)
         self.scanner = scanner
         installed = Path(dist).resolve()
@@ -102,6 +103,17 @@ class GitInventoryScanner(unittest.TestCase):
         explicit = self.base / "explicit.ignore"
         explicit.write_text("tracked.py\n")
         self.assertEqual(self.scan([], ["tracked.py"], explicit), [])
+
+    def test_build_source_remains_eligible_and_artifact_ignores_apply(self):
+        for name in ("build/helper.py", "src/build/probe.py", "build-output/generated.py"):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("def probe(): return True\n")
+        self.assertEqual(self.scan(["build-output/"], []),
+                         ["build/helper.py", "src/build/probe.py"])
+        explicit = self.base / "explicit.ignore"
+        explicit.write_text("build/\n")
+        self.assertEqual(self.scan(["build-output/"], [], explicit), [])
 
     def test_literal_directory_exclusions_preserve_tracked_descendants(self):
         for name in ("ignored/deep/file.py", "mixed/keep.py", "mixed/private.py"):

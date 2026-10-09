@@ -936,6 +936,7 @@ write_bundle() {
   SKILL_DIR="$SKILL_ROOT/pr-review-batch"
   install_file "$SCRIPT_DIR/skills/pr-review-batch/SKILL.md" "$SKILL_DIR/SKILL.md" render
   install_file "$SCRIPT_DIR/skills/pr-review-batch/references/notes.md" "$SKILL_DIR/references/notes.md"
+  install_file "$SCRIPT_DIR/skills/find-docs/SKILL.md" "$SKILL_ROOT/find-docs/SKILL.md"
   for skill in pr-review pr-review-batch; do
     SKILL_DIR="$SKILL_ROOT/$skill"
     install_file "$SCRIPT_DIR/skills/pr-review/references/repositories.md" "$SKILL_DIR/references/repositories.md"
