@@ -1,0 +1,56 @@
+--- a/src/extraction/index.ts
++++ b/src/extraction/index.ts
+@@ -189,7 +189,7 @@
+  * exclusion applies uniformly (git or not, tracked or not); the only opt-in is an
+  * explicit `.gitignore` negation (e.g. `!vendor/`). First-party-prone or generic
+  * names (`packages`, `lib`, `app`, `bin`, `src`, `deps`, `env`, `tmp`, `storage`,
+- * `Library`) are deliberately NOT listed, to avoid ever hiding real source.
++ * `Library`, `build`) are deliberately NOT listed, to avoid ever hiding real source.
+  *
+  * Only dirs that actually contain *indexable source* (or are enormous) earn a slot
+  * — IDE/state dirs like `.idea`/`.vs` are omitted because CodeGraph indexes only
+@@ -204,7 +204,7 @@
+   '.docusaurus', 'storybook-static', '.vinxi', '.nitro', 'out-tsc',
+   '.vercel', '.netlify', '.wrangler',
+   // Build output (common across ecosystems)
+-  'dist', 'build', 'out', '.output',
++  'dist', 'out', '.output',
+   // Test / coverage
+   'coverage', '.nyc_output',
+   // Python
+--- a/__tests__/extraction.test.ts
++++ b/__tests__/extraction.test.ts
+@@ -8669,6 +8669,25 @@
+     expect(files).not.toContain('tmp/scratch.ts');
+   });
+
++  it('keeps source under generic build directories with explicit artifact ignores', async () => {
++    const root = path.join(tempDir, 'generic-build-source');
++    for (const relative of ['build/helper.ts', 'src/build/probe.py', 'build/ignored.ts', 'build-output/generated.ts']) {
++      const file = path.join(root, relative);
++      fs.mkdirSync(path.dirname(file), { recursive: true });
++      fs.writeFileSync(file, relative.endsWith('.py') ? 'def probe(): return True\n' : 'export const value = 1;\n');
++    }
++    fs.writeFileSync(path.join(root, '.gitignore'), '/build-output/\n/build/ignored.ts\n');
++    const files = scanDirectory(root);
++    expect(await scanDirectoryAsync(root)).toEqual(files);
++    expect(files).toContain('build/helper.ts');
++    expect(files).toContain('src/build/probe.py');
++    expect(files).not.toContain('build/ignored.ts');
++    expect(files).not.toContain('build-output/generated.ts');
++    const scope = buildScopeIgnore(root);
++    expect(scope.ignores('src/build/probe.py')).toBe(false);
++    expect(scope.ignores('build/ignored.ts')).toBe(true);
++  });
++
+   it.each(['filesystem', 'untracked', 'tracked'])(
+     'keeps Java packages named build while excluding build output (%s, #1642)',
+     async (mode) => {
+@@ -8703,6 +8722,7 @@
+         fs.mkdirSync(path.dirname(abs), { recursive: true });
+         fs.writeFileSync(abs, 'class Example {}\n');
+       }
++      fs.writeFileSync(path.join(tempDir, '.gitignore'), '/build/\n/module/build/\n/src/main/resources/build/\n');
+       if (mode !== 'filesystem') {
+         execFileSync('git', ['init', '-q'], { cwd: tempDir });
+         if (mode === 'tracked') execFileSync('git', ['add', '-f', '.'], { cwd: tempDir });

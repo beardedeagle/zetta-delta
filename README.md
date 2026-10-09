@@ -49,6 +49,7 @@ The installer adds:
   review at their current head (section 8).
 - The context router and Ponytail rules, written into Delta's Personal
   AGENTS.md (section 6).
+- `/find-docs`: the Context7 CLI documentation lookup skill.
 
 `stack/install.sh` builds and installs the context tools those rules route to
 (section 9), and `examples/agents-prepare.sh` gives each checkout its own
@@ -128,6 +129,7 @@ way.
 | `skills/pr-review/SKILL.md` | `~/.agents/skills/pr-review/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
 | `skills/pr-review-batch/SKILL.md` and `references/notes.md` | `~/.agents/skills/pr-review-batch/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
 | `skills/pr-review/references/{repositories,review-voice}.md` | both PR review skills' `references/` | Always; repository resolution and authorized review-writing rules |
+| `skills/find-docs/SKILL.md` | `~/.agents/skills/find-docs/` | Always; current developer documentation through Context7 |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
 | `tests/install-test.sh` | Not installed | Regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
 | `tests/prepare-test.sh` | Not installed | Regression check for `examples/agents-prepare.sh`: `sh tests/prepare-test.sh` |
@@ -651,10 +653,10 @@ pinned commit, with this repository's patches applied in order:
 |---|---|---|
 | tgrep | microsoft/tgrep v1.0.11 | none |
 | semble | MinishLab/semble v0.6.1 | none |
-| codegraph | colbymchenry/codegraph v1.6.2 | inline Rust tests count as callers; Elixir; a root-only ignore rule such as `/tmp/` no longer hides same-named folders deeper down |
-| zvec-grep | zvec-ai/zvec-grep v0.2.2 | Metal tensor opt-out; node-llama-cpp 3.22.1 (Metal tensor kernels on Apple M5) |
+| codegraph | colbymchenry/codegraph v1.6.2 | inline Rust tests count as callers; Elixir; root-only Git ignores stay anchored; source under `build/` remains eligible |
+| zvec-grep | zvec-ai/zvec-grep v0.2.2 | Metal tensor opt-out; node-llama-cpp 3.22.1 (Metal tensor kernels on Apple M5); exact Git exclusions; source under `build/` remains eligible |
 | rtk | rtk-ai/rtk v0.51.0 | a failed command no longer prints a TOML filter's `on_empty` "ok" |
-| ctx7, githits, caveman | npm 0.5.12, 0.25.1, 2.0.0 | none |
+| ctx7, githits, caveman | npm 0.5.13, 0.26.0, 2.0.1 | none |
 
 The script needs git, curl, and tar, plus cargo, uv, node 22 or later with
 npm, and python3 for the tools you pick (`stack/install.sh --help`). It

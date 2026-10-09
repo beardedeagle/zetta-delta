@@ -1,0 +1,11 @@
+--- a/src/engine/pipeline/indexing/scanner/index.ts
++++ b/src/engine/pipeline/indexing/scanner/index.ts
+@@ -54,7 +54,7 @@
+   "external",
+   "deps",
+   "dist",
+-  "build",
++  // Source under build/ stays eligible; explicit artifact ignores still apply.
+   "out",
+   "target",
+   "coverage",

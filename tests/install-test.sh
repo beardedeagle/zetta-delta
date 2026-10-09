@@ -89,6 +89,7 @@ check "piped install: pr-review skill" "$(cd "$T/home/.agents/skills/pr-review" 
   "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/repositories.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
 check "piped install: pr-review-batch skill" "$(cd "$T/home/.agents/skills/pr-review-batch" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
   "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/notes.md ./references/repositories.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
+check "piped install: find-docs skill" "$(cmp -s "$ROOT/skills/find-docs/SKILL.md" "$T/home/.agents/skills/find-docs/SKILL.md" && echo same)" "same"
 check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/.agents/skills" \
   && cmp -s orchestrate/references/roster.md adversarial/references/roster.md \
   && cmp -s orchestrate/references/roster.md isolated/references/roster.md \
