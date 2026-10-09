@@ -128,7 +128,7 @@ way.
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
 | `skills/pr-review/SKILL.md` | `~/.agents/skills/pr-review/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
 | `skills/pr-review-batch/SKILL.md` and `references/notes.md` | `~/.agents/skills/pr-review-batch/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
-| `skills/pr-review/scripts/intake.py` and `references/review-intake.md` | both PR review skills' `scripts/` and `references/` | Always; shared owner-review eligibility check before dispatch |
+| `skills/pr-review/scripts/intake.py` and `references/review-intake.md` | both PR review skills' `scripts/` and `references/` | Always; shared PR authorship and owner-review eligibility check before dispatch |
 | `skills/pr-review/references/{repositories,review-publication,review-voice,review-voice-sources}.md` | both PR review skills' `references/` | Always; repository resolution, shared submission contract, derived voice, and source coverage |
 | `skills/find-docs/SKILL.md` | `~/.agents/skills/find-docs/` | Always; current developer documentation through Context7 |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
@@ -490,8 +490,11 @@ review below.
 
 Both modes run the same [intake helper](skills/pr-review/scripts/intake.py) before
 any reviewer launch, for one PR, explicit lists, whole-repo requests, and
-organization targets. It collects the requested PRs and compares each current
-head with your latest
+organization targets. It collects the requested PRs and first skips those whose
+creator matches the authenticated `gh` account, case-insensitively, including
+PRs opened by the orchestrator under that account. These stay in the inventory as
+`self-authored` without review-history lookups, subagents, or publication. For
+other authors' PRs, it compares each current head with your latest
 submitted, non-dismissed GitHub review. No prior review or a changed head means a
 full review; the same head means skip, with no subagents or GitHub activity. Owner
 is the authenticated `gh` user. Failed lookups hold dispatch for the requested
@@ -536,7 +539,7 @@ and access gaps. Private conversations and email text are not bundled.
 ```mermaid
 flowchart TD
   U["You: /pr-review PR or range"] --> I["PR: shared owner-review intake<br/>Range: proceed directly"]
-  I -->|"unchanged PR"| K["Skip; no subagents or GitHub activity"]
+  I -->|"self-authored / unchanged PR"| K["Skip; no subagents or GitHub publication"]
   I -->|"new / changed PR or range"| T["Pin comparison and freeze source<br/>measure changed files and hunks"]
   T --> S["Select useful configured perspectives<br/>size assignments and schedule waves"]
   S --> D["Independent discovery<br/>across selected model families"]
@@ -555,7 +558,8 @@ flowchart TD
 
 Lists accept numbers, URLs, commas, spaces, and bullets. A repository without a
 list means all open PRs. Both forms use the shared eligibility check above before
-dispatch: new PRs and changed heads get a full review; unchanged heads are skipped.
+dispatch: self-authored PRs are skipped first; other authors' new PRs and changed
+heads get a full review, while unchanged heads are skipped.
 
 An explicit `org:<name>` target collects all repositories visible to the
 authenticated GitHub account, then every open PR in each. Repository, PR, and

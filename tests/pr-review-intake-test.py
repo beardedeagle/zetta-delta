@@ -82,6 +82,44 @@ else:
                 self.assertEqual((entry["number"], entry["base_sha"], entry["head_sha"]), (12, "b" * 40, HEAD))
                 self.assertEqual((entry["classification"], entry["review_required"]), (expected, expected != "unchanged"))
 
+    def test_self_authored_prs_skip_review_lookup_in_every_scope(self):
+        for author in ("owner", "OwNeR"):
+            own_pull = dict(pull(12), user={"login": author})
+            replies = {f"{PULLS}/12": own_pull, f"{PULLS}/18": pull(18),
+                       f"{PULLS}/18/reviews?per_page=100": [[]],
+                       PULLS + "?state=open&per_page=100": [[own_pull], [pull(18)]],
+                       "orgs/fixture/repos?type=all&per_page=100": [[{"full_name": REPO}]]}
+            for scope in ("single", "list", "repository", "organization"):
+                with self.subTest(author=author, scope=scope):
+                    args = ("--pr", "12") if scope == "single" else ("--pr", "12", "18") if scope == "list" else ()
+                    result = self.run_intake(replies, *args, org="fixture" if scope == "organization" else None)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    data = json.loads(result.stdout)
+                    group = data["repositories"][0] if scope == "organization" else data
+                    own = group["pull_requests"][0]
+                    self.assertEqual((own["number"], own["author"], own["classification"],
+                                      own["review_required"], own["owner_review"]),
+                                     (12, author, "self-authored", False, None))
+                    endpoints = [json.loads(line)[3] for line in self.calls.read_text().splitlines()]
+                    self.assertNotIn(f"{PULLS}/12/reviews?per_page=100", endpoints)
+                    if scope != "single":
+                        other = group["pull_requests"][1]
+                        self.assertEqual((other["number"], other["classification"], other["review_required"]),
+                                         (18, "new", True))
+                        self.assertIn(f"{PULLS}/18/reviews?per_page=100", endpoints)
+
+    def test_missing_or_malformed_pr_authors_hold_intake(self):
+        missing = pull(18)
+        del missing["user"]
+        bad_pulls = [missing] + [dict(pull(18), user=user) for user in
+                                 (None, {}, {"login": None}, {"login": ""}, {"login": " "}, "owner", [], True)]
+        for bad in bad_pulls:
+            with self.subTest(pull=bad):
+                replies = {**self.explicit([[]]), f"{PULLS}/18": bad}
+                self.assert_failure(self.run_intake(replies, "--pr", "12", "18"), "author")
+                endpoints = [json.loads(line)[3] for line in self.calls.read_text().splitlines()]
+                self.assertNotIn(f"{PULLS}/18/reviews?per_page=100", endpoints)
+
     def test_latest_completed_owner_review_across_pages_with_timestamp_and_id_order(self):
         pages = [[review(99, commit=OLD, submitted="2026-10-09T09:00:00Z"),
                   review(3, commit=OLD)],

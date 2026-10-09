@@ -109,19 +109,24 @@ def intake(repo, numbers=None, owner=None):
         seen.add(number)
         if any(not isinstance(pull.get(field), dict) for field in ("base", "head", "user")):
             raise ValueError(f"PR #{number} lacks base/head/author metadata")
+        author = text(pull["user"].get("login"), f"PR #{number} author")
         base = sha(pull["base"].get("sha"), f"PR #{number} base SHA")
         head = sha(pull["head"].get("sha"), f"PR #{number} head SHA")
-        prior = latest_review(api(f"{endpoint}/{number}/reviews?per_page=100", paginate=True), owner)
-        classification = "new" if prior is None else "unchanged" if prior["commit_id"] == head else "changed"
+        prior = None
+        if author.casefold() == owner.casefold():
+            classification = "self-authored"
+        else:
+            prior = latest_review(api(f"{endpoint}/{number}/reviews?per_page=100", paginate=True), owner)
+            classification = "new" if prior is None else "unchanged" if prior["commit_id"] == head else "changed"
         classified.append({
             "number": number,
             "url": text(pull.get("html_url"), f"PR #{number} URL"),
             "title": text(pull.get("title"), f"PR #{number} title"),
-            "author": text(pull["user"].get("login"), f"PR #{number} author"),
+            "author": author,
             "base_sha": base,
             "head_sha": head,
             "classification": classification,
-            "review_required": classification != "unchanged",
+            "review_required": classification in ("new", "changed"),
             "owner_review": prior,
         })
     return {"repository": repo, "owner": owner, "pull_requests": classified}
