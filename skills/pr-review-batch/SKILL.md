@@ -8,7 +8,7 @@ description: >-
 
 Fan out independent reviews across a list of PRs, then publish one GitHub review per PR: approve when the review is complete and there are no confirmed actionable findings, request changes when there are.
 
-Use this when the user gives a space-separated, comma-separated, or bulleted list of PR numbers/URLs and asks to review them. This skill is intentionally different from `pr-review`: one strong reviewer per PR, top-level orchestrator adjudication/vetting, and GitHub posting are part of the workflow. It does not require every finding to be independently vetted by another family.
+Use this when the user gives a space-separated, comma-separated, or bulleted list of PR numbers/URLs and asks to review them. This skill uses one strong reviewer per PR and top-level orchestrator adjudication/vetting. It does not require every finding to be independently vetted by another family. Both skills share the same authorized GitHub publication contract.
 
 ## Delta dispatch contract
 
@@ -146,7 +146,8 @@ For each raw finding:
 1. read the cited source and enough enclosing caller/contract context;
 2. verify the concrete trigger and impact against the frozen source;
 3. decide CONFIRMED, ADJUSTED, REJECTED, or UNVERIFIABLE;
-4. reject speculative, style-only, pre-existing, or unsupported claims;
+4. reject speculative, pre-existing, or unsupported claims; retain useful optional
+   polish only as explicitly non-blocking nits;
 5. cluster confirmed findings by root cause and trigger;
 6. determine whether any actionable blocker/major/minor finding remains.
 
@@ -160,70 +161,20 @@ EVIDENCE: <decisive path:line and caller/contract evidence, or precise gap>
 POSTING DECISION: post | do-not-post | hold
 ```
 
-UNVERIFIABLE findings do not get posted unless the user asks to include a caveat.
+Keep UNVERIFIABLE claims in the thread with their precise evidence gaps.
+Unresolved material gaps hold submission under the shared publication contract.
 
-## Review voice (when posting as the user)
+## Review voice
 
-Follow `references/review-voice.md` for authorized reviews and comments.
+Read `references/review-voice.md` before composing review-flow messages. Apply
+it to review bodies, progress updates, and the completion report.
 
 ## GitHub publication
 
-After the user explicitly authorizes posting:
-
-- Re-fetch the PR's state and base/head OIDs immediately before publication.
-  Closed PRs hold posting; a changed base or head requires a new frozen comparison
-  and re-review. Bind the submitted review to the frozen head with the REST
-  review endpoint's `commit_id`, so a concurrent push cannot retarget the review.
-- Approval requires all changed paths/hunks and relevant interactions assessed,
-  every applicable category checked or explained as N/A, and no unresolved
-  material findings or evidence gaps. Partial, blocked, or failed reviewer
-  reports and material UNVERIFIABLE findings hold approval until their gaps are
-  resolved; zero confirmed findings is not proof of completion.
-- If the review is complete and no confirmed actionable blocker/major/minor findings remain: submit an APPROVE review with no body unless the user supplied one.
-- Bodyless approvals are an explicit exception to the review-body voice rules.
-  Include the verdict and actual verification limits in the thread's completion report.
-- If confirmed actionable blocker/major/minor findings exist: submit a REQUEST_CHANGES review with a concise bullet summary written for a low-to-mid-level engineer.
-- Keep review bodies focused on what is wrong, why it matters, and what to change;
-  also include the verdict and relevant verification limits.
-- No attribution, no model/process metadata, no footer, no “AI” labels, and no links to internal skill outputs.
-- Preserve exact file/line evidence when it helps the engineer find the issue.
-- Do not post rejected, duplicate, optional nit-only, or unverified claims as blockers.
-- Post safe, cheap, clearly useful nits as separate non-blocking comments when
-  commenting is authorized, including for nit-only approvals. Nits never justify
-  a request-changes verdict.
-
-Style:
-
-- direct, plain, and technical;
-- short sentences;
-- no filler;
-- no corporate apology;
-- no praise theater;
-- no emoji;
-- no attribution;
-- if the user provides a style sample or approved corpus location, mirror that voice; otherwise use concise engineering prose.
-
-Before posting, show the exact proposed review text to the user if the user requested review-before-post. If the user has authorized direct posting, publish once and stop.
-
-Write the authorized payload to a temporary JSON file with `commit_id`, `event`
-(APPROVE or REQUEST_CHANGES), and `body` only when needed. Submit with
-`rtk proxy gh api --method POST 'repos/<owner>/<repo>/pulls/<n>/reviews' --input '<payload.json>'; echo "exit=$?"`.
-Require success and verify the returned review's commit, event/state, and URL.
-After an uncertain result, inspect existing reviews before retrying to avoid
-duplicates. A later push leaves the review tied to its recorded head; report it
-as superseded rather than claiming the new head was reviewed.
-
-## Publication decisions
-
-These decisions apply only after publication is explicitly authorized and the
-PR still matches the frozen comparison. Otherwise hold posting.
-
-| Review status | Findings/evidence | Publication |
-|---|---|---|
-| complete | no actionable findings, no material gaps (optional nits allowed) | approve |
-| complete | confirmed actionable blocker/major/minor | request-changes |
-| partial/blocked/failed | any | hold-approval; only confirmed findings may be posted |
-| any | unresolved material evidence gap | hold-approval; only confirmed findings may be posted |
+After reconciling completion, read `references/review-publication.md`. For each
+authorized PR, create and submit one review: REQUEST_CHANGES with actionable
+findings, APPROVE without findings, or APPROVE with non-blocking nits in the
+same body. Incomplete review or a moved comparison holds submission.
 
 ## Completion report
 
@@ -231,7 +182,8 @@ For the batch, report:
 
 1. PR list and frozen base/head OIDs;
 2. each PR's final decision: approved / changes requested / incomplete / not posted;
-3. posted review body for each changed PR;
+3. submitted event, review body if any, reviewed head and receipt URL for each
+   posted review, or the precise reason submission was held/not authorized;
 4. rejected and unverified claims with reasons;
 5. any coverage gaps and actual verification limits, including for bodyless approvals;
 6. source-integrity status;

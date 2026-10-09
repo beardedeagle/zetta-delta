@@ -17,6 +17,8 @@ BEST = ROOT / 'skills/orchestrate/references/best-of-n.md'
 ISOLATED = ROOT / 'skills/isolated/SKILL.md'
 ORCHESTRATE = ROOT / 'skills/orchestrate/SKILL.md'
 BATCH = ROOT / 'skills/pr-review-batch/SKILL.md'
+REVIEW = ROOT / 'skills/pr-review/SKILL.md'
+PUBLICATION = ROOT / 'skills/pr-review/references/review-publication.md'
 
 
 def decisions(path, title):
@@ -30,14 +32,37 @@ def decisions(path, title):
 
 
 class ProtocolAcceptance(unittest.TestCase):
-    def test_batch_publication_never_approves_incomplete_evidence(self):
-        rows = decisions(BATCH, 'Publication decisions')
-        approvals = [(status, evidence) for status, evidence, action in rows if action == 'approve']
-        self.assertEqual(approvals, [('complete', 'no actionable findings, no material gaps (optional nits allowed)')])
-        for status, evidence, action in rows:
-            if status == 'partial/blocked/failed' or evidence == 'unresolved material evidence gap':
-                self.assertTrue(action.startswith('hold-approval'))
-        self.assertIn(('complete', 'confirmed actionable blocker/major/minor', 'request-changes'), rows)
+    def test_shared_publication_has_three_outcomes_and_holds_unsafe_submission(self):
+        rows = decisions(PUBLICATION, 'Publication decisions')
+        submissions = [(status, evidence, event, body)
+                       for status, evidence, event, body in rows if event != 'hold']
+        self.assertEqual(submissions, [
+            ('complete', 'confirmed actionable blocker/major/minor',
+             'REQUEST_CHANGES', 'verdict and findings'),
+            ('complete', 'no findings, no material gaps',
+             'APPROVE', 'omit unless user supplied one'),
+            ('complete', 'non-blocking nits only, no material gaps',
+             'APPROVE', 'nits and explicit non-blocking statement'),
+        ])
+        lookup = {(status, evidence): (event, body)
+                  for status, evidence, event, body in rows}
+        for status, evidence in (
+            ('partial/blocked/failed', 'any'),
+            ('any', 'unresolved material evidence gap'),
+            ('any', 'missing publication authorization'),
+            ('any', 'closed PR or changed base/head'),
+        ):
+            with self.subTest(status=status, evidence=evidence):
+                self.assertEqual(lookup[(status, evidence)], ('hold', 'none'))
+
+    def test_both_review_methods_route_to_one_publication_contract(self):
+        for path in (REVIEW, BATCH):
+            with self.subTest(skill=path.parent.name):
+                text = path.read_text()
+                self.assertIn('references/review-publication.md', text)
+                self.assertIn('references/review-voice.md', text)
+                self.assertNotIn('## Publication decisions', text,
+                                 'publication decisions belong to the shared reference')
 
     def test_failed_worker_completion_accounts_for_landed_partial_work(self):
         rows = decisions(ORCHESTRATE, 'Completion decisions')

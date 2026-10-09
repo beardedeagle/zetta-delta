@@ -25,7 +25,7 @@ if ((DRY_RUN)); then
     "1. brew bundle install --file $ROOT/Brewfile (build prerequisites and gh)" \
     "2. $ROOT/stack/install.sh (pinned context tools)" \
     "3. $ROOT/install.sh --configure-delta (providers, built-ins, skills, rules)" \
-    "Defaults: ZAI_TIER=max QWEN_TIER=pro THREAD_CAP=8 MINIMAX_BILLING=plan; GPT/Grok enabled." \
+    "Defaults: ZAI_TIER=max QWEN_TIER=pro THREAD_CAP=15 MINIMAX_BILLING=plan; GPT/Grok enabled." \
     "Authenticate your accounts locally afterwards; existing files need --force."
   exit 0
 fi
@@ -40,7 +40,7 @@ BREW_PREFIX="$(brew --prefix)"
 PYTHON_PREFIX="$(brew --prefix python@3.13)"
 export PATH="$PYTHON_PREFIX/libexec/bin:$BREW_PREFIX/bin:$PREFIX/bin:$HOME/.cargo/bin:$PATH"
 bash "$ROOT/stack/install.sh"
-export ZAI_TIER="${ZAI_TIER:-max}" QWEN_TIER="${QWEN_TIER:-pro}" THREAD_CAP="${THREAD_CAP:-8}"
+export ZAI_TIER="${ZAI_TIER:-max}" QWEN_TIER="${QWEN_TIER:-pro}" THREAD_CAP="${THREAD_CAP:-15}"
 export GPT_PROVIDER="${GPT_PROVIDER-openai-subscribed}" GROK_PROVIDER="${GROK_PROVIDER-x_ai-subscribed}"
 MINIMAX_PROVIDER="${MINIMAX_PROVIDER-$(python3 "$ROOT/scripts/setup.py" provider-id minimax)}"
 export MINIMAX_PROVIDER

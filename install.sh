@@ -32,7 +32,7 @@
 #   gpt-astra scout-qwen scout-deepseek
 # Optional tuning:
 #   PROFILE_PRIORITY="<names>"  profiles to install first; the rest keep the order above
-#   KIMI_LIMIT=3  LOCAL_LIMIT=2  THREAD_CAP=6  METERED_MAX_SPAWNS=2
+#   KIMI_LIMIT=3  LOCAL_LIMIT=2  THREAD_CAP=15  METERED_MAX_SPAWNS=2
 #   METERED_LANES="DeepSeek API, OpenCode Zen"
 #   ORCHESTRATOR_MODEL=k3  ORCHESTRATOR_LANE="Kimi Code"  ORCHESTRATOR_FAMILY=Kimi
 #   BUILTIN_{SCOUT,WORKER,REVIEWER}_{MODEL,LANE,FAMILY}  (see README)
@@ -171,7 +171,7 @@ LOCAL_FAMILY="${LOCAL_FAMILY:-Local}"
 PROFILE_PRIORITY="${PROFILE_PRIORITY:-}"
 KIMI_LIMIT="${KIMI_LIMIT:-3}"
 LOCAL_LIMIT="${LOCAL_LIMIT:-2}"
-THREAD_CAP="${THREAD_CAP:-6}"
+THREAD_CAP="${THREAD_CAP:-15}"
 METERED_MAX_SPAWNS="${METERED_MAX_SPAWNS:-2}"
 METERED_LANES="${METERED_LANES:-DeepSeek API, OpenCode Zen}"
 ORCHESTRATOR_MODEL="${ORCHESTRATOR_MODEL:-k3}"
@@ -941,6 +941,8 @@ write_bundle() {
     SKILL_DIR="$SKILL_ROOT/$skill"
     install_file "$SCRIPT_DIR/skills/pr-review/references/repositories.md" "$SKILL_DIR/references/repositories.md"
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice.md" "$SKILL_DIR/references/review-voice.md"
+    install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice-sources.md" "$SKILL_DIR/references/review-voice-sources.md"
+    install_file "$SCRIPT_DIR/skills/pr-review/references/review-publication.md" "$SKILL_DIR/references/review-publication.md"
   done
   for skill in $SKILLS; do
     SKILL_DIR="$SKILL_ROOT/$skill"

@@ -86,9 +86,9 @@ check "piped install: adversarial skill" "$(cd "$T/home/.agents/skills/adversari
 check "piped install: isolated skill" "$(cd "$T/home/.agents/skills/isolated" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
   "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/bon.sh ./scripts/identity.py "
 check "piped install: pr-review skill" "$(cd "$T/home/.agents/skills/pr-review" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/repositories.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/repositories.md ./references/review-publication.md ./references/review-voice-sources.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
 check "piped install: pr-review-batch skill" "$(cd "$T/home/.agents/skills/pr-review-batch" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/notes.md ./references/repositories.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/notes.md ./references/repositories.md ./references/review-publication.md ./references/review-voice-sources.md ./references/review-voice.md ./references/roster.md ./scripts/identity.py "
 check "piped install: find-docs skill" "$(cmp -s "$ROOT/skills/find-docs/SKILL.md" "$T/home/.agents/skills/find-docs/SKILL.md" && echo same)" "same"
 check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/.agents/skills" \
   && cmp -s orchestrate/references/roster.md adversarial/references/roster.md \
@@ -96,6 +96,8 @@ check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/
   && cmp -s orchestrate/references/roster.md pr-review/references/roster.md \
   && cmp -s orchestrate/references/roster.md pr-review-batch/references/roster.md \
   && cmp -s pr-review/references/review-voice.md pr-review-batch/references/review-voice.md \
+  && cmp -s pr-review/references/review-voice-sources.md pr-review-batch/references/review-voice-sources.md \
+  && cmp -s pr-review/references/review-publication.md pr-review-batch/references/review-publication.md \
   && cmp -s orchestrate/scripts/bon.sh isolated/scripts/bon.sh && echo same)" "same"
 has "piped install: isolated runs its own bon.sh" "$(cat "$T/home/.agents/skills/isolated/SKILL.md")" \
   "sh '$T/home/.agents/skills/isolated/scripts/bon.sh' snapshot"

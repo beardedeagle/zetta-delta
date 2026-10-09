@@ -135,7 +135,7 @@ class InstallerTests(unittest.TestCase):
             registry = (skill / "references/identity-registry.json").read_bytes()
             contents.append(registry)
             data = json.loads(registry)
-            self.assertEqual(data["thread_limit"], 6)
+            self.assertEqual(data["thread_limit"], 15)
             self.assertEqual(data["metered_max_spawns"], 2)
             self.assertIn({"provider_id": "custom:k", "lane": "Kimi Code", "billing": "flat", "limit": 3}, data["providers"])
             self.assertIn({"provider_id": "custom:k", "model_id": "k3", "family": "Kimi"}, data["models"])
@@ -173,11 +173,14 @@ class InstallerTests(unittest.TestCase):
                     if sibling != skill:
                         shutil.rmtree(sibling)
                 self.assertTrue(roster.is_file())
-                for filename in ("repositories.md", "review-voice.md"):
+                for filename in ("repositories.md", "review-voice.md", "review-publication.md"):
                     self.assertIn("references/" + filename, body)
                     self.assertEqual((skill / "references" / filename).read_bytes(),
                                      (ROOT / "skills/pr-review/references" / filename).read_bytes())
                 self.assertNotIn("llm-wiki-igo", (skill / "references/review-voice.md").read_text())
+                self.assertIn("review-voice-sources.md", (skill / "references/review-voice.md").read_text())
+                self.assertEqual((skill / "references/review-voice-sources.md").read_bytes(),
+                                 (ROOT / "skills/pr-review/references/review-voice-sources.md").read_bytes())
                 command = next(line.strip() for line in reference.read_text().splitlines()
                                if line.strip().startswith("python3 "))
                 command = (command.replace("<sanitized-models-json>", shlex.quote(str(models)))
@@ -363,7 +366,8 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("LOCAL_SECRET_CANARY", result.stdout + result.stderr)
         self.assertNotIn("LOCAL_SECRET_CANARY", (self.bundle / "settings/provider-catalog.json").read_text())
         self.assertEqual(data["portable"]["appearance"], "dark")
-        self.assertEqual(data["portable"]["subagent_concurrency"], {"maximum_per_parent": 6, "maximum_total": 12})
+        self.assertEqual(data["portable"]["subagent_concurrency"], {"maximum_per_parent": 15, "maximum_total": 30})
+        self.assertIn("| **All lanes** | **15** |", self.roster())
         self.assertEqual(data["portable"]["subagent_defaults"], {"unrelated": True, "allow_parent_model_override": True})
         self.assertEqual(len(data["native"]["custom_providers"]), 3)
         self.assertTrue(all(row["headers"] == [] for row in data["native"]["custom_providers"]))
@@ -529,7 +533,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(order.read_text().splitlines(), ["BREW", "STACK"])
         data = json.loads((self.config / "settings.json").read_text())
         self.assertEqual(len(data["native"]["custom_providers"]), 4)
-        self.assertEqual(data["portable"]["subagent_concurrency"], {"maximum_per_parent": 8, "maximum_total": 16})
+        self.assertEqual(data["portable"]["subagent_concurrency"], {"maximum_per_parent": 15, "maximum_total": 30})
+        self.assertIn("| **All lanes** | **15** |", self.roster())
         self.assertIn("| MiniMax | 2 |", self.roster())
         self.assertIn("| grok |", self.roster())
         self.assertIn("| gpt-sol |", self.roster())

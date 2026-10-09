@@ -74,7 +74,8 @@ Codex agent APIs or invent tool arguments. Never switch the top-level model.
    retries, spillover, and tie-breaks too. No orchestrator shortcut counts as
    cross-family verification. If no eligible family is available, mark UNVETTED.
 4. Source and the user's checkout remain unchanged. No fixes, commits, staging,
-   resets, stashes, installs, formatting, snapshot updates, or external posting.
+   resets, stashes, installs, formatting, or snapshot updates. GitHub review
+   submission is allowed only through the authorized publication contract below.
    Limited setup may fetch required refs into a standalone disposable repository,
    create review/test snapshots, and run the authorized index maintainer there. Do
    not fetch into the user's repository or write its refs/FETCH_HEAD. A linked Git
@@ -412,11 +413,12 @@ and retain every raw ID, all three identities, original verdict, final dispositi
 and evidence. A confirmed duplicate must not hide a rejected, unverifiable,
 unadjudicated, or contradictory claim; show material disagreements.
 
-## Review voice (when posting as the user)
+## Review voice
 
-If publication is separately authorized, follow `references/review-voice.md`.
+Read `references/review-voice.md` before composing review-flow messages. Apply
+it to review bodies, progress updates, and the completion report.
 
-## Completion and report
+## Completion reconciliation
 
 Reconcile the planned coverage map against actual CHECKED reports, source identities,
 terminal units, and the raw-finding vet/adjudication ledger. Completion requires
@@ -426,6 +428,16 @@ adjudication for every original/spillover finding. Differentiate intentional mod
 omissions from failed or unavailable coverage. An evidence gap, missing required
 perspective, UNVETTED/UNVERIFIABLE/UNADJUDICATED item, or unresolved
 material dispute makes the review incomplete; never report unconditional merge-ready.
+
+## GitHub publication
+
+After reconciling completion, read `references/review-publication.md`. For an
+authorized PR, create and submit one review: REQUEST_CHANGES with actionable
+findings, APPROVE without findings, or APPROVE with non-blocking nits in the
+same body. Incomplete review or a moved comparison holds submission. Commit
+ranges without a resolved PR remain in-thread reports.
+
+## Completion report
 
 Report in this thread:
 
@@ -446,8 +458,12 @@ Report in this thread:
    model selection/omission reasons, waves and terminal statuses, substitutions,
    effective lanes and metered use, test results, source-integrity checks, and gaps.
 5. **LEARNED:** evidenced durable facts worth the llm-wiki; do not file without asking.
+6. **Publication:** submitted event, review body if any, reviewed head and receipt
+   URL, or the precise reason submission was held/not authorized. Keep a local
+   recommendation distinct from a verified GitHub review.
 
 Remove only disposable resources created for this run after reports no longer depend
 on them; retain the frozen comparison identity and enough evidence to reproduce claims.
-Keep user work, generated roster/registry, and provider settings untouched. Do not post
-to GitHub or apply fixes unless separately requested.
+Keep user work, generated roster/registry, and provider settings untouched.
+Apply fixes only when separately requested. Authorized GitHub review submission
+follows the shared publication contract; it does not authorize other PR updates.

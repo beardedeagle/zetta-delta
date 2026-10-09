@@ -128,7 +128,7 @@ way.
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
 | `skills/pr-review/SKILL.md` | `~/.agents/skills/pr-review/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
 | `skills/pr-review-batch/SKILL.md` and `references/notes.md` | `~/.agents/skills/pr-review-batch/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
-| `skills/pr-review/references/{repositories,review-voice}.md` | both PR review skills' `references/` | Always; repository resolution and authorized review-writing rules |
+| `skills/pr-review/references/{repositories,review-publication,review-voice,review-voice-sources}.md` | both PR review skills' `references/` | Always; repository resolution, shared submission contract, derived voice, and source coverage |
 | `skills/find-docs/SKILL.md` | `~/.agents/skills/find-docs/` | Always; current developer documentation through Context7 |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
 | `tests/install-test.sh` | Not installed | Regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
@@ -279,8 +279,8 @@ reported and refused before writes. Duplicate priorities are refused.
 | Setting | Value |
 |---|---|
 | Enable Sub-agents | Only When Asked |
-| Max Agents Per Thread | The installer's `THREAD_CAP` (default 6), which the roster uses as its all-lanes budget |
-| Max Agents Overall | Twice that (12 at the default); go higher only once a shared admission proxy enforces provider limits |
+| Max Agents Per Thread | The installer's `THREAD_CAP` (default 15), which the roster uses as its all-lanes budget |
+| Max Agents Overall | Twice that (30 at the default); provider-lane budgets still apply across threads |
 | Allow model overrides | On (lets you name a model no profile pins; the skill passes none otherwise) |
 | Scout model | `glm-5.3-flash` (Z.AI Coding Plan), effort high |
 | Worker model | `k3` (Kimi Code), effort high |
@@ -502,6 +502,22 @@ The report preserves finder/vetter/adjudicator identities, rejected and unresolv
 and coverage gaps. Review setup and any tests use disposable snapshots as needed;
 the skill requires source and your checkout to remain unchanged.
 
+After adjudication, both review modes use the same publication contract when
+submission is authorized: actionable findings request changes with the findings
+in the review body; no findings approve, normally without a body; nits only
+approve with the nits in that same body, explicitly stating they do not block
+merging. Incomplete reviews or changed base/head comparisons hold submission.
+Each result produces one review and no separate nit comments. Publication
+rechecks the target, binds the review to the frozen head, verifies the receipt,
+and checks for duplicates before retrying an uncertain submission.
+
+The shared [review voice](skills/pr-review/references/review-voice.md) governs
+review bodies and ordinary review-flow messages. It captures Randy's direct,
+concise cadence with professional grammar and no profanity. Its
+[source coverage](skills/pr-review/references/review-voice-sources.md) records
+the assessment across both machines and connected sources, including sampling
+and access gaps. Private conversations and email text are not bundled.
+
 ```mermaid
 flowchart TD
   U["You: /pr-review PR or range"] --> T["Pin comparison and freeze source<br/>measure changed files and hunks"]
@@ -527,10 +543,7 @@ Each PR gets one eligible strong reviewer within roster budgets, followed by
 top-level orchestrator vetting and adjudication. This mode does not require a
 separate cross-family vet. It remains read-only until you explicitly authorize
 publication; test execution also requires authorization and a disposable copy.
-Complete reviews with no actionable findings approve without a body; confirmed
-actionable findings request changes. Incomplete evidence holds approval. Reviews
-use your supplied voice or the bundled plain engineering rules, and publication
-rechecks the target and binds the review to the frozen head commit.
+It follows the same three publication outcomes and shared voice described above.
 
 ### Orchestrate
 
@@ -694,9 +707,9 @@ on `PATH` shadows.
 
 ## Limits
 
-- Budgets are enforced per orchestrator thread by instruction, not by Delta.
+- Provider budgets are enforced per orchestrator thread by instruction, not by Delta.
   A shared admission proxy (per-provider concurrency, window budgets,
-  429-aware queueing) is what makes higher Max Agents Overall safe.
+  429-aware queueing) is needed to enforce provider-wide budgets across threads.
 - Delta records tracked files and untracked files that Git does not ignore;
   ignored build output does not merge back from isolated workers. Untracked,
   non-ignored artifacts do, which is why every block requires a clean
