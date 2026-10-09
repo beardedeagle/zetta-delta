@@ -103,6 +103,24 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(json.loads(result.stdout)["pull_requests"][0]["owner_review"])
 
+    def test_deleted_reviewers_do_not_change_owner_eligibility(self):
+        deleted_before = dict(review(99, submitted="2026-10-09T09:00:00Z"), user=None)
+        deleted_after = dict(review(100, submitted="2026-10-09T11:00:00Z"), user=None)
+        for prior, expected in ((None, "new"), (review(), "unchanged"), (review(commit=OLD), "changed")):
+            pages = [[deleted_before], [] if prior is None else [prior], [deleted_after]]
+            replies = {**self.explicit(pages), PULLS + "?state=open&per_page=100": [[pull(12)]],
+                       "orgs/fixture/repos?type=all&per_page=100": [[{"full_name": REPO}]]}
+            for scope in ("explicit", "repository", "organization"):
+                with self.subTest(classification=expected, scope=scope):
+                    args = ("--pr", "12") if scope == "explicit" else ()
+                    result = self.run_intake(replies, *args, org="fixture" if scope == "organization" else None)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    data = json.loads(result.stdout)
+                    group = data["repositories"][0] if scope == "organization" else data
+                    entry = group["pull_requests"][0]
+                    self.assertEqual((entry["classification"], entry["review_required"]), (expected, expected != "unchanged"))
+                    self.assertEqual(entry["owner_review"]["id"] if prior else entry["owner_review"], 1 if prior else None)
+
     def test_explicit_list_deduplicates_and_does_not_enumerate_repository(self):
         replies = self.explicit([[]])
         replies.update({f"{PULLS}/18": pull(18), f"{PULLS}/18/reviews?per_page=100": [[review(state="CHANGES_REQUESTED")]]})
@@ -212,10 +230,19 @@ else:
     def test_bad_owner_review_metadata_never_guesses_eligibility(self):
         for field, value, message in (("commit_id", None, "commit_id"), ("submitted_at", None, "submitted_at"),
                                       ("submitted_at", "bad", "submitted_at"), ("submitted_at", "2026-10-09T10:00:00", "timezone"),
-                                      ("id", True, "review id"), ("state", "UNKNOWN", "review state"), ("user", None, "author")):
+                                      ("id", True, "review id"), ("state", "UNKNOWN", "review state")):
             with self.subTest(field=field, value=value):
                 bad = dict(review(), **{field: value})
                 self.assert_failure(self.run_intake(self.explicit([[bad]]), "--pr", "12"), message)
+
+    def test_missing_or_malformed_review_authors_hold_intake(self):
+        missing = review()
+        del missing["user"]
+        bad_reviews = [missing] + [dict(review(), user=user) for user in
+                                   ({}, {"login": None}, {"login": ""}, "owner", [], True)]
+        for bad in bad_reviews:
+            with self.subTest(review=bad):
+                self.assert_failure(self.run_intake(self.explicit([[bad]]), "--pr", "12"), "author")
 
     def test_auth_json_pagination_and_pr_metadata_failures_hold_intake(self):
         for replies, message in (({"user": {"_error": "not authenticated"}}, "not authenticated"),

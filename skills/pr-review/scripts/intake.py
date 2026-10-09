@@ -50,8 +50,12 @@ def sha(value, field):
 def latest_review(reviews, owner):
     completed = []
     for review in reviews:
-        if not isinstance(review, dict) or not isinstance(review.get("user"), dict):
+        if not isinstance(review, dict) or "user" not in review:
             raise ValueError("invalid review or review author")
+        if review["user"] is None:
+            continue
+        if not isinstance(review["user"], dict):
+            raise ValueError("invalid review author")
         login = text(review["user"].get("login"), "review author")
         if login.casefold() != owner.casefold():
             continue

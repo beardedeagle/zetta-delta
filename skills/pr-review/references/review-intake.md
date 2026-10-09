@@ -37,8 +37,10 @@ run. An empty collection means no work.
 Owner means the authenticated invoking user returned by `gh api user`, not the
 repository owner or PR author. Select that user's latest submitted, non-dismissed
 review by `submitted_at`, breaking ties with review ID. APPROVED,
-CHANGES_REQUESTED, and COMMENTED count; PENDING and DISMISSED do not. Missing or
-invalid owner review metadata holds intake rather than silently skipping.
+CHANGES_REQUESTED, and COMMENTED count; PENDING and DISMISSED do not. Reviews
+with an explicitly null `user` (such as a deleted reviewer) cannot be owner
+reviews and are ignored. Missing or malformed review authors and invalid owner
+review metadata hold intake rather than silently skipping.
 
 The helper returns the repository, authenticated owner, and each PR's number,
 URL, title, author, base/head SHAs, classification, `review_required`, and latest
