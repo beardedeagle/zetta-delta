@@ -1,7 +1,7 @@
 ---
 name: pr-review-batch
 description: >-
-  Batch review of PRs in one repo: an explicit list (space/comma-separated or bulleted numbers/URLs), or a bare $ORG/$REPO string meaning "all open PRs I have not yet reviewed at their current head". One strong reviewer per PR, top-level orchestrator inline vetting/adjudication, then one GitHub review per PR (approve / request changes). Use for /pr-review with multiple PRs, "review these PRs", or any multi-PR review request. Single PR or commit range routes to the pr-review skill.
+  Batch review of PRs: an explicit list (space/comma-separated or bulleted numbers/URLs), a bare $ORG/$REPO string for all open PRs in that repo, or an explicit org:name target for all open PRs across visible organization repositories. Skip PRs already reviewed by the owner at their current head. One strong reviewer per eligible PR, top-level orchestrator inline vetting/adjudication, then one authorized GitHub review per PR (approve / request changes). Use for /pr-review with multiple PRs, repository or organization targets, "review these PRs", or any multi-PR review request. Single PR or commit range routes to the pr-review skill.
 ---
 
 # Batch PR Review
@@ -54,36 +54,32 @@ Accept PR inputs as any of:
 - space-separated numbers/URLs;
 - comma-separated numbers/URLs;
 - a markdown/bulleted list;
-- a mixed list, as long as every item maps unambiguously to repository + PR number.
+- a mixed list, as long as every item maps unambiguously to repository + PR number;
+- an explicit `org:<name>` target for every open PR across accessible repositories
+  in that organization.
 
-Read `references/repositories.md` to normalize each input to `owner/repo#number`
-using verified remotes and GitHub metadata. Group multiple repositories separately.
+Read `references/repositories.md` to resolve collection targets and normalize
+explicit PRs to `owner/repo#number` using verified remotes and GitHub metadata.
+Group multiple repositories separately.
 Ask only if repository, PR, or comparison semantics remain ambiguous.
 
-### Whole-repo intake (`$ORG/$REPO` with no PR list)
-
-A bare `owner/repo` (or `~/`-relative path to a local clone, resolved via its source remote) means "every open PR that needs my review":
-
-1. Enumerate all open PRs with `rtk proxy gh api --paginate 'repos/<owner>/<repo>/pulls?state=open&per_page=100'; echo "exit=$?"`.
-   Record each number, title, author, and `head.sha` as `headRefOid`; do not use
-   `gh pr list`'s default result cap as the complete inventory.
-2. Resolve the invoking user once with `rtk proxy gh api user --jq .login; echo "exit=$?"`.
-   For each PR, read every page with `rtk proxy gh api --paginate 'repos/<owner>/<repo>/pulls/<n>/reviews?per_page=100'; echo "exit=$?"`.
-   Select that user's latest submitted, non-dismissed review by `submitted_at`
-   (break ties with `id`) and use its `commit_id`. PENDING and DISMISSED reviews
-   do not count as a completed current-head review. A missing commit or failed
-   enumeration is a classification gap; never guess unchanged or silently skip.
-3. Classify:
-   - no review from the user → **new**: full review.
-   - user's latest review commit == current `headRefOid` → **unchanged**: skip, do nothing (no re-post, no comment).
-   - head has moved since the user's latest review → **changed**: full re-review of the complete current comparison (merge-base → current head), not delta-only. New commits can interact with old code; partial deltas miss that.
-4. Show the classification table in this thread (PR, head OID, class: new/changed/unchanged) before dispatching reviewers. Skipped PRs get no GitHub activity.
-5. Publication of new/changed reviews follows the normal authorization rules below; unchanged PRs are never touched.
+Read `references/review-intake.md` and run its shared helper for every repository
+group before review setup or any subagent launch. This is required for explicit
+lists, whole-repo requests, and explicit `org:<name>` targets. A bare `owner/repo`
+or clone path means all open PRs; explicit lists classify only the named PRs. For
+`org:<name>`, run the helper once with `--org <name>` and retain its repository
+groups, including empty ones. Require successful intake for the entire requested
+collection and show its classification table before dispatch. Report the
+authenticated account and visible-repository scope; do not claim access to hidden
+repositories. Review only new/changed PRs; unchanged PRs get no subagents or
+GitHub activity. If all are unchanged or the collection is empty, stop.
 
 ## Review unit per PR
 
-Freeze each PR through GitHub metadata: repository, base/head OIDs, and fork
-identity. Verify those commits in the disposable repository, compute their
+Freeze each eligible PR through GitHub metadata: repository, base/head OIDs, and
+fork identity. Require the live base/head OIDs to match intake before dispatch;
+if either moved during setup, rerun that group's intake and rebuild affected
+snapshots/plans. Verify those commits in the disposable repository, compute their
 merge-base, and use that same diff-base/head pair for name-status, numstat, the
 full patch, and every assignment. Never substitute a moving `gh pr diff`.
 Verify the snapshot's target HEAD and clean status before dispatch. Start from
@@ -180,7 +176,8 @@ same body. Incomplete review or a moved comparison holds submission.
 
 For the batch, report:
 
-1. PR list and frozen base/head OIDs;
+1. requested scope, authenticated account, visible-repository coverage, intake
+   classifications, skipped PRs, and eligible PRs' frozen base/head OIDs;
 2. each PR's final decision: approved / changes requested / incomplete / not posted;
 3. submitted event, review body if any, reviewed head and receipt URL for each
    posted review, or the precise reason submission was held/not authorized;

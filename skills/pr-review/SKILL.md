@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Thorough Delta review of ONE PR or commit range using independent configured model-family perspectives, workload-sized dispatch waves, cross-family vetting, and explicit orchestrator adjudication of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review" for a single target. Multiple PRs or a repository-only request route to the pr-review-batch skill instead.
+description: Thorough Delta review of ONE PR or commit range using independent configured model-family perspectives, workload-sized dispatch waves, cross-family vetting, and explicit orchestrator adjudication of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review" for a single target. Multiple PRs, repository-only requests, or explicit org:name targets route to the pr-review-batch skill instead.
 disable-model-invocation: true
 ---
 
@@ -106,14 +106,25 @@ Codex agent APIs or invent tool arguments. Never switch the top-level model.
 ### Resolve the repository
 
 Read `references/repositories.md` for PR URLs, numbers, repository slugs, local
-clone paths, and unambiguous shorthand. Multiple PRs or a repository-only request
-route to `pr-review-batch`; this skill freezes one PR or commit range.
+clone paths, and unambiguous shorthand. Multiple PRs, repository-only requests,
+or explicit `org:<name>` targets route to `pr-review-batch`; this skill freezes
+one PR or commit range.
+
+### Check PR eligibility before dispatch
+
+For a PR target, read `references/review-intake.md` and run its shared helper
+before review setup or any subagent launch. Require successful classification:
+new/changed PRs proceed to a full review; unchanged PRs stop with no subagents or
+GitHub activity. This applies even when the user explicitly names the PR. Ranges,
+branches, and working changes without a PR continue directly below.
 
 ### Resolve the requested comparison
 
 - **PR number or URL:** resolve the repository and fetch metadata using
   `rtk proxy gh pr view <pr> --repo <owner/repo> --json url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository,headRepositoryOwner; echo "exit=$?"`.
-  Pin the returned base/head OIDs, including fork heads. Reuse existing objects read-only;
+  Require the returned base/head OIDs to match intake before dispatch; if either
+  moved during setup, rerun intake and rebuild the frozen comparison. Pin the
+  matching OIDs, including fork heads. Reuse existing objects read-only;
   if any are missing, fetch only necessary refs into a standalone disposable repository
   with its own Git metadata. Verify fetched OIDs and calculate their merge-base there.
   Review merge-base to the pinned PR head. Generate the patch locally from these

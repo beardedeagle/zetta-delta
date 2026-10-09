@@ -61,6 +61,7 @@ class ProtocolAcceptance(unittest.TestCase):
                 text = path.read_text()
                 self.assertIn('references/review-publication.md', text)
                 self.assertIn('references/review-voice.md', text)
+                self.assertIn('references/review-intake.md', text)
                 self.assertNotIn('## Publication decisions', text,
                                  'publication decisions belong to the shared reference')
 
