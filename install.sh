@@ -484,6 +484,7 @@ install_file() {
         -e "s|{{SKILL_DIR}}|$(sed_literal "$SKILL_DIR")|g" \
         -e "s|{{BON_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/bon.sh")")|g" \
         -e "s|{{IDENTITY_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/identity.py")")|g" \
+        -e "s|{{INTAKE_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/intake.py")")|g" \
         -e "s|{{IDENTITY_REGISTRY}}|$(sed_literal "$(shell_argument "$SKILL_DIR/references/identity-registry.json")")|g" \
         "$@" -- "$src" |
       if [[ $src == "$SCRIPT_DIR"/profiles/*.toml.tmpl ]]; then
@@ -940,6 +941,8 @@ write_bundle() {
   for skill in pr-review pr-review-batch; do
     SKILL_DIR="$SKILL_ROOT/$skill"
     install_file "$SCRIPT_DIR/skills/pr-review/references/repositories.md" "$SKILL_DIR/references/repositories.md"
+    install_file "$SCRIPT_DIR/skills/pr-review/references/review-intake.md" "$SKILL_DIR/references/review-intake.md" render
+    install_file "$SCRIPT_DIR/skills/pr-review/scripts/intake.py" "$SKILL_DIR/scripts/intake.py"
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice.md" "$SKILL_DIR/references/review-voice.md"
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice-sources.md" "$SKILL_DIR/references/review-voice-sources.md"
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-publication.md" "$SKILL_DIR/references/review-publication.md"

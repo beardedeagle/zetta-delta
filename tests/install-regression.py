@@ -160,6 +160,20 @@ class InstallerTests(unittest.TestCase):
         path = self.base / "skills with 'apostrophe' & space"
         models = self.base / "models.json"
         models.write_text(json.dumps([{"provider_id": "custom:k", "model_id": "k3"}]))
+        intake_bin = self.base / "intake-bin"
+        intake_bin.mkdir()
+        (intake_bin / "rtk").write_text('#!/bin/sh\n[ "$1" = proxy ] || exit 2\nshift\nexec "$@"\n')
+        pull = {"number": 12, "html_url": "https://github.com/fixture/project/pull/12", "title": "Fixture",
+                "user": {"login": "author"}, "base": {"sha": "b" * 40}, "head": {"sha": "a" * 40}}
+        (intake_bin / "gh").write_text(
+            '#!/bin/sh\ncase "$4" in\nuser) printf \'%s\\n\' \'{"login":"owner"}\';;\n'
+            '*reviews*) printf \'%s\\n\' \'[[]]\';;\n'
+            'orgs/*) printf \'%s\\n\' \'[[{"full_name":"fixture/project"}]]\';;\n'
+            '*state=open*) printf \'%s\\n\' ' + shlex.quote(json.dumps([[pull]])) + ';;\n'
+            '*) printf \'%s\\n\' ' + shlex.quote(json.dumps(pull)) + ';;\nesac\n')
+        for tool in intake_bin.iterdir():
+            tool.chmod(0o755)
+        intake_env = dict(self.env, PATH=str(intake_bin) + ":" + self.env["PATH"])
         for name in ("pr-review", "pr-review-batch"):
             with self.subTest(skill=name):
                 result = self.install("--force", "--skill-dir", str(path))
@@ -193,6 +207,32 @@ class InstallerTests(unittest.TestCase):
                 identity = json.loads("\n".join(lines))
                 self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"]),
                                  ("custom:k", "k3", "Kimi", "Kimi Code"))
+                self.assertIn("references/review-intake.md", body)
+                self.assertEqual((skill / "scripts/intake.py").read_bytes(),
+                                 (ROOT / "skills/pr-review/scripts/intake.py").read_bytes())
+                intake_reference = (skill / "references/review-intake.md").read_text()
+                self.assertNotIn("{{", intake_reference)
+                command = next(line for line in intake_reference.splitlines()
+                               if line.startswith("rtk proxy python3 "))
+                command = command.replace("<owner/repo>", "fixture/project").replace("<number>", "12")
+                result = subprocess.run(["/bin/sh", "-c", command], cwd=self.base,
+                                        env=intake_env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines.pop(), "exit=0", result.stdout + result.stderr)
+                classified = json.loads("\n".join(lines))["pull_requests"]
+                self.assertEqual([(pr["number"], pr["classification"], pr["review_required"]) for pr in classified],
+                                 [(12, "new", True)])
+                command = next(line for line in intake_reference.splitlines()
+                               if line.startswith("rtk proxy python3 ") and " --org " in line)
+                result = subprocess.run(["/bin/sh", "-c", command.replace("<organization>", "fixture")],
+                                        cwd=self.base, env=intake_env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines.pop(), "exit=0", result.stdout + result.stderr)
+                groups = json.loads("\n".join(lines))["repositories"]
+                self.assertEqual(groups[0]["repository"], "fixture/project")
+                self.assertEqual(groups[0]["pull_requests"][0]["classification"], "new")
 
     def test_missing_settings_and_runtime_tools_refuse_before_writes(self):
         settings = self.config / "settings.json"
