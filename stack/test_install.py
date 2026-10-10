@@ -9,6 +9,52 @@ import unittest
 REPO = Path(__file__).resolve().parent.parent
 
 
+class SembleInstallTests(unittest.TestCase):
+    def test_upgrade_source_survives_cleanup_and_reinstall(self):
+        with tempfile.TemporaryDirectory(prefix="semble-install-test-") as temp:
+            root = Path(temp).resolve()
+            binary = root / "bin"
+            binary.mkdir()
+            prefix = root / "prefix with spaces"
+            staging = root / "staging"
+            staging.mkdir()
+            receipt = root / "source-path"
+            env = {
+                "HOME": str(root / "home"), "PREFIX": str(prefix),
+                "TMPDIR": str(staging), "PATH": f"{binary}:/usr/bin:/bin:/usr/sbin:/sbin",
+                "TEST_RECEIPT": str(receipt),
+            }
+            for name, script in {
+                "git": '''#!/bin/bash
+if [[ $1 == -c ]]; then
+    mkdir -p -- "${@: -1}"
+    printf 'patched source\\n' > "${@: -1}/probe"
+elif [[ ${3:-} == rev-parse ]]; then
+    echo 24497845460960db1839c8485319df189a889225
+fi
+''',
+                "uv": '''#!/bin/bash
+source="${@: -1}"
+printf '%s\\n' "${source#*file://}" > "$TEST_RECEIPT"
+''',
+            }.items():
+                mock = binary / name
+                mock.write_text(script)
+                mock.chmod(0o755)
+            sources = []
+            for _ in range(2):
+                result = subprocess.run(["/bin/bash", str(REPO / "stack/install.sh"), "semble"],
+                                        env=env, text=True, capture_output=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                source = Path(receipt.read_text().strip())
+                self.assertTrue(source.is_relative_to(prefix), source)
+                self.assertEqual((source / "probe").read_text(), "patched source\n")
+                self.assertEqual(list(staging.iterdir()), [], "temporary checkout survived cleanup")
+                sources.append(source)
+            self.assertNotEqual(*sources, "reinstall reused the previous upgrade source")
+            self.assertTrue((sources[0] / "probe").is_file(), "reinstall removed the previous source")
+
+
 class CodegraphInstallTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="stack-install-test-")

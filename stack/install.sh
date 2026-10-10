@@ -139,9 +139,13 @@ install_cargo() { # $1=tool $2=crate folder inside the source
 }
 
 install_semble() { # the mcp extra keeps semble's MCP server working for other agents
-  local dir
+  local dir saved
   dir="$(fetch_source semble)"
-  uv tool install --force --quiet "semble[mcp] @ file://$dir"
+  # uv upgrades reuse this source path after the staging directory is deleted.
+  mkdir -p -- "$PREFIX/share/zetta-delta/semble"
+  saved="$(mktemp -d "$PREFIX/share/zetta-delta/semble/source.XXXXXX")"
+  mv -- "$dir" "$saved/semble"
+  uv tool install --force --quiet "semble[mcp] @ file://$saved/semble"
 }
 
 install_zvec_grep() { # pack the patched source under a stamped version, install it, pin the zg guard to it
