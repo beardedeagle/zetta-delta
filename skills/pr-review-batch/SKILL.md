@@ -71,8 +71,9 @@ or clone path means all open PRs; explicit lists classify only the named PRs. Fo
 groups, including empty ones. Require successful intake for the entire requested
 collection and show its classification table before dispatch. Report the
 authenticated account and visible-repository scope; do not claim access to hidden
-repositories. Review only new/changed PRs; unchanged PRs get no subagents or
-GitHub activity. If all are unchanged or the collection is empty, stop.
+repositories. Review only new/changed PRs; self-authored PRs (creator matches the
+authenticated review account) and unchanged PRs get no subagents or GitHub
+publication. If all are skipped or the collection is empty, stop.
 
 ## Review unit per PR
 

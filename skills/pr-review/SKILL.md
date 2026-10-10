@@ -114,8 +114,9 @@ one PR or commit range.
 
 For a PR target, read `references/review-intake.md` and run its shared helper
 before review setup or any subagent launch. Require successful classification:
-new/changed PRs proceed to a full review; unchanged PRs stop with no subagents or
-GitHub activity. This applies even when the user explicitly names the PR. Ranges,
+new/changed PRs proceed to a full review; self-authored PRs (creator matches the
+authenticated review account) and unchanged PRs stop with no subagents or GitHub
+publication. This applies even when the user explicitly names the PR. Ranges,
 branches, and working changes without a PR continue directly below.
 
 ### Resolve the requested comparison

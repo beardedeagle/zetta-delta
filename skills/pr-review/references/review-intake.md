@@ -29,14 +29,24 @@ private repositories, and archived repositories returned by GitHub; none are
 silently filtered. Coverage is limited to repositories visible to the
 authenticated account and its credentials. Report this scope in the thread;
 unlisted repositories are not evidence that the organization has no other PRs.
-The helper paginates all open PRs and all reviews, deduplicates explicit numbers,
-and emits JSON only after all lookups succeed, including every organization
-repository. A failed repository or review lookup holds the entire organization
-run. An empty collection means no work.
+The helper paginates all open PRs and other authors' PR review histories,
+deduplicates explicit numbers, and emits JSON only after all lookups succeed,
+including every organization repository. A failed repository or review lookup
+holds the entire organization run. An empty collection means no work.
 
 Owner means the authenticated invoking user returned by `gh api user`, not the
-repository owner or PR author. Select that user's latest submitted, non-dismissed
-review by `submitted_at`, breaking ties with review ID. APPROVED,
+repository owner. First compare each PR creator's login with that account,
+case-insensitively. Matching PRs are `self-authored` and skipped before review-history
+lookup or reviewer dispatch, including PRs opened by the orchestrator under that
+account. Keep them in the inventory with `review_required: false` and
+`owner_review: null` (history was not queried). Use the PR creator, not commit
+authorship or repository ownership. Missing or malformed PR authors hold intake.
+Validate authenticated, PR-author, and review-author logins before identity
+comparisons. Accept alphanumeric/hyphen GitHub names with an optional `[bot]`
+suffix; reject whitespace and control characters rather than trimming them.
+
+For other authors' PRs, select the owner's latest submitted, non-dismissed review
+by `submitted_at`, breaking ties with review ID. APPROVED,
 CHANGES_REQUESTED, and COMMENTED count; PENDING and DISMISSED do not. Reviews
 with an explicitly null `user` (such as a deleted reviewer) cannot be owner
 reviews and are ignored. Missing or malformed review authors and invalid owner
@@ -49,17 +59,19 @@ and a `repositories` list of those repository results; keep empty repository
 groups too. PR numbers and frozen comparisons remain scoped to their repository.
 Keep this evidence in the thread.
 
-| Latest completed owner review | Classification | Action |
+| Eligibility check (in order) | Classification | Action |
 |---|---|---|
-| None | new | Full review |
+| PR creator matches authenticated owner | self-authored | Skip; no reviewer or publication; no review-history lookup |
+| No completed owner review | new | Full review |
 | `commit_id` equals current head SHA | unchanged | Skip; no reviewer or GitHub activity |
 | `commit_id` differs from current head SHA | changed | Full review of the complete current comparison |
 
-Show a table for the entire requested collection (repository/PR, head SHA, prior
-review commit or none, classification) before dispatch. Only `review_required:
-true` entries may proceed. If all are unchanged, stop without subagents,
-comments, or review submissions. Explicitly naming an unchanged PR does not
-bypass eligibility. New/changed PRs still use the normal publication contract.
+Show a table for the entire requested collection (repository/PR, author, head SHA,
+prior review commit or not queried/none, classification) before dispatch. Only
+`review_required: true` entries may proceed. If all are self-authored or unchanged,
+stop without subagents, comments, or review submissions. Explicitly naming a
+skipped PR does not bypass eligibility. New/changed PRs still use the normal
+publication contract.
 
 ## Bind intake to review setup
 
