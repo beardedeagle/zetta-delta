@@ -485,6 +485,7 @@ install_file() {
         -e "s|{{BON_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/bon.sh")")|g" \
         -e "s|{{IDENTITY_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/identity.py")")|g" \
         -e "s|{{INTAKE_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/intake.py")")|g" \
+        -e "s|{{WORKFLOW_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/workflow.py")")|g" \
         -e "s|{{IDENTITY_REGISTRY}}|$(sed_literal "$(shell_argument "$SKILL_DIR/references/identity-registry.json")")|g" \
         "$@" -- "$src" |
       if [[ $src == "$SCRIPT_DIR"/profiles/*.toml.tmpl ]]; then
@@ -943,6 +944,13 @@ write_bundle() {
     install_file "$SCRIPT_DIR/skills/pr-review/references/repositories.md" "$SKILL_DIR/references/repositories.md"
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-intake.md" "$SKILL_DIR/references/review-intake.md" render
     install_file "$SCRIPT_DIR/skills/pr-review/scripts/intake.py" "$SKILL_DIR/scripts/intake.py"
+    install_file "$SCRIPT_DIR/skills/pr-review/scripts/workflow.py" "$SKILL_DIR/scripts/workflow.py"
+    install_file "$SCRIPT_DIR/skills/pr-review/scripts/handoff.py" "$SKILL_DIR/scripts/handoff.py"
+    install_file "$SCRIPT_DIR/skills/pr-review/scripts/preparation.py" "$SKILL_DIR/scripts/preparation.py"
+    install_file "$SCRIPT_DIR/skills/pr-review/scripts/publication.py" "$SKILL_DIR/scripts/publication.py"
+    install_file "$SCRIPT_DIR/skills/pr-review/scripts/review_contract.py" "$SKILL_DIR/scripts/review_contract.py"
+    install_file "$SCRIPT_DIR/stack/context-indexes/ensure-context-indexes.py" "$SKILL_DIR/scripts/ensure-context-indexes.py"
+    install_file "$SCRIPT_DIR/skills/pr-review/references/review-workflow.md" "$SKILL_DIR/references/review-workflow.md" render
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice.md" "$SKILL_DIR/references/review-voice.md"
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice-sources.md" "$SKILL_DIR/references/review-voice-sources.md"
     install_file "$SCRIPT_DIR/skills/pr-review/references/review-publication.md" "$SKILL_DIR/references/review-publication.md"

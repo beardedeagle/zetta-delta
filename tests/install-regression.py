@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Offline installer regressions; all writes stay under fresh temporary fixtures."""
+import hashlib
+import json
 import os
 import re
-import json
-import hashlib
-from pathlib import Path
 import shlex
 import shutil
 import subprocess
@@ -12,6 +11,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BASH = os.environ.get("BASH_BIN", "/bin/bash")
@@ -28,6 +28,9 @@ class InstallerTests(unittest.TestCase):
             shutil.copy2(ROOT / filename, self.bundle / filename)
         for directory in ("profiles", "rules", "skills", "scripts", "settings"):
             shutil.copytree(ROOT / directory, self.bundle / directory)
+        indexes = self.bundle / "stack/context-indexes"
+        indexes.mkdir(parents=True)
+        shutil.copy2(ROOT / "stack/context-indexes/ensure-context-indexes.py", indexes)
         self.home = self.base / "home"
         self.config = self.base / "delta"
         for directory in (self.home, self.config, self.base / "tmp", self.base / "state", self.base / "bin"):
@@ -55,7 +58,7 @@ class InstallerTests(unittest.TestCase):
     def install(self, *args, cwd=None, **extra):
         env = dict(self.env, **extra)
         return subprocess.run([BASH, str(self.bundle / "install.sh"), *args],
-                              cwd=cwd or self.base, env=env, text=True, capture_output=True)
+                              cwd=cwd or self.base, env=env, text=True, capture_output=True, check=False)
 
     def assertNoWrites(self):
         self.assertFalse((self.config / "profiles").exists())
@@ -150,7 +153,7 @@ class InstallerTests(unittest.TestCase):
         resolved = subprocess.run([sys.executable, str(skill / "scripts/identity.py"),
                                    "--models", str(models), "--registry", str(skill / "references/identity-registry.json"),
                                    "--provider", "custom:k", "--model", "k3"],
-                                  cwd=self.base, env=self.env, text=True, capture_output=True)
+                                  cwd=self.base, env=self.env, text=True, capture_output=True, check=False)
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
         identity = json.loads(resolved.stdout)
         self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"], identity["billing"], identity["limit"]),
@@ -163,25 +166,37 @@ class InstallerTests(unittest.TestCase):
         intake_bin = self.base / "intake-bin"
         intake_bin.mkdir()
         (intake_bin / "rtk").write_text('#!/bin/sh\n[ "$1" = proxy ] || exit 2\nshift\nexec "$@"\n')
-        pull = {"number": 12, "html_url": "https://github.com/fixture/project/pull/12", "title": "Fixture",
+        pull = {"number": 12, "html_url": "https://github.com/fixture/project/pull/12", "title": "Fixture", "body": "Intent",
                 "user": {"login": "author"}, "base": {"sha": "b" * 40}, "head": {"sha": "a" * 40}}
         (intake_bin / "gh").write_text(
             '#!/bin/sh\ncase "$4" in\nuser) printf \'%s\\n\' \'{"login":"owner"}\';;\n'
-            '*reviews*) printf \'%s\\n\' \'[[]]\';;\n'
+            '*reviews*|*comments*) printf \'%s\\n\' \'[[]]\';;\n'
             'orgs/*) printf \'%s\\n\' \'[[{"full_name":"fixture/project"}]]\';;\n'
             '*state=open*) printf \'%s\\n\' ' + shlex.quote(json.dumps([[pull]])) + ';;\n'
             '*) printf \'%s\\n\' ' + shlex.quote(json.dumps(pull)) + ';;\nesac\n')
         for tool in intake_bin.iterdir():
             tool.chmod(0o755)
         intake_env = dict(self.env, PATH=str(intake_bin) + ":" + self.env["PATH"])
+        checkout = self.base / "checkout"
+        checkout.mkdir()
+        for args in (("init", "-q", "-b", "main"), ("config", "user.name", "Fixture"),
+                     ("config", "user.email", "fixture@localhost")):
+            subprocess.run(["git", "-C", str(checkout), *args], env=intake_env, check=True, capture_output=True)
+        for text in ("base\n", "target\n"):
+            (checkout / "source.txt").write_text(text)
+            subprocess.run(["git", "-C", str(checkout), "add", "source.txt"], env=intake_env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "fixture"], env=intake_env, check=True, capture_output=True)
         for name in ("pr-review", "pr-review-batch"):
             with self.subTest(skill=name):
                 result = self.install("--force", "--skill-dir", str(path))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 skill = path / name
                 body = (skill / "SKILL.md").read_text()
-                roster = skill / re.search(r"Read `([^`]+)` relative", body).group(1)
-                reference = skill / re.search(r"follow `([^`]+)` before", body, re.I).group(1)
+                roster_match = re.search(r"Read `([^`]+)` relative", body)
+                reference_match = re.search(r"follow `([^`]+)` before", body, re.IGNORECASE)
+                assert roster_match is not None and reference_match is not None
+                roster = skill / roster_match.group(1)
+                reference = skill / reference_match.group(1)
                 self.assertEqual(roster.read_bytes(), (path / "orchestrate/references/roster.md").read_bytes())
                 for sibling in path.iterdir():
                     if sibling != skill:
@@ -200,7 +215,7 @@ class InstallerTests(unittest.TestCase):
                 command = (command.replace("<sanitized-models-json>", shlex.quote(str(models)))
                            .replace("<exact-provider-id>", "custom:k").replace("<exact-model-id>", "k3"))
                 resolved = subprocess.run(["/bin/sh", "-c", command], cwd=self.base, env=self.env,
-                                          text=True, capture_output=True)
+                                          text=True, capture_output=True, check=False)
                 self.assertEqual(resolved.returncode, 0, resolved.stderr)
                 lines = resolved.stdout.splitlines()
                 self.assertEqual(lines.pop(), "exit=0", resolved.stdout + resolved.stderr)
@@ -216,7 +231,7 @@ class InstallerTests(unittest.TestCase):
                                if line.startswith("rtk proxy python3 "))
                 command = command.replace("<owner/repo>", "fixture/project").replace("<number>", "12")
                 result = subprocess.run(["/bin/sh", "-c", command], cwd=self.base,
-                                        env=intake_env, text=True, capture_output=True)
+                                        env=intake_env, text=True, capture_output=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 lines = result.stdout.splitlines()
                 self.assertEqual(lines.pop(), "exit=0", result.stdout + result.stderr)
@@ -226,13 +241,72 @@ class InstallerTests(unittest.TestCase):
                 command = next(line for line in intake_reference.splitlines()
                                if line.startswith("rtk proxy python3 ") and " --org " in line)
                 result = subprocess.run(["/bin/sh", "-c", command.replace("<organization>", "fixture")],
-                                        cwd=self.base, env=intake_env, text=True, capture_output=True)
+                                        cwd=self.base, env=intake_env, text=True, capture_output=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 lines = result.stdout.splitlines()
                 self.assertEqual(lines.pop(), "exit=0", result.stdout + result.stderr)
                 groups = json.loads("\n".join(lines))["repositories"]
                 self.assertEqual(groups[0]["repository"], "fixture/project")
                 self.assertEqual(groups[0]["pull_requests"][0]["classification"], "new")
+                self.assertEqual((skill / "scripts/workflow.py").read_bytes(),
+                                 (ROOT / "skills/pr-review/scripts/workflow.py").read_bytes())
+                self.assertEqual((skill / "scripts/handoff.py").read_bytes(),
+                                 (ROOT / "skills/pr-review/scripts/handoff.py").read_bytes())
+                self.assertEqual((skill / "scripts/review_contract.py").read_bytes(),
+                                 (ROOT / "skills/pr-review/scripts/review_contract.py").read_bytes())
+                self.assertEqual((skill / "scripts/preparation.py").read_bytes(),
+                                 (ROOT / "skills/pr-review/scripts/preparation.py").read_bytes())
+                self.assertEqual((skill / "scripts/publication.py").read_bytes(),
+                                 (ROOT / "skills/pr-review/scripts/publication.py").read_bytes())
+                self.assertEqual((skill / "scripts/ensure-context-indexes.py").read_bytes(),
+                                 (ROOT / "stack/context-indexes/ensure-context-indexes.py").read_bytes())
+                workflow_reference = (skill / "references/review-workflow.md").read_text()
+                self.assertNotIn("{{", workflow_reference)
+                self.assertIn("references/review-workflow.md", body)
+                orchestrator = self.base / "orchestrator.json"
+                orchestrator.write_text(json.dumps({"provider_id": "custom:k", "model_id": "k3"}))
+                # Exercise the rendered tool command after every sibling skill
+                # was removed, including an install path with shell metacharacters.
+                command = next(line for line in workflow_reference.splitlines()
+                               if line.startswith("rtk proxy python3 ") and " create " in line)
+                run_directory = self.base / (name + "-run")
+                command = (command.replace("'<new-absolute-private-run-directory>'", shlex.quote(str(run_directory)))
+                           .replace("--method pr-review ", "--method " + name + " ")
+                           .replace("'<actual-parent-thread-id>'", "fixture-thread")
+                           .replace("'<verified-owner/repo>'", "fixture/project").replace("<number>", "12")
+                           .replace("'<sanitized-identity.json>'", shlex.quote(str(orchestrator))))
+                result = subprocess.run(["/bin/sh", "-c", command], cwd=self.base,
+                                        env=intake_env, text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines.pop(), "exit=0", result.stdout + result.stderr)
+                recorded = json.loads("\n".join(lines))
+                self.assertEqual(recorded["method"], name)
+                self.assertEqual(recorded["targets"][0]["next"]["code"], "prepare_source")
+                local_run = self.base / (name + "-local-run")
+                executable = [sys.executable, str(skill / "scripts/workflow.py"), "--run", str(local_run)]
+                legacy = self.home / ".local/share/zetta-delta/ensure-context-indexes.py"
+                legacy.parent.mkdir(parents=True, exist_ok=True)
+                legacy.write_text("raise RuntimeError('static preparation must use its bundled API')\n")
+                result = subprocess.run([*executable, "create", "--method", "pr-review", "--thread-id", "fixture-thread",
+                                         "--source", str(checkout), "--range", "HEAD~1..HEAD",
+                                         "--registry", str(skill / "references/identity-registry.json"),
+                                         "--orchestrator", str(orchestrator)], env=intake_env, text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = json.loads(result.stdout)
+                for operation in ("prepare", "finalize", "catalog"):
+                    extra = ["--roster", str(skill / "references/roster.md")] if operation == "catalog" else []
+                    result = subprocess.run([*executable, operation, "--target", "local", "--revision", str(state["revision"]), *extra],
+                                            env=intake_env, text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    state = json.loads(result.stdout)
+                self.assertTrue(state["targets"][0]["catalog"]["profiles"])
+                self.assertTrue(state["targets"][0]["catalog"]["units"])
+                frozen = state["targets"][0]["frozen"]
+                self.assertEqual(frozen["inventory"], ["source.txt"])
+                resource = Path(frozen["source_root"]).parent
+                self.assertIn(b"+target", (resource / "review.patch").read_bytes())
+                self.assertTrue((resource / "final-source-baseline.json").exists())
 
     def test_missing_settings_and_runtime_tools_refuse_before_writes(self):
         settings = self.config / "settings.json"
@@ -498,10 +572,10 @@ class InstallerTests(unittest.TestCase):
                                  {"model": provider + "/" + model, **effort})
 
     def test_builtin_explicit_efforts_validate_before_writes(self):
-        minimax = dict(MINIMAX_PROVIDER=self.catalog_id("minimax"), BUILTIN_WORKER_MODEL="MiniMax-M3",
-                       BUILTIN_WORKER_LANE="MiniMax", BUILTIN_WORKER_FAMILY="MiniMax")
-        qwen = dict(QWEN_PROVIDER=self.catalog_id("qwen"), BUILTIN_WORKER_MODEL="qwen3.8-max",
-                    BUILTIN_WORKER_LANE="Qwen Token Plan", BUILTIN_WORKER_FAMILY="Qwen")
+        minimax = {"MINIMAX_PROVIDER": self.catalog_id("minimax"), "BUILTIN_WORKER_MODEL": "MiniMax-M3",
+                       "BUILTIN_WORKER_LANE": "MiniMax", "BUILTIN_WORKER_FAMILY": "MiniMax"}
+        qwen = {"QWEN_PROVIDER": self.catalog_id("qwen"), "BUILTIN_WORKER_MODEL": "qwen3.8-max",
+                    "BUILTIN_WORKER_LANE": "Qwen Token Plan", "BUILTIN_WORKER_FAMILY": "Qwen"}
         for extra, effort in ((minimax, "high"), (minimax, "max"), (qwen, "high")):
             result = self.install("--force", BUILTIN_WORKER_EFFORT=effort, **extra)
             self.assertNotEqual(result.returncode, 0)
@@ -532,11 +606,13 @@ class InstallerTests(unittest.TestCase):
         result = self.install(PATH=path)
         self.assertEqual(result.returncode, 0, result.stderr)
         rules = (self.home / ".config/delta/AGENTS.md").read_text()
-        prefix = re.search(r"`(export PATH=.*?;)`", rules).group(1)
+        match = re.search(r"`(export PATH=.*?;)`", rules)
+        assert match is not None
+        prefix = match.group(1)
         command = prefix + ' githits; python3 -c "import tomllib"; printf "%s\\n" "$PATH"'
         ran = subprocess.run(["/bin/sh", "-e", "-c", command],
                              env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)},
-                             cwd=self.base, capture_output=True, text=True)
+                             cwd=self.base, capture_output=True, text=True, check=False)
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.splitlines()[0], "RUNTIME_OK")
         directories = ran.stdout.splitlines()[1].split(":")
@@ -545,16 +621,18 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn(str(ambient), directories)
         for name in ("worker", "reviewer", "scout", "qwen-max"):
             prompt = tomllib.loads((self.config / "profiles" / (name + ".toml")).read_text())["prompt"]
-            profile_prefix = re.search(r"`(export PATH=.*?;)`", prompt).group(1)
+            match = re.search(r"`(export PATH=.*?;)`", prompt)
+            assert match is not None
+            profile_prefix = match.group(1)
             profile_ran = subprocess.run(["/bin/sh", "-e", "-c", command.replace(prefix, profile_prefix, 1)],
                                         env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)},
-                                        cwd=self.base, capture_output=True, text=True)
+                                        cwd=self.base, capture_output=True, text=True, check=False)
             self.assertEqual(profile_ran.returncode, 0, profile_ran.stderr)
             self.assertEqual(profile_ran.stdout, ran.stdout)
 
     def test_bootstrap_orders_prerequisites_tools_and_configuration(self):
         stack = self.bundle / "stack"
-        stack.mkdir()
+        stack.mkdir(exist_ok=True)
         order = self.base / "tmp/order"
         (stack / "install.sh").write_text('#!/bin/sh\nprintf "STACK\\n" >> "$TMPDIR/order"\n')
         brew = self.base / "bin/brew"
@@ -563,12 +641,12 @@ class InstallerTests(unittest.TestCase):
         brew.chmod(0o755)
         env = {key: value for key, value in self.env.items() if key not in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER")}
         dry = subprocess.run([BASH, str(self.bundle / "bootstrap.sh"), "--dry-run"], env=env,
-                             cwd=self.base, text=True, capture_output=True)
+                             cwd=self.base, text=True, capture_output=True, check=False)
         self.assertEqual(dry.returncode, 0, dry.stderr)
         self.assertFalse(order.exists())
         self.assertNoWrites()
         ran = subprocess.run([BASH, str(self.bundle / "bootstrap.sh"), "--force"], env=env,
-                             cwd=self.base, text=True, capture_output=True)
+                             cwd=self.base, text=True, capture_output=True, check=False)
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(order.read_text().splitlines(), ["BREW", "STACK"])
         data = json.loads((self.config / "settings.json").read_text())
@@ -660,7 +738,7 @@ class InstallerTests(unittest.TestCase):
         profiles = self.config / "profiles"
         profiles.mkdir()
         for i in range(8):
-            (profiles / ("own-%d.toml" % i)).write_text("name='own'\n")
+            (profiles / f"own-{i}.toml").write_text("name='own'\n")
         result = self.install("--force")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(list(profiles.glob("*.toml"))), 8)
@@ -733,7 +811,7 @@ class InstallerTests(unittest.TestCase):
             resolved = subprocess.run([sys.executable, str(skill / "scripts/identity.py"),
                                        "--models", str(models), "--registry", str(registry),
                                        "--provider", provider, "--model", "default"],
-                                      cwd=self.base, env=self.env, text=True, capture_output=True)
+                                      cwd=self.base, env=self.env, text=True, capture_output=True, check=False)
             self.assertEqual(resolved.returncode, 0, resolved.stderr)
             self.assertEqual(json.loads(resolved.stdout)["family"], family)
 
@@ -748,7 +826,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         command = (path / "isolated/SKILL.md").read_text().strip()
         self.assertEqual(shlex.split(command), ["sh", str(path / "isolated/scripts/bon.sh"), "fixture-probe"])
-        ran = subprocess.run(["/bin/sh", "-c", command], env=self.env, cwd=self.base, capture_output=True, text=True)
+        ran = subprocess.run(["/bin/sh", "-c", command], env=self.env, cwd=self.base, capture_output=True, text=True, check=False)
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "HELPER_OK")
 
@@ -766,10 +844,10 @@ class InstallerTests(unittest.TestCase):
                    GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
                    GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
         initialized = subprocess.run(["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "init", str(checkout)],
-                                     env=env, text=True, capture_output=True)
+                                     env=env, text=True, capture_output=True, check=False)
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
         (checkout / "file.txt").write_text("fixture content\n")
-        snapshot = subprocess.run(["/bin/sh", "-c", command], env=env, cwd=checkout, text=True, capture_output=True)
+        snapshot = subprocess.run(["/bin/sh", "-c", command], env=env, cwd=checkout, text=True, capture_output=True, check=False)
         self.assertEqual(snapshot.returncode, 0, snapshot.stderr + snapshot.stdout)
         self.assertIn("RESULT: ok:", snapshot.stdout)
         self.assertIn("TREE=", snapshot.stdout)

@@ -3,7 +3,6 @@
 
 No provider requests, configuration writes, model-name heuristics, or credentials.
 """
-from __future__ import annotations
 
 import argparse
 import json
@@ -44,13 +43,13 @@ def resolve(models: object, registry: object, model: str, provider: str | None =
     if provider is not None:
         provider = text(provider, 'requested provider')
     if not isinstance(models, list) or not isinstance(registry, dict):
-        raise ValueError('models must be a list and registry must be an object')
+        raise ValueError('models must be a list and registry must be an object')  # noqa: TRY004 - validation errors retain the ValueError contract.
     if registry.get('version') != 1:
         raise ValueError('identity registry version must be 1')
     providers = {}
     for row in registry.get('providers', []):
         if not isinstance(row, dict):
-            raise ValueError('provider registry entry must be an object')
+            raise ValueError('provider registry entry must be an object')  # noqa: TRY004 - validation errors retain the ValueError contract.
         key = text(row.get('provider_id'), 'provider_id')
         if key in providers:
             raise ValueError('duplicate provider in registry')
@@ -63,7 +62,7 @@ def resolve(models: object, registry: object, model: str, provider: str | None =
     families = {}
     for row in registry.get('models', []):
         if not isinstance(row, dict):
-            raise ValueError('model registry entry must be an object')
+            raise ValueError('model registry entry must be an object')  # noqa: TRY004 - validation errors retain the ValueError contract.
         key = (text(row.get('provider_id'), 'family provider_id'),
                text(row.get('model_id'), 'model_id'))
         binding = text(row.get('family'), 'family')
@@ -76,7 +75,7 @@ def resolve(models: object, registry: object, model: str, provider: str | None =
     matches = []
     for row in models:
         if not isinstance(row, dict):
-            raise ValueError('Delta model metadata entry must be an object')
+            raise ValueError('Delta model metadata entry must be an object')  # noqa: TRY004 - validation errors retain the ValueError contract.
         key = (text(row.get('provider_id'), 'provider_id'), text(row.get('model_id'), 'model_id'))
         if key in seen:
             raise ValueError('duplicate provider/model in Delta metadata')

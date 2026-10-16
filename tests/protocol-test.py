@@ -17,13 +17,14 @@ BEST = ROOT / 'skills/orchestrate/references/best-of-n.md'
 ISOLATED = ROOT / 'skills/isolated/SKILL.md'
 ORCHESTRATE = ROOT / 'skills/orchestrate/SKILL.md'
 BATCH = ROOT / 'skills/pr-review-batch/SKILL.md'
+BATCH_NOTES = ROOT / 'skills/pr-review-batch/references/notes.md'
 REVIEW = ROOT / 'skills/pr-review/SKILL.md'
 PUBLICATION = ROOT / 'skills/pr-review/references/review-publication.md'
 
 
 def decisions(path, title):
     text = path.read_text()
-    match = re.search(r'^## ' + re.escape(title) + r'\n(.*?)(?=^## |\Z)', text, re.M | re.S)
+    match = re.search(r'^## ' + re.escape(title) + r'\n(.*?)(?=^## |\Z)', text, re.MULTILINE | re.DOTALL)
     if not match:
         raise AssertionError(f'{path.name}: missing operational decision table {title}')
     rows = [tuple(v.strip() for v in line.strip().strip('|').split('|'))
@@ -32,6 +33,38 @@ def decisions(path, title):
 
 
 class ProtocolAcceptance(unittest.TestCase):
+    def test_single_review_preserves_three_families_when_vetter_finds_spillover(self):
+        """Check reciprocal spillover vetting with the same three participants."""
+        rows = decisions(REVIEW, 'Finding routing')
+        self.assertEqual(rows, [
+            ('primary finder', 'primary vetter', 'orchestrator'),
+            ('primary vetter (spillover)', 'primary finder', 'orchestrator'),
+        ])
+        families = {
+            'primary finder': 'A',
+            'primary vetter': 'B',
+            'primary vetter (spillover)': 'B',
+            'orchestrator': 'C',
+        }
+        for finder, vetter, adjudicator in rows:
+            with self.subTest(finder=finder):
+                self.assertEqual(len({families[finder], families[vetter],
+                                      families[adjudicator]}), 3)
+
+    def test_batch_adjudication_preserves_parallel_exception_and_family_reuse(self):
+        rows = decisions(BATCH_NOTES, 'Batch adjudication decisions')
+        lookup = {(overlap, stand_in): (adjudicator, action)
+                  for overlap, stand_in, adjudicator, action in rows}
+        self.assertEqual(lookup[('no', 'not needed')], ('orchestrator', 'adjudicate'))
+        for activity in ('idle', 'active on another PR'):
+            with self.subTest(activity=activity):
+                self.assertEqual(lookup[('yes', 'eligible and capable; ' + activity)],
+                                 ('stand-in', 'adjudicate-in-parallel'))
+        for assessment in ('family already participated on this PR',
+                           'lower or unknown capability', 'unavailable or unknown identity'):
+            with self.subTest(assessment=assessment):
+                self.assertEqual(lookup[('yes', assessment)], ('none', 'hold affected PR'))
+
     def test_shared_publication_has_three_outcomes_and_holds_unsafe_submission(self):
         rows = decisions(PUBLICATION, 'Publication decisions')
         submissions = [(status, evidence, event, body)
@@ -62,6 +95,7 @@ class ProtocolAcceptance(unittest.TestCase):
                 self.assertIn('references/review-publication.md', text)
                 self.assertIn('references/review-voice.md', text)
                 self.assertIn('references/review-intake.md', text)
+                self.assertIn('references/review-workflow.md', text)
                 self.assertNotIn('## Publication decisions', text,
                                  'publication decisions belong to the shared reference')
 
@@ -115,8 +149,8 @@ class ProtocolAcceptance(unittest.TestCase):
                     task_env = dict(os.environ, HOME=str(tmp / 'home'),
                                     XDG_CACHE_HOME=str(tmp / 'cache'),
                                     GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
-                    def run(args):
-                        return subprocess.run(args, cwd=repo, env=task_env,
+                    def run(args, cwd=repo, env=task_env):
+                        return subprocess.run(args, cwd=cwd, env=env,
                                               text=True, capture_output=True, check=False)
                     for args in (['git', 'init', '-q'], ['git', 'config', 'user.email', 'fixture@example.invalid'],
                                  ['git', 'config', 'user.name', 'Fixture']):
@@ -129,8 +163,11 @@ class ProtocolAcceptance(unittest.TestCase):
                     before = run(['git', 'status', '--porcelain']).stdout
                     snapshot = run(['sh', str(BON), 'snapshot'])
                     self.assertEqual(snapshot.returncode, 0, snapshot.stdout + snapshot.stderr)
-                    run_id = re.search(r'^RUN=(.+)$', snapshot.stdout, re.M).group(1)
-                    tree = re.search(r'^TREE=(.+)$', snapshot.stdout, re.M).group(1)
+                    run_match = re.search(r'^RUN=(.+)$', snapshot.stdout, re.MULTILINE)
+                    tree_match = re.search(r'^TREE=(.+)$', snapshot.stdout, re.MULTILINE)
+                    assert run_match is not None and tree_match is not None
+                    run_id = run_match.group(1)
+                    tree = tree_match.group(1)
                     # Fill the command that the actual mode instructs its parent
                     # to execute, including the installer's quoted helper site.
                     filled = command.replace('{{BON_SH}}', "'" + str(BON).replace("'", "'\\''") + "'")

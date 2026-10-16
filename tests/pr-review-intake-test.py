@@ -3,14 +3,18 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "skills/pr-review/scripts/intake.py"
+sys.path.insert(0, str(HELPER.parent))
+import intake
+
 REPO = "fixture/project"
 PULLS = f"repos/{REPO}/pulls"
 HEAD = "a" * 40
@@ -20,13 +24,13 @@ BAD_LOGINS = (" owner ", "ow ner", "owner\n", "ow\nner", "owner\t", "ow\x00ner",
 
 def pull(number, head=HEAD, repo=REPO):
     return {"number": number, "html_url": f"https://github.com/{repo}/pull/{number}",
-            "title": f"PR {number}", "user": {"login": "author"},
+            "title": f"PR {number}", "body": "Intent and accepted constraints", "user": {"login": "author"},
             "base": {"sha": "b" * 40}, "head": {"sha": head}}
 
 
 def review(review_id=1, commit=HEAD, state="APPROVED", user="owner", submitted="2026-10-09T10:00:00Z"):
     return {"id": review_id, "commit_id": commit, "state": state,
-            "user": {"login": user}, "submitted_at": submitted}
+            "user": {"login": user}, "submitted_at": submitted, "body": ""}
 
 
 class IntakeTests(unittest.TestCase):
@@ -58,11 +62,19 @@ else:
                         INTAKE_CALLS=str(self.calls), INTAKE_REPLIES=str(self.replies))
 
     def run_intake(self, replies, *args, repo=REPO, org=None):
+        replies = dict(replies)
+        pulls = [row for value in replies.values() for page in (value if isinstance(value, list) else [[value]])
+                 for row in page if isinstance(row, dict) and "number" in row]
+        for row in pulls:
+            slug = row["html_url"].split("/")[-4:-2]
+            root = "repos/" + "/".join(slug)
+            replies.setdefault(f"{root}/issues/{row['number']}/comments?per_page=100", [[]])
+            replies.setdefault(f"{root}/pulls/{row['number']}/comments?per_page=100", [[]])
         self.replies.write_text(json.dumps({"user": {"login": "owner"}, **replies}))
         self.calls.unlink(missing_ok=True)
         scope = ["--repo", repo] if org is None else ["--org", org]
         return subprocess.run([sys.executable, str(HELPER), *scope, *args],
-                              env=self.env, text=True, capture_output=True)
+                              env=self.env, text=True, capture_output=True, check=False)
 
     def explicit(self, reviews):
         return {f"{PULLS}/12": pull(12), f"{PULLS}/12/reviews?per_page=100": reviews}
@@ -109,6 +121,30 @@ else:
                                          (18, "new", True))
                         self.assertIn(f"{PULLS}/18/reviews?per_page=100", endpoints)
 
+    def test_explicit_own_pr_override_captures_history_without_reopening_other_prs(self):
+        own = dict(pull(12), user={"login": "OwNeR"})
+        replies = {f"{PULLS}/12": own, f"{PULLS}/12/reviews?per_page=100": [[review()]],
+                   f"{PULLS}/18": pull(18), f"{PULLS}/18/reviews?per_page=100": [[review(2)]]}
+        result = self.run_intake(replies, "--pr", "12", "18", "--review-own-pr")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        own, other = json.loads(result.stdout)["pull_requests"]
+        self.assertEqual((own["classification"], own["review_required"]), ("self-authored-review", True))
+        self.assertEqual(own["owner_review"]["id"], 1)
+        self.assertEqual(own["discussion"]["snapshot"]["reviews"][0]["id"], 1)
+        self.assertFalse(own["discussion_decision_required"])
+        self.assertEqual((other["classification"], other["review_required"]), ("unchanged", False))
+
+    def test_own_pr_override_requires_explicit_numbers_before_any_lookup(self):
+        for org in (None, "fixture"):
+            with self.subTest(org=org):
+                result = self.run_intake({}, "--review-own-pr", org=org)
+                self.assert_failure(result, "requires --repo and explicit --pr")
+                self.assertFalse(self.calls.exists())
+        with patch.object(intake, "api") as api:
+            with self.assertRaisesRegex(ValueError, "explicit PR numbers"):
+                intake.intake(REPO, review_own_pr=True)
+            api.assert_not_called()
+
     def test_missing_or_malformed_pr_authors_hold_intake(self):
         missing = pull(18)
         del missing["user"]
@@ -137,8 +173,8 @@ else:
         self.assertEqual(entry["owner_review"]["state"], "COMMENTED")
 
     def test_other_authors_pending_and_dismissed_are_not_owner_reviews(self):
-        pages = [[review(user="author"), review(user="github-actions[bot]"), review(state="PENDING", submitted=None),
-                  review(state="DISMISSED", submitted=None)]]
+        pages = [[review(1, user="author"), review(2, user="github-actions[bot]"), review(3, state="PENDING", submitted=None),
+                  review(4, state="DISMISSED", submitted=None)]]
         result = self.run_intake(self.explicit(pages), "--pr", "12")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(json.loads(result.stdout)["pull_requests"][0]["owner_review"])
@@ -184,7 +220,9 @@ else:
         self.assertEqual([p["number"] for p in json.loads(result.stdout)["pull_requests"]], [12, 18])
         endpoints = [json.loads(line)[3] for line in self.calls.read_text().splitlines()]
         self.assertEqual(endpoints, ["user", f"{PULLS}/12", f"{PULLS}/18",
-                                     f"{PULLS}/12/reviews?per_page=100", f"{PULLS}/18/reviews?per_page=100"])
+                                     f"{PULLS}/12/reviews?per_page=100", f"repos/{REPO}/issues/12/comments?per_page=100",
+                                     f"{PULLS}/12/comments?per_page=100", f"{PULLS}/18/reviews?per_page=100",
+                                     f"repos/{REPO}/issues/18/comments?per_page=100", f"{PULLS}/18/comments?per_page=100"])
 
     def test_repository_inventory_and_reviews_use_all_pages_with_only_get_requests(self):
         replies = {PULLS + "?state=open&per_page=100": [[pull(12)], [pull(18)], [pull(23)]],
@@ -321,6 +359,54 @@ else:
             with self.subTest(repo=repo, numbers=numbers):
                 self.assert_failure(self.run_intake({}, "--pr", *numbers, repo=repo), "invalid" if repo == REPO else "verified owner/repo")
                 self.assertFalse(self.calls.exists())
+
+    def test_discussion_capture_includes_description_reviews_inline_replies_and_all_pages(self):
+        comment = {"id": 20, "user": {"login": "author"}, "body": "Risk accepted; declining the fix"}
+        reply = dict(comment, id=21, body="Caller guarantees nonempty input", path="src/a.py", line=None,
+                     original_line=42, in_reply_to_id=7, commit_id=OLD, diff_hunk="@@ evidence @@")
+        deleted = dict(comment, id=22, user=None, body="Deleted author's evidence")
+        result = self.run_intake({**self.explicit([[review()]]),
+            f"repos/{REPO}/issues/12/comments?per_page=100": [[comment], [deleted]],
+            f"{PULLS}/12/comments?per_page=100": [[], [reply]]}, "--pr", "12")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = json.loads(result.stdout)["pull_requests"][0]
+        self.assertFalse(entry["review_required"])
+        self.assertTrue(entry["discussion_decision_required"])
+        snapshot = entry["discussion"]["snapshot"]
+        self.assertEqual(snapshot["description"]["body"], pull(12)["body"])
+        self.assertEqual([row["id"] for row in snapshot["comments"]], [20, 22])
+        self.assertEqual(snapshot["review_comments"][0]["in_reply_to_id"], 7)
+        self.assertEqual(snapshot["reviews"][0]["id"], 1)
+        intake.validate_discussion(entry["discussion"])
+
+    def test_assessed_same_head_skips_only_the_same_owner_review_and_discussion(self):
+        snapshot = intake.discussion_record(pull(12), [review()], [], [])
+        previous = {"owner": "owner", "base_sha": "b" * 40, "head_sha": HEAD, "owner_review_id": 1,
+                    "discussion": snapshot, "prior_review": {"run_id": "prior-run"}}
+        responses = {"user": {"login": "owner"}, f"{PULLS}/12": pull(12),
+                     f"{PULLS}/12/reviews?per_page=100": [review()],
+                     f"repos/{REPO}/issues/12/comments?per_page=100": [], f"{PULLS}/12/comments?per_page=100": []}
+        cases = ((previous, responses, False),
+                 (dict(previous, owner="different"), responses, True),
+                 (dict(previous, owner_review_id=2), responses, True),
+                 (dict(previous, base_sha=OLD), responses, True),
+                 (previous, {**responses, f"{PULLS}/12": dict(pull(12), body="Edited explanation")}, True),
+                 (previous, {**responses, f"repos/{REPO}/issues/12/comments?per_page=100":
+                            [{"id": 2, "user": {"login": "author"}, "body": "Thanks!"}]}, True))
+        for baseline, replies, pending in cases:
+            with self.subTest(baseline=baseline, pending=pending), patch.object(intake, "api", side_effect=lambda endpoint, replies=replies, **_: replies[endpoint]):
+                entry = intake.intake(REPO, [12], baselines={REPO + "#12": baseline})["pull_requests"][0]
+                self.assertEqual(entry["discussion_decision_required"], pending)
+                self.assertFalse(entry["review_required"], "changed discussion must never launch a full review without judgment")
+
+    def test_discussion_failures_emit_no_partial_collection(self):
+        endpoint = f"repos/{REPO}/issues/12/comments?per_page=100"
+        for reply in ({"_error": "discussion unavailable"}, [[{"id": 1, "user": None}]],
+                      [[{"id": 1, "user": None, "body": "one"}], [{"id": 1, "user": None, "body": "two"}]]):
+            with self.subTest(reply=reply):
+                result = self.run_intake({**self.explicit([[]]), endpoint: reply}, "--pr", "12")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

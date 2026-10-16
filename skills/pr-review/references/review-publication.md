@@ -22,6 +22,9 @@ PR ends with the in-thread report.
 - Immediately before submission, re-fetch the PR's state and base/head OIDs.
   The PR must be open and match the frozen comparison. A changed base or head
   requires a new frozen comparison and re-review before any submission.
+- Re-fetch complete PR discussion. Changed discussion requires a recorded
+  judgment about finding additions, removals or severity changes. Nonmaterial
+  changes permit the completed review; material changes hold for re-review.
 - Read `review-voice.md` for the review body and ordinary review-flow messages.
   If the user requested review-before-post, show the exact body and event and
   wait for approval. Existing authorization for direct posting needs no extra
@@ -62,25 +65,23 @@ to internal skill outputs unless the user explicitly instructs otherwise.
 
 ## Submission and receipt
 
-Use GitHub's native REST review endpoint to create and submit the review in one
-request. Write a temporary JSON payload with `commit_id` equal to the frozen
-head, `event` selected above, and `body` only when needed. Binding `commit_id`
-prevents a concurrent push from silently retargeting the review.
+Use only the shared workflow's `preflight`/`publish`/`reconcile` commands,
+documented in `review-workflow.md`. The publisher owns completion and live gates,
+body bindings, private payload cleanup, durable intent before POST, and exact
+receipt readback. It creates and submits a review in one native REST request
+with the frozen `commit_id`; a concurrent push cannot retarget that review.
 
-```sh
-rtk proxy gh api --method POST 'repos/<owner>/<repo>/pulls/<n>/reviews' --input '<payload.json>'; echo "exit=$?"
-```
+When exact wording approval is required, show `preflight --draft`'s event/body
+and record `authorization.approved_review`. Direct-post authorization needs no
+additional approval. Models remain responsible for evidence, shared-root-cause
+judgments, natural prose, and clean language; structural checks do not prove them.
 
-Require command success and a returned review ID, URL, the expected `commit_id`,
-and state (`APPROVED` or `CHANGES_REQUESTED` matching the selected event). Do not
-claim publication based on attempted submission or a locally prepared payload.
-
-After a timeout, interrupted response, or otherwise uncertain result, read all
-pages of the PR's reviews before retrying. Match the authenticated author,
-frozen commit, state, and body against this attempted review. If it was submitted,
-report its receipt and do not duplicate it. If the outcome remains unknown,
-hold and report that uncertainty. An explicit rejection is a failure to resolve,
-not permission to substitute a comment or another event.
+Only `receipt_verified` establishes the tool's independent live readback.
+An attempted POST or legacy `receipt_recorded` does not establish it. Uncertain
+responses are reconciled against every review page and a unique new matching
+ID, followed by a GET of that exact ID. Pending attempts cannot POST again.
+Absence, ambiguity or unreadable evidence holds publication; an error never
+authorizes a comment or different event as a substitute.
 
 A later push leaves the review attached to its recorded head. Report it as
 superseded; never claim that the new head was reviewed. Include the final event,
