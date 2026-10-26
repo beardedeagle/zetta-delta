@@ -26,6 +26,8 @@ def endpoint(target: dict) -> tuple[str, str]:
         NeedsDecision: Local comparisons cannot publish GitHub reviews.
         ValueError: The intake URL does not identify the recorded PR.
     """
+    if "project" in target:
+        raise NeedsDecision("local_publication", "project reviews have no GitHub publication target")
     if "comparison" in target:
         raise NeedsDecision("local_publication", "local comparison has no GitHub PR publication target")
     return intake.pr_endpoint(target["repository"], target["intake"]["number"], target["intake"]["url"])

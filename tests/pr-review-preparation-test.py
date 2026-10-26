@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "skills/pr-review/scripts"
+SCRIPTS = ROOT / "review/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import preparation
 import workflow
@@ -1515,9 +1515,8 @@ class WorkflowPreparationTests(GitFixture):
         project = self.base / "native-project"
         self.git("clone", "-q", str(self.parent), str(project))
         parent, _, _ = self.native_clone("native-parent", project)
-        for name, root in (("native-project", project), ("native-parent", parent)):
-            result = self.operation("baseline", "--id", name, "--root", str(root))
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.operation("baseline", "--id", "native-parent", "--root", str(parent))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         _, run = workflow.load_run(self.directory / "run.json")
         captured = subprocess.run([sys.executable, str(SCRIPTS / "workflow.py"), "--run", str(self.directory),
                                    "native-parent", "--revision", str(run["revision"])],
@@ -1526,6 +1525,16 @@ class WorkflowPreparationTests(GitFixture):
         started = {"assignment_id": "review", "runtime_handle": "native-handle", "runtime_identity": MODEL,
                    "runtime_profile": "fixture", "runtime_evidence": "separate runtime route metadata"}
         self.assertEqual(self.record("started", started).returncode, 2)
+        blocked = self.operation("task", "--assignment", "review")
+        self.assertEqual(blocked.returncode, 2, blocked.stdout + blocked.stderr)
+        self.assertEqual(json.loads(blocked.stdout)["code"], "runtime_parent")
+        self.assertIn(str(project), json.loads(blocked.stdout)["reason"])
+        _, unissued = workflow.load_run(self.directory / "run.json")
+        self.assertNotIn("task_ready", unissued["targets"]["local"]["assignments"]["review"])
+        self.assertEqual(workflow.pending_launches(unissued), [])
+        self.assertFalse(list(self.directory.glob("handoff-*")))
+        result = self.operation("baseline", "--id", "native-project", "--root", str(project))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         task = self.operation("task", "--assignment", "review")
         self.assertEqual(task.returncode, 0, task.stdout + task.stderr)
         approval = workflow.load_run(self.directory / "run.json")[1]["targets"]["local"]["assignments"]["review"]["task_ready"]
@@ -1570,7 +1579,10 @@ class WorkflowPreparationTests(GitFixture):
             heading, body = evidence.stdout.split("\n", 1)
             self.assertIn("next_offset=done", heading)
             payload[section] = json.loads(body)
-        self.assertEqual(payload["report_template"]["assignment_id"], "review")
+        self.assertFalse(set(payload["report_template"]) & {"assignment_id", "target", "reviewer"})
+        _, current = workflow.load_run(self.directory / "run.json")
+        transport = workflow.handoff_task(self.directory, current, "local", "review")["report_template"]
+        self.assertEqual((transport["assignment_id"], transport["target"], transport["reviewer"]), ("review", frozen, identity))
         self.assertEqual(payload["target"], frozen)
         self.assertEqual(set(payload["categories"]), set(workflow.CATEGORIES))
         diff = subprocess.run(["/bin/sh", "-c", payload["diff_command"]], capture_output=True, check=False)

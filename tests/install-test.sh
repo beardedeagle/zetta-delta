@@ -21,7 +21,7 @@ download_residue() { find "$T/tmp" -mindepth 1 -maxdepth 1 -name 'zetta-delta.*'
 mkdir -p "$T/bin" "$T/home" "$T/tmp" "$T/delta"
 printf '{}\n' > "$T/delta/settings.json"
 ln -s "$PYTHON_BIN" "$T/bin/python3"
-for tool in gh rtk tgrep semble codegraph zg ctx7 githits caveman node; do
+for tool in gh rg rtk tgrep semble codegraph zg ctx7 githits caveman node; do
   printf '#!/bin/sh\nexit 0\n' > "$T/bin/$tool"
   chmod +x "$T/bin/$tool"
 done
@@ -86,9 +86,11 @@ check "piped install: adversarial skill" "$(cd "$T/home/.agents/skills/adversari
 check "piped install: isolated skill" "$(cd "$T/home/.agents/skills/isolated" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
   "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/roster.md ./scripts/bon.sh ./scripts/identity.py "
 check "piped install: pr-review skill" "$(cd "$T/home/.agents/skills/pr-review" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/repositories.md ./references/review-intake.md ./references/review-publication.md ./references/review-voice-sources.md ./references/review-voice.md ./references/review-workflow.md ./references/roster.md ./scripts/ensure-context-indexes.py ./scripts/handoff.py ./scripts/identity.py ./scripts/intake.py ./scripts/preparation.py ./scripts/publication.py ./scripts/review_contract.py ./scripts/workflow.py "
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/repositories.md ./references/review-intake.md ./references/review-publication.md ./references/review-voice-sources.md ./references/review-voice.md ./references/review-workflow.md ./references/roster.md ./scripts/identity.py ./scripts/intake.py ./scripts/workflow.py "
 check "piped install: pr-review-batch skill" "$(cd "$T/home/.agents/skills/pr-review-batch" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/notes.md ./references/repositories.md ./references/review-intake.md ./references/review-publication.md ./references/review-voice-sources.md ./references/review-voice.md ./references/review-workflow.md ./references/roster.md ./scripts/ensure-context-indexes.py ./scripts/handoff.py ./scripts/identity.py ./scripts/intake.py ./scripts/preparation.py ./scripts/publication.py ./scripts/review_contract.py ./scripts/workflow.py "
+  "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/notes.md ./references/repositories.md ./references/review-intake.md ./references/review-publication.md ./references/review-voice-sources.md ./references/review-voice.md ./references/review-workflow.md ./references/roster.md ./scripts/identity.py ./scripts/intake.py ./scripts/workflow.py "
+check "piped install: one shared review runtime" "$(cd "$T/home/.local/share/zetta-delta/review/scripts" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
+  "./ensure-context-indexes.py ./handoff.py ./identity.py ./intake.py ./preparation.py ./publication.py ./review_contract.py ./workflow.py "
 check "piped install: find-docs skill" "$(cmp -s "$ROOT/skills/find-docs/SKILL.md" "$T/home/.agents/skills/find-docs/SKILL.md" && echo same)" "same"
 check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/.agents/skills" \
   && cmp -s orchestrate/references/roster.md adversarial/references/roster.md \

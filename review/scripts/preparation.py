@@ -217,6 +217,340 @@ def fingerprint(value: dict) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
 
 
+def project_inventory(root: Path, exclusions: dict[str, str] | None = None,
+                      destination: Path | None = None) -> dict:
+    """Inventory current bytes without following links or opening special files.
+
+    Args:
+        root (Path): Canonical existing project directory.
+        exclusions (dict[str, str] | None): Explicit relative subtrees and reasons.
+        destination (Path | None): New private copy root, or None for observation.
+
+    Returns:
+        dict: Included entries, explicit exclusions and unsupported-entry gaps.
+
+    Raises:
+        OSError: A source entry cannot be read safely.
+        ValueError: A source entry changes while being copied.
+    """
+    exclusions = exclusions or {}
+    result: dict = {"entries": {}, "excluded": {}, "gaps": {}}
+    directories = []
+    if root.resolve(strict=True) != root or not root.is_dir():
+        raise ValueError("project inventory requires a canonical directory")
+    original = root.stat()
+
+    def excluded(relative: str) -> str | None:
+        if any(part.casefold() == ".git" for part in relative.split("/")):
+            return "Git metadata"
+        return next((reason for path, reason in exclusions.items()
+                     if relative == path or relative.startswith(path + "/")), None)
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    for directory, dirs, files_, descriptor in os.fwalk(root, follow_symlinks=False, onerror=fail):
+        relative_dir = Path(directory).relative_to(root)
+        for name in sorted(dirs + files_):
+            relative = (relative_dir / name).as_posix()
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            reason = excluded(relative)
+            if reason:
+                result["excluded"][relative] = reason
+                if name in dirs:
+                    dirs.remove(name)
+                continue
+            target = destination / relative if destination is not None else None
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISLNK(info.st_mode):
+                if name in dirs:
+                    dirs.remove(name)
+                link = os.readlink(name, dir_fd=descriptor)
+                try:
+                    resolved = (root / relative).resolve()
+                    safe = (not os.path.isabs(link) and resolved.is_relative_to(root)
+                            and excluded(resolved.relative_to(root).as_posix()) is None)
+                except (OSError, RuntimeError):
+                    safe = False
+                row = {"kind": "symlink", "mode": mode, "target": link}
+                if not safe:
+                    result["gaps"][relative] = dict(row, reason="absolute, escaping, cyclic or excluded link; not copied")
+                    continue
+                result["entries"][relative] = row
+                if target is not None:
+                    target.symlink_to(link)
+            elif stat.S_ISDIR(info.st_mode):
+                result["entries"][relative] = {"kind": "directory", "mode": mode}
+                if target is not None:
+                    target.mkdir(mode=0o700)
+                    directories.append((target, mode))
+            elif stat.S_ISREG(info.st_mode):
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+                with os.fdopen(fd, "rb") as source:
+                    before = os.fstat(source.fileno())
+                    if not stat.S_ISREG(before.st_mode) or (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino):
+                        raise ValueError("project file changed during capture")
+                    checksum = hashlib.sha256()
+                    with ExitStack() as stack:
+                        output = stack.enter_context(target.open("xb")) if target is not None else None
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            checksum.update(chunk)
+                            if output is not None:
+                                output.write(chunk)
+                    after = os.fstat(source.fileno())
+                    attributes = ("st_dev", "st_ino", "st_size", "st_mode", "st_mtime_ns", "st_ctime_ns")
+                    if any(getattr(before, attr) != getattr(after, attr) for attr in attributes):
+                        raise ValueError("project file changed during capture")
+                result["entries"][relative] = {"kind": "file", "mode": mode, "size": before.st_size,
+                                                "sha256": checksum.hexdigest()}
+                if target is not None:
+                    target.chmod(mode)
+            else:
+                result["gaps"][relative] = {"kind": "special", "mode": mode, "device": info.st_dev,
+                                            "inode": info.st_ino, "type": stat.S_IFMT(info.st_mode),
+                                            "reason": "nonregular filesystem entry; not copied"}
+        dirs.sort()
+    for path, mode in reversed(directories):
+        path.chmod(mode)
+    current = root.stat()
+    if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+        raise ValueError("project root moved during capture")
+    return result
+
+
+def cache_identity(root: Path) -> dict:
+    """Identify an existing disposable CodeGraph sidecar without opening SQLite.
+
+    Args:
+        root (Path): Canonical protected project root.
+
+    Returns:
+        dict: Stable identities for the root, cache directory, database and SHM;
+            empty when any entry is absent, redirected or unsafe.
+    """
+    result = {}
+    try:
+        for name in (".", ".codegraph", ".codegraph/codegraph.db", ".codegraph/codegraph.db-shm"):
+            path = root / name
+            info = path.lstat()
+            directory = name in (".", ".codegraph")
+            expected_kind = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+            if not expected_kind or path.resolve() != path or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                return {}
+            result[name] = [info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode), info.st_nlink]
+            if not directory:
+                result[name].append(info.st_size)
+        descriptor = os.open(root / ".codegraph/codegraph.db", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as database:
+            info = os.fstat(database.fileno())
+            actual = [info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode), info.st_nlink, info.st_size]
+            if actual != result[".codegraph/codegraph.db"] or database.read(16) != b"SQLite format 3\0":
+                return {}
+    except OSError:
+        return {}
+    return result
+
+
+def recover_cache(before: dict, current: dict, root: str) -> tuple[dict, list[dict]]:
+    """Compare original ledgers while auditing one identity-stable SHM change.
+
+    Args:
+        before (dict): Immutable baseline with explicit cache-recovery identities.
+        current (dict): Complete current ledger, including database/WAL and Git.
+        root (str): Canonical protected root for the audit receipt.
+
+    Returns:
+        tuple[dict, list[dict]]: Comparison ledger and exact before/after hashes.
+            Every other byte and metadata field retains its original comparison.
+    """
+    name = ".codegraph/codegraph.db-shm"
+    old, new = before["files"].get(name), current["files"].get(name)
+    if (not before.get("cache_identity") or before["cache_identity"] != current.get("cache_identity")
+            or not old or not new or old[:2] != new[:2] or old[0] != "file" or old == new):
+        return current, []
+    normalized = dict(current, files=dict(current["files"]))
+    normalized["files"][name] = old
+    return normalized, [{"root": root, "path": name, "before": old[2], "after": new[2]}]
+
+
+def project_baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies: tuple[dict, ...] = (),
+                     cache_recovery: bool = False) -> dict:
+    """Protect filesystem content and any existing Git administration separately.
+
+    Args:
+        root (Path): Canonical project or frozen filesystem root.
+        exclude (tuple[str, ...]): Owned index cache paths during setup only.
+        native_copies (tuple[dict, ...]): Exact registered native administration.
+        cache_recovery (bool): Capture identities for explicitly excluded CodeGraph
+            SHM metadata; default keeps legacy and reviewed-cache baselines strict.
+
+    Returns:
+        dict: Baseline with the existing file/Git ledger shape and root identity.
+
+    Raises:
+        OSError: Source content or administration is unreadable.
+        ValueError: Source or nested Git ownership is invalid.
+    """
+    copies = [row for row in native_copies if Path(row["root"]).is_relative_to(root)]
+    native_roots = [str(Path(row["root"]).relative_to(root)) for row in copies]
+    native_roots += [str(Path(row["git_dir"]).relative_to(root)) for row in native_copies
+                     if "clone_store" in row and Path(row["git_dir"]).is_relative_to(root)]
+    inventory = project_inventory(root, dict.fromkeys((*exclude, *native_roots), "owned runtime/cache path"))
+    ledger = {}
+    for name, row in {**inventory["entries"], **inventory["gaps"]}.items():
+        kind, mode = row["kind"], row["mode"]
+        ledger[name] = (["file", mode, row["sha256"]] if kind == "file" else
+                        ["link", mode, row["target"]] if kind == "symlink" else
+                        ["directory", mode] if kind == "directory" else ["special", row])
+    for row in copies:
+        for path, expected in row["created_dirs"].items():
+            absolute = Path(row.get("project_root", row["parent_root"])) / path
+            if absolute.is_relative_to(root) and ledger.get(str(absolute.relative_to(root))) == expected:
+                del ledger[str(absolute.relative_to(root))]
+    if (root / ".git").is_symlink():
+        raise ValueError("project Git metadata was redirected")
+    metadata = git_metadata(root, native_copies, allow_unborn=True) if (root / ".git").exists() else {}
+    stores = {Path(common_dir(root))} if metadata else set()
+    projects = [root]
+    for name, reason in inventory["excluded"].items():
+        checkout = (root / name).parent
+        if reason != "Git metadata" or checkout == root:
+            continue
+        captured = nested_git_metadata(checkout, stores, projects, native_copies, allow_unborn=True)
+        metadata.setdefault("nested", {})[str(checkout.relative_to(root))] = captured
+        stores.add(Path(captured["common_dir"]))
+        projects.append(checkout)
+    info = root.stat()
+    result = {"files": dict(sorted(ledger.items())), "git": metadata,
+              "root_identity": [info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)]}
+    if cache_recovery and (identities := cache_identity(root)):
+        result["cache_identity"] = identities
+    return result
+
+
+def prepare_project(directory: Path, run_id: str, key: str, target: dict, parent: Path,
+                    native_copies: tuple[dict, ...] = ()) -> dict:
+    """Capture a filesystem target in the existing private resource ownership.
+
+    Args:
+        directory (Path): Private run directory outside the project.
+        run_id (str): Owning run ID.
+        key (str): Target ID derived from its canonical root.
+        target (dict): Validated project request and exclusion rationale.
+        parent (Path): Recorded canonical project root.
+        native_copies (tuple[dict, ...]): Registered native bookkeeping.
+
+    Returns:
+        dict: Filesystem identity, complete manifest and owned artifact hashes.
+
+    Raises:
+        ValueError: Source, ownership or copy identity is invalid.
+        NeedsDecision: The original project changes during capture.
+        OSError: A required entry cannot be copied safely.
+    """
+    if parent != Path(target["project"]["source_root"]) or parent.resolve(strict=True) != parent:
+        raise ValueError("project source differs from its recorded canonical root")
+    if parent == directory or parent in directory.parents or directory in parent.parents:
+        raise ValueError("run and project directories must be separate")
+    exclusions = {row["path"]: row["reason"] for row in target["project"]["exclusions"]}
+    cache_recovery = any(name in exclusions for name in (".codegraph", ".codegraph/codegraph.db-shm"))
+    before = project_baseline(parent, native_copies=native_copies, cache_recovery=cache_recovery)
+    resource = directory / ("snapshot-" + uuid.uuid4().hex)
+    resource.mkdir(mode=0o700)
+    save(resource / "owner.json", {"run_id": run_id, "target": key, "resource": resource.name})
+    try:
+        source = resource / "source"
+        source.mkdir(mode=0o700)
+        manifest = project_inventory(parent, exclusions, source)
+        after = project_baseline(parent, native_copies=native_copies, cache_recovery=cache_recovery)
+        if before != recover_cache(before, after, str(parent))[0] or manifest != project_inventory(parent, exclusions):
+            raise NeedsDecision("source_integrity", "project changed during capture; preserve it and create a new run")
+        copied = project_inventory(source)
+        if copied["entries"] != manifest["entries"] or copied["gaps"] or copied["excluded"]:
+            raise ValueError("project snapshot does not match the captured manifest")
+        save(resource / "manifest.json", manifest)
+        save(resource / "parent-baseline.json", before)
+        source_baseline = project_baseline(source)
+        save(resource / "source-baseline.json", source_baseline)
+        return {"mode": "project", "source_root": str(source), "source_fingerprint": fingerprint(source_baseline),
+                "parent_root": str(parent), "parent_fingerprint": fingerprint(before), "manifest": manifest,
+                "manifest_fingerprint": fingerprint(manifest), "inventory": sorted(manifest["entries"]),
+                "preparation": {"resource": resource.name, "artifacts": {
+                    name: digest(resource / name) for name in ("owner.json", "manifest.json", "parent-baseline.json", "source-baseline.json")}}}
+    except BaseException:
+        remove_resource(owned(directory, resource.name, run_id, key))
+        raise
+
+
+def remove_resource(path: Path) -> None:
+    """Remove an authenticated private copy, including read-only directories.
+
+    Args:
+        path (Path): Run-owned resource or test copy, validated by its caller.
+
+    Raises:
+        ValueError: The resource root was redirected.
+        OSError: Private directories cannot be made removable or deleted.
+    """
+    if path.is_symlink() or path.resolve() != path:
+        raise ValueError("refuse removal of a redirected resource")
+    for _, _, _, descriptor in os.fwalk(path, follow_symlinks=False):
+        os.fchmod(descriptor, stat.S_IMODE(os.fstat(descriptor).st_mode) | 0o700)
+    shutil.rmtree(path)
+
+
+def validate_project_frozen(data: dict, target: dict) -> None:
+    """Validate filesystem identity during replay without inventing Git commits.
+
+    Args:
+        data (dict): Generated filesystem preparation/finalization record.
+        target (dict): Original canonical project request.
+
+    Raises:
+        ValueError: Identity, manifest or artifact bindings are inconsistent.
+    """
+    required = {"mode", "source_root", "source_fingerprint", "parent_root", "parent_fingerprint",
+                "manifest", "manifest_fingerprint", "inventory", "preparation"}
+    if set(data) != required or data["mode"] != "project" or data["parent_root"] != target["project"]["source_root"]:
+        raise ValueError("project preparation differs from its requested filesystem target")
+    for name in ("source_fingerprint", "parent_fingerprint", "manifest_fingerprint"):
+        if not isinstance(data[name], str) or not re.fullmatch(r"[0-9a-f]{64}", data[name]):
+            raise ValueError("project fingerprint must be SHA-256")
+    manifest = data["manifest"]
+    if (not isinstance(manifest, dict) or set(manifest) != {"entries", "excluded", "gaps"}
+            or any(not isinstance(row, dict) for row in manifest.values())
+            or fingerprint(manifest) != data["manifest_fingerprint"]
+            or data["inventory"] != sorted(manifest["entries"])):
+        raise ValueError("invalid complete project manifest")
+    for name, row in manifest["entries"].items():
+        relative_path(name)
+        if not isinstance(row, dict) or type(row.get("mode")) is not int or not 0 <= row["mode"] <= 0o7777:
+            raise ValueError("invalid project entry permissions")
+        if row.get("kind") == "file":
+            if (set(row) != {"kind", "mode", "size", "sha256"} or type(row["size"]) is not int or row["size"] < 0
+                    or not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])):
+                raise ValueError("invalid project file identity")
+        elif row.get("kind") == "directory":
+            if set(row) != {"kind", "mode"}:
+                raise ValueError("invalid project directory identity")
+        elif row.get("kind") == "symlink":
+            if set(row) != {"kind", "mode", "target"} or not isinstance(row["target"], str) or not row["target"] or "\0" in row["target"] or os.path.isabs(row["target"]):
+                raise ValueError("invalid project link identity")
+        else:
+            raise ValueError("unsupported included project entry")
+    proof = data["preparation"]
+    if (not isinstance(proof, dict) or set(proof) != {"resource", "artifacts"}
+            or not re.fullmatch(r"snapshot-[0-9a-f]{32}", proof["resource"])
+            or not isinstance(proof["artifacts"], dict)
+            or not {"owner.json", "manifest.json", "parent-baseline.json", "source-baseline.json"} <= proof["artifacts"].keys()
+            or Path(data["source_root"]).parent.name != proof["resource"]
+            or Path(data["source_root"]).name != "source" or not Path(data["source_root"]).is_absolute()):
+        raise ValueError("invalid owned project preparation")
+    for name, checksum in proof["artifacts"].items():
+        if Path(name).name != name or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise ValueError("invalid project artifact identity")
+
+
 def common_dir(root: Path) -> str:
     """Identify the actual shared Git store for a canonical checkout.
 
@@ -281,12 +615,13 @@ def clone_store_baseline(copy: dict) -> dict:
             "ref_store": proof["ref_store"]}
 
 
-def git_metadata(root: Path, native_copies: tuple[dict, ...] = ()) -> dict:
+def git_metadata(root: Path, native_copies: tuple[dict, ...] = (), *, allow_unborn: bool = False) -> dict:
     """Capture Git state shared by outer and owned nested checkouts.
 
     Args:
         root (Path): Canonical, ownership-validated checkout.
         native_copies (tuple[dict, ...]): Exact registered native ref exclusions.
+        allow_unborn (bool): Protect an uncommitted project without requiring HEAD.
 
     Returns:
         dict: Commit, refs and index/config/control-file content hashes.
@@ -303,7 +638,16 @@ def git_metadata(root: Path, native_copies: tuple[dict, ...] = ()) -> dict:
                         for copy in native_copies if "clone_store" in copy and copy["clone_store"]["ref_store"] == shared})
     refs = b"".join(line for line in refs.splitlines(keepends=True)
                     if native_refs.get(line.partition(b"\0")[0]) != line.partition(b"\0")[2].rstrip(b"\n"))
-    metadata = {"head": resolve(root, "HEAD"), "refs": hashlib.sha256(refs).hexdigest()}
+    try:
+        head = resolve(root, "HEAD")
+    except NeedsDecision:
+        if not allow_unborn:
+            raise
+        branch = git(root, "symbolic-ref", "HEAD").decode().strip()
+        if not branch.startswith("refs/heads/") or git(root, "for-each-ref", branch):
+            raise ValueError("project HEAD is neither a commit nor an unborn branch") from None
+        head = None
+    metadata = {"head": head, "refs": hashlib.sha256(refs).hexdigest()}
     if any(copy["root"] == str(root) for copy in native_copies):
         metadata["native_root"] = [stat.S_IMODE(root.stat().st_mode), shared or common_dir(root),
                                    str(Path(os.fsdecode(git(root, "rev-parse", "--absolute-git-dir").rstrip(b"\n"))).resolve()),
@@ -322,7 +666,8 @@ def git_metadata(root: Path, native_copies: tuple[dict, ...] = ()) -> dict:
     return metadata
 
 
-def nested_git_metadata(root: Path, stores: set[Path], projects: list[Path], native_copies: tuple[dict, ...]) -> dict:
+def nested_git_metadata(root: Path, stores: set[Path], projects: list[Path], native_copies: tuple[dict, ...],
+                        *, allow_unborn: bool = False) -> dict:
     """Bind nested Git administration only inside known ownership layouts.
 
     Args:
@@ -330,6 +675,7 @@ def nested_git_metadata(root: Path, stores: set[Path], projects: list[Path], nat
         stores (set[Path]): Already owned parent/module Git common directories.
         projects (list[Path]): Already validated containing checkout roots.
         native_copies (tuple[dict, ...]): Exact registered native administration.
+        allow_unborn (bool): Permit an uncommitted filesystem-review project.
 
     Returns:
         dict: Store ownership, marker permissions/content and full Git state.
@@ -378,7 +724,7 @@ def nested_git_metadata(root: Path, stores: set[Path], projects: list[Path], nat
             or common_dir(root) != str(common)):
         raise ValueError("nested Git checkout ownership changed")
     return {"git_dir": str(directory), "common_dir": str(common), "marker": binding,
-            "git": git_metadata(root, native_copies)}
+            "git": git_metadata(root, native_copies, allow_unborn=allow_unborn)}
 
 
 def baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies: tuple[dict, ...] = ()) -> dict:
@@ -531,7 +877,8 @@ def capture_runtime_copy(directory: Path, run_id: str, key: str, frozen: dict, r
     return copy
 
 
-def capture_baseline(directory: Path, key: str, root: Path, native_copies: tuple[dict, ...]) -> dict:
+def capture_baseline(directory: Path, key: str, root: Path, native_copies: tuple[dict, ...], *, filesystem: bool = False,
+                     cache_recovery: bool = False) -> dict:
     """Keep a compact baseline reference and private ledger for native bookkeeping.
 
     Args:
@@ -539,6 +886,8 @@ def capture_baseline(directory: Path, key: str, root: Path, native_copies: tuple
         key (str): Stable participating-copy ID.
         root (Path): Canonical Git checkout root.
         native_copies (tuple[dict, ...]): Existing validated administrative exceptions.
+        filesystem (bool): Protect a project parent without requiring a Git commit.
+        cache_recovery (bool): Retain identities for an explicitly excluded SHM file.
 
     Returns:
         dict: Root/fingerprint and generated ledger filename/checksum.
@@ -550,11 +899,15 @@ def capture_baseline(directory: Path, key: str, root: Path, native_copies: tuple
     """
     if directory == root or root in directory.parents:
         raise ValueError("run and baseline checkout must be separate")
-    ledger = baseline(root, native_copies=native_copies)
+    ledger = (project_baseline(root, native_copies=native_copies, cache_recovery=cache_recovery) if filesystem
+              else baseline(root, native_copies=native_copies))
     path = directory / ("baseline-" + uuid.uuid4().hex + ".json")
     save(path, ledger)
-    return {"id": key, "root": str(root), "fingerprint": fingerprint(ledger),
-            "artifact": path.name, "artifact_sha256": digest(path)}
+    result = {"id": key, "root": str(root), "fingerprint": fingerprint(ledger),
+              "artifact": path.name, "artifact_sha256": digest(path)}
+    if filesystem:
+        result["filesystem"] = True
+    return result
 
 
 def read_baseline(directory: Path, record: dict) -> dict:
@@ -924,6 +1277,10 @@ def prepare(directory: Path, run_id: str, key: str, target: dict, parent: Path,
         ValueError: Inputs or Git results are invalid.
         OSError: Snapshots or baselines cannot be created/read.
     """
+    if "project" in target:
+        if target["project"]["error"]:
+            raise NeedsDecision("project_source", target["project"]["error"])
+        return prepare_project(directory, run_id, key, target, parent, native_copies)
     before = baseline(parent, native_copies=native_copies)
     if parent == directory or parent in directory.parents or directory == parent or directory in parent.parents:
         raise ValueError("run and source directories must be separate")
@@ -970,7 +1327,7 @@ def prepare(directory: Path, run_id: str, key: str, target: dict, parent: Path,
                 "preparation": {"resource": resource.name, "artifacts": artifact_hashes,
                                 "baseline_head_sha": baseline_head, "staged_tree_sha": staged}}
     except BaseException:
-        shutil.rmtree(owned(directory, resource.name, run_id, key))
+        remove_resource(owned(directory, resource.name, run_id, key))
         raise
 
 
@@ -995,8 +1352,10 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
         dict: Actual integrity status and changed/unreadable components.
     """
     problems = []
+    cache_changes = []
     scans = observations if observations is not None else {}
-    def observe(root: str, exclude: tuple[str, ...] = (), *, native: bool = True) -> str:
+    def observe(root: str, exclude: tuple[str, ...] = (), *, native: bool = True, project: bool = False,
+                expected: dict | None = None) -> str:
         """Reuse a full-content scan within this observation command.
 
         Args:
@@ -1004,6 +1363,8 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             exclude (tuple[str, ...]): Explicit setup cache exclusions.
             native (bool): Normalize validated parent/copy bookkeeping; frozen
                 source observations always disable these exceptions.
+            project (bool): Use a filesystem baseline without requiring Git.
+            expected (dict | None): Verified original ledger for audited SHM recovery.
 
         Returns:
             str: Content and Git metadata fingerprint.
@@ -1012,30 +1373,43 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             ValueError: This root's baseline could not be captured.
         """
         copies = native_copies if native else ()
-        key = (root, exclude, fingerprint({"native_copies": copies}))
+        recover = project and bool((expected or {}).get("cache_identity"))
+        key = (root, exclude, fingerprint({"native_copies": copies}), project, recover)
         if key not in scans:
             try:
-                scans[key] = fingerprint(baseline(Path(root), exclude, native_copies=copies))
+                scans[key] = (project_baseline(Path(root), exclude, native_copies=copies, cache_recovery=recover)
+                              if project else baseline(Path(root), exclude, native_copies=copies))
             except (OSError, ValueError, KeyError, TypeError):
                 scans[key] = None
         if scans[key] is None:
             raise ValueError("source baseline is unreadable")
-        return scans[key]
+        current = scans[key]
+        if recover and expected is not None:
+            current, changes = recover_cache(expected, current, root)
+            for change in changes:
+                if change not in cache_changes:
+                    cache_changes.append(change)
+        return fingerprint(current)
 
     component = "unreadable or unowned preparation evidence"
     try:
         proof = frozen["preparation"]
         resource = owned(directory, proof["resource"], run_id, key)
         source = resource / "source"
-        if (frozen["source_root"] != str(source) or (source / ".git").is_symlink()
-                or not (source / ".git").is_dir()
+        project = frozen["mode"] == "project"
+        if (frozen["source_root"] != str(source) or source.resolve() != source or not source.is_dir()
+                or (project and ((source / ".git").exists() or (source / ".git").is_symlink()))
+                or (not project and ((source / ".git").is_symlink() or not (source / ".git").is_dir()
                 or (source / ".git/commondir").exists()
                 or (source / ".git/objects").resolve() != source / ".git/objects"
-                or (source / ".git/objects/info/alternates").exists()):
+                or (source / ".git/objects/info/alternates").exists()))):
             raise ValueError("source does not belong to this resource")
         for name, expected in proof["artifacts"].items():
-            if Path(name).name != name or (resource / name).is_symlink() or digest(resource / name) != expected:
+            if Path(name).name != name or (resource / name).is_symlink() or not (resource / name).is_file() or digest(resource / name) != expected:
                 problems.append("artifact:" + name)
+        if project and (json.loads((resource / "manifest.json").read_text()) != frozen["manifest"]
+                        or fingerprint(frozen["manifest"]) != frozen["manifest_fingerprint"]):
+            problems.append("manifest")
         for name in ("parent", "source"):
             component = name
             if name == "source" and setup:
@@ -1043,14 +1417,17 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                     if (source / cache).is_symlink():
                         raise ValueError("index cache was redirected")
             current = observe(frozen[name + "_root"],
-                              tuple(setup["cache_paths"]) if name == "source" and setup else (), native=name != "source")
+                              tuple(setup["cache_paths"]) if name == "source" and setup else (),
+                              native=name != "source", project=project,
+                              expected=json.loads((resource / (name + "-baseline.json")).read_text()) if project else None)
             if current != frozen[name + "_fingerprint"]:
                 problems.append(name)
         for name, record in baselines.items():
             component = "copy:" + name
+            expected = None
             if "artifact" in record:
-                read_baseline(directory, record)
-            if observe(record["root"]) != record["fingerprint"]:
+                expected = read_baseline(directory, record)
+            if observe(record["root"], project=record.get("filesystem", False), expected=expected) != record["fingerprint"]:
                 problems.append("copy:" + name)
         for record in native_copies:
             component = "native:" + record["root"]
@@ -1063,7 +1440,8 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                     scans[store_key] = fingerprint(clone_store_baseline(record))
                 if scans[store_key] != record["clone_store"]["fingerprint"]:
                     problems.append(component)
-        return {"status": "changed" if problems else "unchanged", "components": problems}
+        return {"status": "changed" if problems else "unchanged", "components": problems,
+                **({"cache_changes": cache_changes} if cache_changes else {})}
     except (OSError, ValueError, KeyError, TypeError):
         return {"status": "unknown", "components": list(dict.fromkeys(problems + [component]))}
 
@@ -1085,7 +1463,7 @@ def index_helper(*, bundled: bool = False) -> tuple[ModuleType, Path]:
     installed = Path.home() / ".local/share/zetta-delta/ensure-context-indexes.py"
     shipped = Path(__file__).with_name("ensure-context-indexes.py")
     if not shipped.is_file():
-        shipped = Path(__file__).resolve().parents[3] / "stack/context-indexes/ensure-context-indexes.py"
+        shipped = Path(__file__).resolve().parents[2] / "stack/context-indexes/ensure-context-indexes.py"
     path = installed if not bundled and installed.is_file() else shipped
     if not path.is_file():
         raise NeedsDecision("index_maintainer", "the trusted index maintainer API is unavailable; repair the project bundle separately")
@@ -1229,10 +1607,10 @@ def finalize(directory: Path, run_id: str, key: str, staged: dict, request: dict
             raise NeedsDecision("index_fallback", "choose static evidence for failed/unavailable indexes: " + ", ".join(unavailable))
         if fallback and (not isinstance(evidence, str) or not evidence.strip() or "\0" in evidence):
             raise ValueError("static fallback requires evidence of adequate source inspection")
-        current = baseline(source)
-        original_content = {"git": current["git"], "files": {
+        current = project_baseline(source) if staged["mode"] == "project" else baseline(source)
+        original_content = dict(current, files={
             path: value for path, value in current["files"].items()
-            if not any(path == cache or path.startswith(cache + "/") for cache in (request or {}).get("cache_paths", []))}}
+            if not any(path == cache or path.startswith(cache + "/") for cache in (request or {}).get("cache_paths", []))})
         observation = check(directory, run_id, key, staged, baselines or {}, setup=request, native_copies=native_copies)
         if fingerprint(original_content) != staged["source_fingerprint"]:
             observation = {"status": "changed", "components": list(dict.fromkeys(observation["components"] + ["source"]))}
@@ -1283,12 +1661,20 @@ def test_copy(directory: Path, run_id: str, key: str, frozen: dict) -> Path:
     resource = owned(directory, frozen["preparation"]["resource"], run_id, key)
     path = resource / ("test-" + uuid.uuid4().hex)
     try:
+        if frozen["mode"] == "project":
+            path.mkdir(mode=0o700)
+            setup = json.loads((resource / "index-result.json").read_text())["request"]
+            caches = dict.fromkeys((setup or {}).get("cache_paths", []), "owned index cache")
+            copied = project_inventory(resource / "source", caches, path)
+            if copied["entries"] != frozen["manifest"]["entries"] or copied["gaps"]:
+                raise ValueError("project test copy differs from the frozen manifest")
+            return path
         repository(path, resource / "source", [frozen["head_sha"]])
         git(path, "checkout", "--quiet", "--detach", frozen["head_sha"])
         return path
     except BaseException:
         if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
+            remove_resource(path)
         raise
 
 
@@ -1327,13 +1713,13 @@ def cleanup(directory: Path, run_id: str, key: str, request: dict | None = None,
     with ExitStack() as stack:
         for path in matches:
             setup = request if setup_resource in (None, path.name) else None
-            if (path / "source/.git").is_dir():
+            if (path / "manifest.json").is_file() or (path / "source/.git").is_dir():
                 if (path / "source/.git").is_symlink():
                     raise ValueError("refuse cleanup of redirected Git metadata")
                 stack.enter_context(idle_indexes(path / "source", setup))
             elif setup:
                 raise NeedsDecision("index_setup_pending", "index lifecycle evidence is missing; preserve the resource")
         for path in matches:
-            shutil.rmtree(path)
+            remove_resource(path)
     return [path.name for path in matches]
 

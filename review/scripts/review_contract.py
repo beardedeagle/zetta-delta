@@ -63,7 +63,7 @@ def report_check(errors: list[dict] | None, field: str) -> Generator[None, None,
 
 
 def identity_helper() -> ModuleType:
-    """Load the shared identity helper from the skill bundle or repository.
+    """Load the shared identity helper from the review runtime or repository.
 
     Returns:
         ModuleType: Shared effective-model identity helper.
@@ -73,7 +73,7 @@ def identity_helper() -> ModuleType:
         OSError: The helper source cannot be read.
     """
     local = Path(__file__).with_name("identity.py")
-    path = local if local.exists() else Path(__file__).parents[2] / "orchestrate/scripts/identity.py"
+    path = local if local.exists() else Path(__file__).parents[2] / "skills/orchestrate/scripts/identity.py"
     spec = importlib.util.spec_from_file_location("review_identity", path)
     if spec is None or spec.loader is None:
         raise ImportError("the shared identity helper cannot be loaded")
@@ -87,7 +87,9 @@ identity = identity_helper()
 
 def fields(value, required, optional=()):
     if not isinstance(value, dict) or not set(required) <= value.keys() or value.keys() - set(required) - set(optional):
-        raise ValueError("invalid record fields; expected " + ", ".join(required))
+        detail = ("; missing: " + ", ".join(sorted(set(required) - value.keys())) +
+                  "; unexpected: " + ", ".join(sorted(map(str, value.keys() - set(required) - set(optional))))) if isinstance(value, dict) else "; received " + type(value).__name__
+        raise ValueError("invalid record fields; expected " + ", ".join(required) + detail)
     return value
 
 
@@ -217,6 +219,21 @@ def change_sections(patch: bytes, changes: list[dict]) -> list[list[tuple[int, i
     return result
 
 
+def project_units(frozen: dict) -> dict:
+    """Derive exact file/metadata coverage from a captured filesystem manifest.
+
+    Args:
+        frozen (dict): Validated filesystem preparation.
+
+    Returns:
+        dict: Stable units covering every included manifest entry.
+    """
+    return {f"project-{number:06d}": {"paths": [path], "artifact": "manifest.json", "offset": 0,
+            "bytes": max(1, row.get("size", 0) + len(json.dumps(row, ensure_ascii=True).encode())),
+            "kind": "file" if row["kind"] == "file" else "metadata", "header": json.dumps(row, sort_keys=True)}
+            for number, (path, row) in enumerate(sorted(frozen["manifest"]["entries"].items()), 1)}
+
+
 def catalog(frozen: dict, roster: Path, registry: dict) -> dict:
     """Capture configured profiles and lossless patch units from sealed artifacts.
 
@@ -262,6 +279,9 @@ def catalog(frozen: dict, roster: Path, registry: dict) -> dict:
     if not profiles:
         raise ValueError("roster has no configured profiles")
     resource = Path(frozen["source_root"]).parent
+    if frozen["mode"] == "project":
+        return {"roster_path": str(roster.resolve()), "roster_sha256": hashlib.sha256(raw).hexdigest(),
+                "profiles": profiles, "units": project_units(frozen)}
     ledger = json.loads((resource / "inventory.json").read_bytes())
     units = {}
     labels = [("review", "changes")]
@@ -313,6 +333,10 @@ def validate_catalog(data: dict, frozen: dict, registry: dict) -> None:
             raise ValueError("catalog identity contradicts registry")
         strings(profile["roles"], "profile role")
         choice(profile["worktree"], ("shared", "isolated"), "profile worktree")
+    if frozen["mode"] == "project":
+        if data["units"] != project_units(frozen):
+            raise ValueError("project catalog must match every captured manifest entry")
+        return
     covered = set()
     for key, unit in data["units"].items():
         stable_id(key)
@@ -588,7 +612,8 @@ def plan(data: dict, target: dict, method: str, registry: dict, orchestrator: di
         ValueError: Decisions contradict the roster or coverage inventory.
     """
     decisions(data, ("required_perspectives", "boundary_evidence", "selection_evidence", "profiles",
-                     "coverage", "partitioned", "interactions", "context", "routing"), "review_plan")
+                     "coverage", "partitioned", "interactions", "context", "routing"), "review_plan",
+              ("cross_project",) if "project" in target else ())
     saved = target["catalog"]
     if saved is None:
         raise NeedsDecision("review_catalog", "capture the configured roster and frozen patch units before planning")
@@ -681,7 +706,8 @@ def plan(data: dict, target: dict, method: str, registry: dict, orchestrator: di
         raise NeedsDecision("interaction_plan", "partitioned review requires explicit end-to-end interaction questions")
     for key, row in data["interactions"].items():
         stable_id(key)
-        decisions(row, ("question", "units", "families", "shortfall"), "interaction_plan", nullable=("shortfall",))
+        decisions(row, ("question", "units", "families", "shortfall"), "interaction_plan",
+                  ("targets",) if "project" in target else (), nullable=("shortfall",))
         evidence(row["question"])
         if not set(strings(row["units"], "interaction unit")) <= set(saved["units"]):
             raise ValueError("interaction references an unknown unit")
@@ -689,6 +715,65 @@ def plan(data: dict, target: dict, method: str, registry: dict, orchestrator: di
         shortfall(row["shortfall"])
         if families != required:
             raise ValueError("every interaction must be assigned to the primary finder's family")
+
+
+def project_plan(run: dict, key: str, data: dict) -> None:
+    """Bind cross-project questions to every participating snapshot and unit.
+
+    Args:
+        run (dict): Shared target state, never a common-parent inferred scope.
+        key (str): Project owning the plan and its finding ledger.
+        data (dict): Proposed or immutable recorded analytical plan.
+
+    Raises:
+        NeedsDecision: Cross-project scope is unassessed or a snapshot is unavailable.
+        ValueError: An interaction refers to the wrong root, fingerprint or units.
+    """
+    decision = decisions(data.get("cross_project", {}), ("required", "evidence"), "project_interactions")
+    if type(decision["required"]) is not bool:
+        raise ValueError("cross-project requirement must be boolean")
+    evidence(decision["evidence"])
+    cross = False
+    for interaction in data["interactions"].values():
+        bindings = interaction.get("targets")
+        if bindings is None:
+            continue
+        if not isinstance(bindings, dict) or key not in bindings or len(bindings) < 2:
+            raise ValueError("cross-project interaction must include its owner and another project")
+        cross = True
+        for target_id, binding in bindings.items():
+            fields(binding, ("frozen", "units"))
+            target = run["targets"].get(target_id)
+            if target is None or "project" not in target:
+                raise ValueError("cross-project interaction refers to an unknown project")
+            if target["frozen"] is None or target["catalog"] is None or target["resources_removed"]:
+                raise NeedsDecision("project_snapshot", "prepare and retain every involved project's frozen source and catalog")
+            if (binding["frozen"] != target["frozen"] or not set(strings(binding["units"], "project interaction unit",
+                    empty=not target["catalog"]["units"])) <= set(target["catalog"]["units"])):
+                raise ValueError("cross-project binding differs from its frozen project or units")
+            if target_id == key and set(binding["units"]) != set(interaction["units"]):
+                raise ValueError("cross-project owner units differ from its interaction scope")
+    if cross != decision["required"]:
+        raise NeedsDecision("project_interactions", "record required cross-project contracts, or explicitly justify their absence")
+
+
+def related_targets(target: dict) -> dict:
+    """Return immutable foreign bindings from the owning project's plan.
+
+    Args:
+        target (dict): Project with its frozen analytical plan.
+
+    Returns:
+        dict: Participating target IDs mapped to their complete frozen records.
+    """
+    result = {}
+    for row in (target["plan"] or {}).get("interactions", {}).values():
+        for key, binding in row.get("targets", {}).items():
+            if binding["frozen"] != target["frozen"]:
+                if key in result and result[key] != binding["frozen"]:
+                    raise ValueError("conflicting cross-project source bindings")
+                result[key] = binding["frozen"]
+    return result
 
 
 def assignment(data: dict, target: dict, effective: dict, method: str, registry: dict) -> None:
@@ -799,7 +884,7 @@ def references(value: object, *, errors: list[dict] | None = None, field: str = 
     for index, row in enumerate(value if isinstance(value, list) else ()):
         label = f"{field}/{index}"
         with report_check(errors, label):
-            decisions(row, ("path", "line", "side", "relation", "evidence"), "reference_evidence")
+            decisions(row, ("path", "line", "side", "relation", "evidence"), "reference_evidence", ("target_id",))
         if not isinstance(row, dict):
             continue
         with report_check(errors, label + "/path"):
@@ -812,6 +897,56 @@ def references(value: object, *, errors: list[dict] | None = None, field: str = 
             choice(row.get("relation"), ("trigger", "caller", "contract", "consequence", "test", "anchor"), "evidence relation")
         with report_check(errors, label + "/evidence"):
             evidence(row.get("evidence"))
+        if "target_id" in row:
+            with report_check(errors, label + "/target_id"):
+                stable_id(row["target_id"])
+
+
+def project_evidence(target: dict, data: dict) -> None:
+    """Require project citations to address the correct captured source roots.
+
+    Args:
+        target (dict): Owning filesystem target and immutable interaction plan.
+        data (dict): Reviewer report or a separate final judgment.
+
+    Raises:
+        ValueError: A citation uses a base side, wrong root or unbound location.
+    """
+    rows = []
+    for name in ("findings", "verdicts", "adjudications"):
+        values = data.get(name)
+        if isinstance(values, list):
+            rows.extend(values)
+    if "finding_id" in data:
+        rows = [data]
+    if "project" not in target:
+        for row in rows:
+            refs = row.get("references") if isinstance(row, dict) else None
+            if isinstance(refs, list) and any(isinstance(ref, dict) and "target_id" in ref for ref in refs):
+                raise ValueError("cross-project reference bindings require a filesystem project")
+        return
+    owner = target["project"]["id"]
+    bindings = {owner: target["frozen"], **related_targets(target)}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if "path" in row and (row.get("side") != "target" or row["path"] not in target["frozen"]["manifest"]["entries"]):
+            raise ValueError("project finding must anchor in its owning frozen filesystem")
+        reference_ids = set()
+        for reference in row.get("references", []) if isinstance(row.get("references"), list) else []:
+            if not isinstance(reference, dict):
+                continue
+            key = reference.get("target_id", owner)
+            if not isinstance(key, str):
+                raise ValueError("invalid project reference target")  # noqa: TRY004 - retain aggregated draft validation.
+            frozen = bindings.get(key)
+            if frozen is None or reference.get("side") != "target" or reference.get("path") not in frozen["manifest"]["entries"]:
+                raise ValueError("project reference does not bind a captured target path")
+            reference_ids.add(key)
+        original = target["findings"].get(row.get("finding_id"))
+        required = {ref.get("target_id", owner) for ref in (original or {}).get("references", [])}
+        if not required <= reference_ids:
+            raise ValueError("cross-project judgment must cite every involved original target")
 
 
 def unit_root(target: dict, row: dict) -> dict:
@@ -1313,6 +1448,9 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
         raise ValueError("task blocks require a queued assignment and existing resources")
     validate_tests(row, target)
     frozen = target["frozen"]
+    project = "project" in target
+    if project:
+        project_plan(run, key, target["plan"])
     units = {unit: target["catalog"]["units"][unit] for unit in row["units"]}
     tests = row["test_plan"]
     run_argument = shlex.quote(str(directory if directory is not None else Path(frozen["source_root"]).parent.parent))
@@ -1326,16 +1464,26 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
                "workload": row["workload"], "categories": CATEGORY_CHECKLIST,
                "test_commands": [f'cd {shlex.quote(tests["root"])} && {command}; echo "exit=$?"' for command in tests["commands"]],
                "test_evidence": tests["evidence"], "test_plan": tests}
-    if not replay:
+    if project:
+        payload.pop("diff_command")
+        payload["manifest_command"] = f'rtk proxy cat {shlex.quote(str(Path(frozen["source_root"]).parent / "manifest.json"))}'
+        payload["related_targets"] = related_targets(target)
+        payload["report_template"]["related_targets"] = payload["related_targets"]
+    if not replay and not project:
         payload["source_git_prefix"] = f'GIT_OPTIONAL_LOCKS=0 rtk git --no-pager -c core.fsmonitor=false -C {shlex.quote(frozen["source_root"])}'
-        payload["source_search_prefix"] = "rtk proxy tgrep --no-index"
+    if not replay:
+        payload["source_search_command"] = (f"rtk proxy python3 {script} --run {run_argument} source-search"
+                                            f" --target {shlex.quote(key)} --assignment {shlex.quote(assignment_id)}")
+        payload["source_read_command"] = (f"rtk proxy python3 {script} --run {run_argument} source-read"
+                                          f" --target {shlex.quote(key)} --assignment {shlex.quote(assignment_id)}")
     if target["intake"].get("discussion") is not None:
         payload["pr_discussion"] = target["intake"]["discussion"]
         payload["discussion_decision"] = target["discussion_decision"]
         payload["prior_review"] = target["intake"].get("prior_review")
-    artifacts = sorted({unit["artifact"] for unit in units.values()} | {"review.patch"})
-    payload["complete_patch_commands"] = {artifact: f'rtk proxy cat {shlex.quote(str(Path(frozen["source_root"]).parent / artifact))}; echo "exit=$?"'
-                                          for artifact in artifacts}
+    if not project:
+        artifacts = sorted({unit["artifact"] for unit in units.values()} | {"review.patch"})
+        payload["complete_patch_commands"] = {artifact: f'rtk proxy cat {shlex.quote(str(Path(frozen["source_root"]).parent / artifact))}; echo "exit=$?"'
+                                              for artifact in artifacts}
     template = payload["report_template"]
     template.update(status=None, evidence="", source_status=None)
     payload["severity_values"] = SEVERITIES
@@ -1389,31 +1537,56 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
         f"Use original finding IDs <unit>-NN. Severity must be one of {', '.join(SEVERITIES)}; nit is optional (at most five). Keep actual finder provenance; spillover is a new original finding.",
         "done requires all assigned units/interactions, category evidence and unchanged source. Missing evidence requires partial/blocked, never guessed certainty.",
     )
+    if project:
+        rules = (rules[0], "Verify captured filesystem identity and every related target before reading; use each explicit source root.",
+                 "The manifest defines complete current-file coverage, exclusions and unsupported-entry gaps. Read assigned files in bounded portions and trace callers/contracts.",
+                 "Existing defects are in scope. Review current behavior across all nine categories without a changed-line or introduction-date requirement.",
+                 "Cross-project interactions bind every participating snapshot; never substitute a common parent or another root with identical content.",
+                 *rules[5:])
     startup_rules = () if replay else (
-        "Startup/setup is already complete for the sealed source. Do not run SessionStart maintenance, build/refresh indexes, create caches, or clean/rebaseline that source, even if general profile startup rules suggest it. Use source_git_prefix for Git reads and source_search_prefix with flags, --, pattern and the absolute root for static searches. Use prepared indexes only through a read-only route that cannot start a writer; otherwise inspect statically. Unexpected changes hold the run and must be preserved.",
+        "Startup/setup is already complete for the sealed source. Do not run SessionStart maintenance, build/refresh indexes, create caches, or clean/rebaseline that source. Use source_git_prefix for Git reads and source_search_command with --pattern='<literal>', optional --regex and relative --path for searches; it owns the source root, flags and argument separator. Failed/interrupted searches require a successful --retry-of '<search-id>' or an explicit material coverage gap in a non-done report. Never treat errors as absence. Prepared indexes require a read-only route that cannot start a writer. Preserve unexpected changes.",
     )
+    if project and not replay:
+        startup_rules = ("Setup is complete. Do not build indexes, create caches, run Git commands or rebaseline reviewed snapshots. Use source_search_command with --pattern='<literal>', optional --regex and relative --path; do not append raw flags or a source root. Errors require a successful --retry-of '<search-id>' or an explicit material gap in a non-done report, never an absence claim. Inspect statically when an index cannot cover the manifest.",)
     specific = ("Investigate independently; no other discovery reports or consensus are supplied." if row["kind"] == "discovery" else
                 "Check every finder family differs from yours. Reproduce or trace each claim independently; return exactly one CONFIRMED/ADJUSTED/REJECTED/UNVERIFIABLE verdict per assigned raw ID with claim, severity/category, independent references and fix assessment.")
     report_fields = "assignment_id,status,target,reviewer,checked,checked_units,checked_interactions,categories,verification,coverage_gaps,pre_existing,learned,findings,verdicts,evidence,source_status"
+    if not replay:
+        payload["report_template"] = handoff.author_template(template)
+        if isinstance(finding_template := payload.get("finding_template"), dict):
+            finding_template.pop("finder", None)
+        report_fields = ",".join(name for name in report_fields.split(",") if name not in ("assignment_id", "target", "reviewer"))
     prefix = {"discovery": "REVIEW-PR ", "vet": "VET ", "adjudication": "ADJUDICATE "}[row["kind"]]
+    if project and row["kind"] == "discovery":
+        prefix = "REVIEW-PROJECT "
     task = prefix + row["id"] + "\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-    task += "\nREPORT BINDING: Return one JSON object. Start with report_template and add the required report fields from your own observations. Preserve assignment_id exactly, without the task heading. target is the complete frozen object, including preparation and every nested field; target_id is only a routing label and cannot replace it. reviewer is the complete identity object, not a model-name string; it must match separately recorded runtime evidence. The template supplies bindings only, never completion or verification evidence."
+    task += ("\nREPORT BINDING: Return one JSON object. Start with report_template and add the required report fields from your own observations. Preserve assignment_id exactly, without the task heading. target is the complete frozen object, including preparation and every nested field; target_id is only a routing label and cannot replace it. reviewer is the complete identity object, not a model-name string; it must match separately recorded runtime evidence. The template supplies bindings only, never completion or verification evidence." if replay else
+             "\nREPORT BINDING: Start with report_template, which contains only author-supplied judgments. The engine binds assignment_id, target, reviewer, related_targets, finder in findings and assignment_id in verdicts/adjudications. Omit those reserved fields from your judgment file; keep all analytical observations and existing finding IDs unchanged.")
     task += "\nREPORT TYPES: Replace null/empty judgment placeholders with your own observations; an unfilled template is not a valid completed report. Every evidence field is a nonempty string, including top-level evidence, not a list. Claim, trigger, impact, fix, fix_assessment, argument_assessment, reason and root_cause are strings. Severity must use severity_values exactly. Retain existing originals and provenance exactly. References are objects with a positive integer line and string evidence."
+    if project:
+        task += ("\nPROJECT BINDINGS: Preserve related_targets from the template." if replay else "\nPROJECT BINDINGS: The engine supplies related_targets.")
+        task += " Reference side is target only; omit target_id for the owning project, or supply the exact related target_id for a foreign source. Cross-project vet/final judgments must cite every target referenced by the original claim. Project results remain local assessments; no PR approval or merge verdict applies."
     if row["kind"] == "adjudication":
         task += "\nRULES:\n" + "\n".join("- " + rule for rule in (rules[0], rules[1], rules[4], rules[5], rules[6], *startup_rules))
         task += "\nIndependently assess each original claim and vet argument against the frozen code. Your family must differ from both. Preserve IDs/provenance; do not discover replacement findings or alter original reports. Unresolved evidence remains UNVERIFIABLE/UNVETTED/DISPUTED."
-        task += "\nREPORT JSON FIELDS: assignment_id,status,target,reviewer,adjudications,evidence,source_status. Copy target exactly; reviewer must match recorded runtime identity. done requires one decision per assigned ID and unchanged sources."
-        task += "\nadjudications: [{finding_id,assignment_id,disposition: CONFIRMED|ADJUSTED|REJECTED|UNVERIFIABLE|UNVETTED|DISPUTED,severity,category,claim,fix_assessment,argument_assessment,evidence,reason,root_cause,references}]. references: [{path,line,side: base|target,relation: anchor|trigger|caller|contract|consequence|test,evidence}]."
+        task += ("\nREPORT JSON FIELDS: assignment_id,status,target,reviewer,adjudications,evidence,source_status. Copy target exactly; reviewer must match recorded runtime identity." if replay else "\nREPORT JSON FIELDS: status,adjudications,evidence,source_status.")
+        task += " done requires one decision per assigned ID and unchanged sources."
+        task += "\nadjudications: [{finding_id," + ("assignment_id," if replay else "") + "disposition: CONFIRMED|ADJUSTED|REJECTED|UNVERIFIABLE|UNVETTED|DISPUTED,severity,category,claim,fix_assessment,argument_assessment,evidence,reason,root_cause,references}]. references: [{path,line,side: base|target,relation: anchor|trigger|caller|contract|consequence|test,evidence}]."
     else:
         task += "\nRULES:\n" + "\n".join("- " + rule for rule in (*rules, *startup_rules, specific))
         task += "\nREPORT JSON FIELDS: " + report_fields
-        task += "\nNew findings use finding_template with the complete finder identity object, not an assignment ID or model-name string; replace NN with digits."
+        task += ("\nNew findings use finding_template with the complete finder identity object, not an assignment ID or model-name string; replace NN with digits." if replay else "\nNew findings use finding_template; replace NN with digits and omit finder. The engine preserves retained provenance and binds only new claims to you.")
         task += "\nchecked is a list of checked scope paths, not prose; checked_units and checked_interactions are lists of assigned IDs. Categories map to {status: checked|not-applicable|gap, evidence}; verification is {results: [{command,root,exit_code,evidence}], not_run: reason|null}. Include only executed assigned tests in results: copy command verbatim from test_plan.commands and root from test_plan.root, with integer exit_code and observed evidence. Do not include Git reads, searches or patch reads as test results; put their evidence in category or top-level evidence strings. If every assigned test ran, not_run is null; otherwise explain omissions."
-        task += "\nfindings: [{id,finder,severity,category,path,line,side,trigger,impact,evidence,fix,root_cause,references}]; verdicts: [{finding_id,assignment_id,verdict,severity,category,evidence,fix_assessment,claim,references}] (empty for discovery)."
+        task += "\nfindings: [{id," + ("finder," if replay else "") + "severity,category,path,line,side,trigger,impact,evidence,fix,root_cause,references}]; verdicts: [{finding_id," + ("assignment_id," if replay else "") + "verdict,severity,category,evidence,fix_assessment,claim,references}] (empty for discovery)."
         task += "\nreferences: [{path,line,side: base|target,relation: anchor|trigger|caller|contract|consequence|test,evidence}]; include each finding's anchor. coverage_gaps: [{id,reason,material: boolean}]; pre_existing and learned: lists of evidence strings. Empty lists mean none. status: done|partial|blocked|failed|stopped; source_status: unchanged|changed|unknown."
     if recovery_request:
-        task += "\nRECOVERY: address only the recorded failure, missing report evidence or focused question. Recheck the complete report contract, not just the first validation error, and use this task's report_template bindings. Preserve retained originals exactly, including their IDs and finder provenance; do not turn restatements into new findings. New claim evidence belongs in the focused verdict; immutable originals remain unchanged."
+        task += "\nRECOVERY: address only the recorded failure, missing report evidence or focused question. Recheck the complete report contract, not just the first validation error, and use this task's " + ("report_template bindings" if replay else "author-only report_template") + ". Preserve retained originals exactly, including their IDs and finder provenance; do not turn restatements into new findings. New claim evidence belongs in the focused verdict; immutable originals remain unchanged."
     measured = len(task.encode("utf-8")) + sum(unit["bytes"] for unit in units.values())
+    if project:
+        foreign_units = {(target_id, unit) for name in row["interactions"]
+                         for target_id, binding in target["plan"]["interactions"][name].get("targets", {}).items()
+                         if target_id != key for unit in binding["units"]}
+        measured += sum(run["targets"][target_id]["catalog"]["units"][unit]["bytes"] for target_id, unit in foreign_units)
     result = {"run_id": run["run_id"], "revision": run["revision"], "profile": row["profile"],
               "assignment_id": assignment_id, "task": task, "input_floor_bytes": measured}
     result["report_template"] = template

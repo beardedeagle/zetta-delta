@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Thorough Delta review of ONE PR or commit range using one finder, one vetter, and the orchestrator from three different model families, with workload-sized assignments and adjudication of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review" for a single target. Multiple PRs, repository-only requests, or explicit org:name targets route to the pr-review-batch skill instead.
+description: Thorough Delta review of ONE PR, a commit range, or explicit filesystem projects using one finder, one vetter, and the orchestrator from three different model families, with workload-sized assignments and adjudication of every finding. Runs only when explicitly invoked with /pr-review or "multi-model PR review". Multiple PRs, repository-only requests, or explicit org:name targets route to the pr-review-batch skill instead.
 disable-model-invocation: true
 ---
 
@@ -35,7 +35,15 @@ independent route; do not invent another participant or adjudicate your own clai
 
 Read `references/repositories.md` to resolve the target. Multiple PRs,
 repository-only requests, or explicit `org:<name>` targets use `pr-review-batch`.
-This skill reviews one PR or explicit local comparison.
+This skill reviews one PR, an explicit local comparison, or explicit filesystem
+project targets. `/pr-review --project '<root>'` and explicit whole-project intent
+review current files; repeat `--project` for independent roots and their required
+cross-project contracts. Use the project commands in `references/review-workflow.md`.
+Plain folders need no Git repository, remote or GitHub authentication. Existing
+defects, modified/untracked/ignored source and local reports are in scope. Bare
+repository/path requests retain their existing open-PR batch meaning.
+Project targets use the same independent finder/vetter/adjudicator policy and
+never acquire PR approval, merge recommendations or GitHub publication.
 
 Read `references/review-workflow.md` for commands and record fields, and
 `references/review-intake.md` for eligibility and discussion evidence. Use one
@@ -67,6 +75,10 @@ mode. Never substitute persisted thread lists or invented zero for live counts.
 An issued task must be registered before another task or fresh scan. While waiting
 for its native cwd, use only `status`/`report`; other commands hold without journal
 changes. Settle that exact launch with `started` or a verified no-start withdrawal.
+For a planned launch wave, collect/register each member serially before sending
+any proceed acknowledgement. This keeps a later pending start from pausing an
+already released reviewer. Keep the registration guard intact; release a
+single-assignment wave as soon as its start is settled.
 Proceed only on success;
 use its exact profile, identity, role, worktree mode, override and file-reading task.
 Forward that small task verbatim; never retype the sealed payload or its hashes.
@@ -75,7 +87,12 @@ coverage paths/units/interactions, test
 authorization and report receipt instructions. Read sealed evidence with its
 `--section <key/subkey/index> --offset <byte> --length <1..32768>` commands;
 historical PR comments are context, not substitute vet assignments. No evidence
-is discarded. Then run `author-report --input '<judgments.json>'` on the reviewer's
+is discarded. Use the generated `source-read` terminal command for bounded source
+files, continuing through every byte of each file claimed as checked. Native
+`read_file` rejects external absolute snapshot paths. New project discovery tasks
+require delivery receipts; incomplete inspection stays partial with material gaps.
+Copy the author-only template; the engine supplies all reserved bindings.
+Then run `author-report --input '<judgments.json>'` on the reviewer's
 own UTF-8 judgment file. Invalid drafts return `report_draft` with all independently
 detectable errors and expected coverage; their bytes are retained without sealing
 a final or consuming a submitted correction. The reviewer corrects their own
@@ -86,6 +103,10 @@ omit `finder` for all claims and preserve retained judgments exactly. Code binds
 only new claims to the current reviewer.
 Use `receive-report` with the actual native handle and completion
 evidence to retain the sealed report bytes; never reconstruct received reports.
+Read a fresh status immediately before receipt/recovery mutations and use its
+revision. Inspect exit status before parsing stdout; on failure read the error
+envelope and stop that command sequence. Author receipts also return their saved
+revision, which another active reviewer may subsequently advance.
 A returned
 `runtime_handle` requires a follow-up to that handle. Launch once, then immediately
 record `started` with native identity/handle evidence and the returned revision.

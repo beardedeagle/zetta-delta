@@ -1,7 +1,7 @@
 ---
 name: pr-review-batch
 description: >-
-  Batch review of PRs: an explicit list (space/comma-separated or bulleted numbers/URLs), a bare $ORG/$REPO string for all open PRs in that repo, or an explicit org:name target for all open PRs across visible organization repositories. Skip PRs already reviewed by the owner at their current head. One strong reviewer per eligible PR, different-family vetting, orchestrator adjudication with a parallel high-end stand-in for family overlap, then one authorized GitHub review per PR (approve / request changes). Use for /pr-review with multiple PRs, repository or organization targets, "review these PRs", or any multi-PR review request. Single PR or commit range routes to the pr-review skill.
+  Batch review of explicit filesystem projects or PRs: an explicit PR list (space/comma-separated or bulleted numbers/URLs), a bare $ORG/$REPO string for all open PRs in that repo, or an explicit org:name target for all open PRs across visible organization repositories. Skip PRs already reviewed by the owner at their current head. One strong reviewer per target, different-family vetting, orchestrator adjudication with a parallel high-end stand-in for family overlap. Project reports stay local; PRs allow one authorized GitHub review (approve / request changes). Use for /pr-review with multiple PRs, repository or organization targets, "review these PRs", or explicit --project targets. Single PR or commit range routes to the pr-review skill.
 ---
 
 # Batch PR Review
@@ -20,6 +20,16 @@ open PRs or an explicit `org:<name>` collection. Normalize numbers/URLs from
 space-separated, comma-separated, bulleted or mixed lists using verified repository
 identity. Single PRs or local comparisons use `pr-review`. Ask only when material
 target semantics remain ambiguous; do not claim access to hidden repositories.
+
+Explicit `--project '<root>'` targets, repeated roots, and whole-project intent
+use the filesystem variant of the same workflow. Review current files, including
+modified, untracked and ignored source and existing defects, with no Git/remote/
+GitHub requirement for plain folders. Assess required cross-project interactions
+and bind every participating snapshot. Keep independent per-project ledgers and
+the batch finder/vetter/stand-in policy. Project reports are local assessments;
+no PR approval, merge verdict or GitHub publication applies. Bare paths/slugs
+retain the existing PR-collection meaning. See the project commands in
+`references/review-workflow.md`.
 
 Read `references/review-workflow.md` for commands and record fields, and
 `references/review-intake.md` for eligibility and discussion evidence. Use one
@@ -57,6 +67,10 @@ mode. Never substitute persisted thread lists or invented zero for live counts.
 An issued task must be registered before another task or fresh scan. While waiting
 for its native cwd, use only `status`/`report`; other commands hold without journal
 changes. Settle that exact launch with `started` or a verified no-start withdrawal.
+For a planned launch wave, collect/register each member serially before sending
+any proceed acknowledgement. This keeps a later pending start from pausing an
+already released reviewer. Keep the registration guard intact; release a
+single-assignment wave as soon as its start is settled.
 Proceed only on success;
 use its exact profile, identity, role, worktree mode, override and file-reading task.
 Forward that small task verbatim; never retype the sealed payload or its hashes.
@@ -65,7 +79,12 @@ coverage paths/units/interactions, test
 authorization and report receipt instructions. Read sealed evidence with its
 `--section <key/subkey/index> --offset <byte> --length <1..32768>` commands;
 historical PR comments are context, not substitute vet assignments. No evidence
-is discarded. Then run `author-report --input '<judgments.json>'` on the reviewer's
+is discarded. Use the generated `source-read` terminal command for bounded source
+files, continuing through every byte of each file claimed as checked. Native
+`read_file` rejects external absolute snapshot paths. New project discovery tasks
+require delivery receipts; incomplete inspection stays partial with material gaps.
+Copy the author-only template; the engine supplies all reserved bindings.
+Then run `author-report --input '<judgments.json>'` on the reviewer's
 own UTF-8 judgment file. Invalid drafts return `report_draft` with all independently
 detectable errors and expected coverage; their bytes are retained without sealing
 a final or consuming a submitted correction. The reviewer corrects their own
@@ -76,6 +95,10 @@ omit `finder` for all claims and preserve retained judgments exactly. Code binds
 only new claims to the current reviewer.
 Use `receive-report` with the actual native handle and completion
 evidence to retain the sealed report bytes; never reconstruct received reports.
+Read a fresh status immediately before receipt/recovery mutations and use its
+revision. Inspect exit status before parsing stdout; on failure read the error
+envelope and stop that command sequence. Author receipts also return their saved
+revision, which another active reviewer may subsequently advance.
 A returned
 `runtime_handle` requires a follow-up to that handle. Launch once, then immediately
 record `started` with native identity/handle evidence and the returned revision.

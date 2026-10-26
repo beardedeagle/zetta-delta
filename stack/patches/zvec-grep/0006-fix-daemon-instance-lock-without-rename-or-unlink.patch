@@ -1,0 +1,197 @@
+diff --git a/src/daemon/server-controller.ts b/src/daemon/server-controller.ts
+index 4701112..b098603 100644
+--- a/src/daemon/server-controller.ts
++++ b/src/daemon/server-controller.ts
+@@ -21,6 +21,12 @@ import {
+ const LIFTOFF_ONLY_FLAG = "--liftoff-only";
+ const SHUTDOWN_REQUEST_TIMEOUT_MS = 2_000;
+ const TERMINATION_GRACE_MS = 2_000;
++// The instance record is stored at a fixed width so that it can be rewritten
++// in place. Swapping the file through a rename needs permission to replace
++// the directory entry, which restricted filesystems deny; a daemon that
++// cannot rewrite its own record never publishes readiness and exits instead
++// of serving.
++const INSTANCE_RECORD_WIDTH = 512;
+ 
+ export type DaemonInstanceRecord = {
+   pid: number;
+@@ -31,6 +37,7 @@ export type DaemonInstanceRecord = {
+   serverUrl: string;
+   ready: boolean;
+   mcpToolset: McpToolset;
++  releasedAt?: number;
+ };
+ 
+ export type DaemonControlStatus = {
+@@ -68,7 +75,7 @@ export class DaemonInstanceLock {
+     try {
+       const handle = await open(temporaryPath, "wx", 0o600);
+       try {
+-        await handle.writeFile(`${JSON.stringify(record)}\n`);
++        await handle.writeFile(serializeInstanceRecord(record));
+       } finally {
+         await handle.close();
+       }
+@@ -91,6 +98,13 @@ export class DaemonInstanceLock {
+               { cause: error },
+             );
+           }
++          // The previous owner is gone. Take the record over in place:
++          // removing the stale file first needs permission to unlink, which
++          // restricted filesystems deny, and the retry loop would never make
++          // progress there.
++          if (await takeOverInstanceRecord(path, record)) {
++            return new DaemonInstanceLock(path, record);
++          }
+           await unlink(path).catch(() => undefined);
+         }
+       }
+@@ -113,7 +127,21 @@ export class DaemonInstanceLock {
+       current?.instanceToken === this.record.instanceToken &&
+       current.pid === process.pid
+     ) {
+-      await unlink(this.path).catch(() => undefined);
++      try {
++        await unlink(this.path);
++        return;
++      } catch {
++        // Unlink is denied on restricted filesystems. Mark the record as
++        // released instead, so the next acquirer can take it over rather
++        // than failing to acquire the lock forever.
++      }
++      this.record.ready = false;
++      this.record.pid = 0;
++      this.record.releasedAt = Date.now();
++      await writeRecordInPlace(
++        this.path,
++        serializeInstanceRecord(this.record),
++      ).catch(() => undefined);
+     }
+   }
+ 
+@@ -126,10 +154,64 @@ export class DaemonInstanceLock {
+     ) {
+       throw new Error("zvec-grep server no longer owns its instance lock.");
+     }
+-    // Keep the old record readable until the complete replacement is ready.
+-    await replaceFileAtomically(this.path, `${JSON.stringify(this.record)}\n`, {
+-      mode: 0o600,
+-    });
++    const payload = serializeInstanceRecord(this.record);
++    try {
++      await replaceFileAtomically(this.path, payload, { mode: 0o600 });
++    } catch (error) {
++      if (!isReplacementDenied(error)) throw error;
++      // The filesystem refuses to replace the directory entry. The lock inode
++      // belongs to this process, so rewrite the record in place instead: the
++      // fixed-width payload replaces the previous record wholesale, and the
++      // daemon still publishes readiness instead of exiting.
++      await writeRecordInPlace(this.path, payload);
++    }
++  }
++}
++
++function serializeInstanceRecord(record: DaemonInstanceRecord): string {
++  const payload = `${JSON.stringify(record)}\n`;
++  return payload.length < INSTANCE_RECORD_WIDTH
++    ? payload.padEnd(INSTANCE_RECORD_WIDTH, " ")
++    : payload;
++}
++
++function isReplacementDenied(error: unknown): boolean {
++  const code = (error as NodeJS.ErrnoException | undefined)?.code;
++  return (
++    code === "EPERM" ||
++    code === "EACCES" ||
++    code === "EXDEV" ||
++    code === "ENOTSUP" ||
++    code === "EBUSY"
++  );
++}
++
++async function writeRecordInPlace(
++  path: string,
++  payload: string,
++): Promise<void> {
++  const handle = await open(path, "r+");
++  try {
++    await handle.write(payload, 0, "utf8");
++    const { size } = await handle.stat();
++    if (size > payload.length) {
++      await handle.truncate(payload.length);
++    }
++    await handle.sync();
++  } finally {
++    await handle.close();
++  }
++}
++
++async function takeOverInstanceRecord(
++  path: string,
++  record: DaemonInstanceRecord,
++): Promise<boolean> {
++  try {
++    await writeRecordInPlace(path, serializeInstanceRecord(record));
++    return true;
++  } catch {
++    return false;
+   }
+ }
+ 
+@@ -428,6 +510,8 @@ async function readRecordPath(
+       typeof value.updatedAt !== "number" ||
+       typeof value.serverUrl !== "string" ||
+       typeof value.ready !== "boolean" ||
++      (value.releasedAt !== undefined &&
++        typeof value.releasedAt !== "number") ||
+       (value.mcpToolset !== undefined &&
+         value.mcpToolset !== "agent" &&
+         value.mcpToolset !== "full")
+diff --git a/test/instance-lock-race.test.mjs b/test/instance-lock-race.test.mjs
+index 0150a67..7bfe8ca 100644
+--- a/test/instance-lock-race.test.mjs
++++ b/test/instance-lock-race.test.mjs
+@@ -132,7 +132,7 @@ test("ready instances do not schedule redundant disk heartbeats", async (t) => {
+   }
+ });
+ 
+-test("failed readiness replacement preserves the lock and cleans temporary files", async () => {
++test("readiness replacement falls back to an in-place rewrite when the filesystem denies replacement", async () => {
+   const home = await fs.mkdtemp(join(tmpdir(), "zg-instance-replace-"));
+   const lock = await DaemonInstanceLock.acquire(home, "http://127.0.0.1:1/mcp");
+   const originalRename = fs.rename;
+@@ -142,7 +142,33 @@ test("failed readiness replacement preserves the lock and cleans temporary files
+       throw Object.assign(new Error("replacement denied"), { code: "EPERM" });
+     };
+     syncBuiltinESMExports();
+-    await assert.rejects(lock.markReady(), { code: "EPERM" });
++    // A filesystem that refuses to replace the directory entry must not stop
++    // the daemon from publishing readiness: the lock inode belongs to this
++    // process, so the record is rewritten in place.
++    await lock.markReady();
++    const after = await readInstanceRecord(home);
++    assert.equal(after.instanceToken, before.instanceToken);
++    assert.equal(after.ready, true);
++    assert.deepEqual(await fs.readdir(join(home, "daemon")), ["instance.lock"]);
++  } finally {
++    fs.rename = originalRename;
++    syncBuiltinESMExports();
++    await lock.release();
++    await fs.rm(home, { recursive: true, force: true });
++  }
++});
++
++test("failed readiness replacement preserves the lock and cleans temporary files", async () => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-instance-replace-"));
++  const lock = await DaemonInstanceLock.acquire(home, "http://127.0.0.1:1/mcp");
++  const originalRename = fs.rename;
++  try {
++    const before = await readInstanceRecord(home);
++    fs.rename = async () => {
++      throw Object.assign(new Error("no space left"), { code: "ENOSPC" });
++    };
++    syncBuiltinESMExports();
++    await assert.rejects(lock.markReady(), { code: "ENOSPC" });
+     assert.deepEqual(await readInstanceRecord(home), before);
+     assert.deepEqual(await fs.readdir(join(home, "daemon")), ["instance.lock"]);
+     fs.rename = originalRename;

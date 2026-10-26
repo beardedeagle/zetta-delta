@@ -2,6 +2,7 @@
 """Shared review journal, source preparation and authorized GitHub publication."""
 
 import argparse
+import base64
 import copy
 import fcntl
 import hashlib
@@ -10,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +40,46 @@ from review_contract import (
 METHODS = ("pr-review", "pr-review-batch")
 ADMISSION_MODES = ("observed", "native")
 CATEGORIES = contract.CATEGORIES
+
+
+def project_collection(roots: list[str], exclusions: list[list[str]]) -> dict:
+    """Resolve requested roots once, retaining aliases and failed requests.
+
+    Args:
+        roots (list[str]): Explicit project paths, without repository inference.
+        exclusions (list[list[str]]): Relative path and rationale pairs.
+
+    Returns:
+        dict: Replayable filesystem intake, with no GitHub account requirement.
+
+    Raises:
+        ValueError: Roots or explicit exclusion rationale are malformed.
+    """
+    if not isinstance(roots, list) or not roots:
+        raise ValueError("project review requires explicit roots")
+    for root in roots:
+        identity.text(root, "project root")
+    omitted = []
+    for path, reason in exclusions:
+        preparation.relative_path(path)
+        evidence(reason)
+        if any(row["path"] == path for row in omitted):
+            raise ValueError("duplicate project exclusion")
+        omitted.append({"path": path, "reason": reason})
+    projects = []
+    resolved_roots = {}
+    for requested in roots:
+        error = None
+        try:
+            root = Path(requested).expanduser().resolve(strict=True)
+            if not root.is_dir():
+                raise ValueError("project root is not a directory")
+            info = root.stat()
+            source = resolved_roots.setdefault((info.st_dev, info.st_ino), str(root))
+        except (OSError, RuntimeError, ValueError) as failure:
+            source, error = None, f"project root is unavailable ({type(failure).__name__})"
+        projects.append({"requested_root": requested, "source_root": source, "error": error})
+    return {"projects": projects, "exclusions": omitted}
 
 
 def target_record(repository: str, metadata: dict) -> dict:
@@ -118,6 +160,42 @@ def new_run(method: str, collection: dict, registry: dict, orchestrator: dict, t
         choice(admission_mode, ADMISSION_MODES, "admission mode")
     if type(review_own_pr) is not bool:
         raise ValueError("review-own-pr override must be boolean")
+    if "projects" in collection:
+        fields(collection, ("projects", "exclusions"))
+        if review_own_pr or not isinstance(collection["projects"], list) or not collection["projects"]:
+            raise ValueError("project review requires explicit roots and no PR override")
+        exclusions = collection["exclusions"]
+        if not isinstance(exclusions, list):
+            raise ValueError("project exclusions must be a list")
+        names = []
+        for row in exclusions:
+            fields(row, ("path", "reason"))
+            names.append(preparation.relative_path(row["path"]))
+            evidence(row["reason"])
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate project exclusion")
+        targets = {}
+        for index, request in enumerate(collection["projects"]):
+            fields(request, ("requested_root", "source_root", "error"))
+            requested = identity.text(request["requested_root"], "requested project root")
+            source = request["source_root"]
+            if source is None:
+                evidence(request["error"])
+                key = f"project-failed-{index + 1:04d}"
+            else:
+                if (not isinstance(source, str) or not Path(source).is_absolute() or ".." in Path(source).parts
+                        or str(Path(source)) != source or request["error"] is not None):
+                    raise ValueError("invalid canonical project root")
+                key = "project-" + hashlib.sha256(os.fsencode(source)).hexdigest()[:24]
+            if key in targets and targets[key]["project"]["source_root"] != source:
+                raise ValueError("conflicting project root identities")
+            if key not in targets:
+                target = target_record(source or requested, {"classification": "project"})
+                target["project"] = {"id": key, "source_root": source, "requested_roots": [],
+                                     "exclusions": copy.deepcopy(exclusions), "error": request["error"]}
+                targets[key] = target
+            targets[key]["project"]["requested_roots"].append(requested)
+        return run_record(method, collection, registry, orchestrator, thread_id, None, targets, admission_mode)
     if "local" in collection:
         if review_own_pr:
             raise ValueError("review-own-pr requires explicit GitHub PR intake")
@@ -393,6 +471,8 @@ def completion_gaps(run, target):
 
 
 def review_event(target):
+    if "project" in target:
+        return None
     retained = [row for row in target["adjudications"].values()
                 if row["disposition"] in ("CONFIRMED", "ADJUSTED")]
     return "REQUEST_CHANGES" if any(row["severity"] != "nit" for row in retained) else "APPROVE"
@@ -479,6 +559,28 @@ def readjudication_allowed(target: dict, key: str) -> bool:
     return root.get("recovery", {}).get("kind") == "follow-up" and vet["assignment_id"] != prior.get("vet_assignment_id")
 
 
+def source_reads(target: dict, row: dict) -> list[dict]:
+    """Collect byte-delivery evidence retained in this same native conversation.
+
+    Args:
+        target (dict): Frozen target and assignment history.
+        row (dict): Current reviewer attempt.
+
+    Returns:
+        list[dict]: Current reads plus same-handle recovery ancestors; another
+            conversation's reads never satisfy independent inspection.
+    """
+    result, seen = [], set()
+    while row["id"] not in seen:
+        seen.add(row["id"])
+        result.extend(row.get("source_reads", []))
+        previous = target["assignments"].get(row.get("recovery", {}).get("assignment_id"))
+        if not previous or not row.get("runtime_handle") or previous.get("runtime_handle") != row["runtime_handle"]:
+            break
+        row = previous
+    return result
+
+
 def accept_report(target: dict, row: dict, data: dict, *, errors: list[dict] | None = None) -> None:
     """Retain a validated terminal report and register its completed vet judgments.
 
@@ -495,13 +597,20 @@ def accept_report(target: dict, row: dict, data: dict, *, errors: list[dict] | N
     """
     if errors is not None:
         target = copy.deepcopy(target)
+    project_fields = ("related_targets",) if "project" in target else ()
     with contract.report_check(errors, "report"):
         if row["kind"] == "adjudication":
-            contract.decisions(data, ("assignment_id", "status", "target", "reviewer", "adjudications", "evidence", "source_status"), "adjudication_report")
+            contract.decisions(data, ("assignment_id", "status", "target", "reviewer", "adjudications", "evidence", "source_status"), "adjudication_report", project_fields)
         else:
-            fields(data, ("assignment_id", "status", "target", "checked", "findings", "evidence", "source_status"), ("reviewer", "checked_units", "checked_interactions", "categories", "verification", "coverage_gaps", "pre_existing", "learned", "verdicts"))
+            fields(data, ("assignment_id", "status", "target", "checked", "findings", "evidence", "source_status"), ("reviewer", "checked_units", "checked_interactions", "categories", "verification", "coverage_gaps", "pre_existing", "learned", "verdicts", *project_fields))
     if not isinstance(data, dict):
         return
+    if "project" in target:
+        with contract.report_check(errors, "related_targets"):
+            if data.get("related_targets") != contract.related_targets(target):
+                raise ValueError("project report must retain every related frozen target")
+    with contract.report_check(errors, "references"):
+        contract.project_evidence(target, data)
     if row["kind"] == "adjudication":
         with contract.report_check(errors, "reviewer"):
             if data.get("reviewer") != row["actual_identity"]:
@@ -518,6 +627,35 @@ def accept_report(target: dict, row: dict, data: dict, *, errors: list[dict] | N
         choice(data.get("source_status"), ("unchanged", "changed", "unknown"), "source status")
         if data.get("source_status") != "unchanged" and data.get("status") == "done":
             raise ValueError("done requires an unchanged source record")
+    with contract.report_check(errors, "source_searches"):
+        unresolved = [key for key, search in row.get("source_searches", {}).items()
+                      if search["status"] != "success" and not search.get("retried_by")]
+        gaps = data.get("coverage_gaps", [])
+        declared = {gap.get("id") for gap in gaps if isinstance(gap, dict) and gap.get("material") is True} if isinstance(gaps, list) else set()
+        if unresolved and (data.get("status") == "done" or row["kind"] != "adjudication" and not set(unresolved) <= declared):
+            raise NeedsDecision("search_errors", "retry failed/interrupted searches or report each as an explicit material gap in a non-done report: " + ", ".join(unresolved))
+    with contract.report_check(errors, "source_reads"):
+        if row.get("task_ready", {}).get("source_read_required"):
+            missing = {}
+            frozen = target["frozen"]
+            reads = source_reads(target, row)
+            checked = data.get("checked", [])
+            for path in checked if isinstance(checked, list) else ():
+                entry = frozen["manifest"]["entries"].get(path, {})
+                if entry.get("kind") != "file":
+                    continue
+                cursor = 0
+                ranges = sorted((read["offset"], read["offset"] + read["length"]) for read in reads
+                                if read["source_root"] == frozen["source_root"] and read["path"] == path
+                                and read["file_sha256"] == entry["sha256"])
+                for start, end in ranges:
+                    if start > cursor:
+                        break
+                    cursor = max(cursor, end)
+                if cursor < entry["size"]:
+                    missing[path] = cursor
+            if missing:
+                raise NeedsDecision("source_coverage", "checked files require complete source-read receipts; read from these missing byte offsets or omit their checked attestations and report incomplete coverage: " + json.dumps(missing, ensure_ascii=True))
     with contract.report_check(errors, "evidence"):
         evidence(data.get("evidence"))
     if row["kind"] == "adjudication":
@@ -625,6 +763,8 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
     if target["phase"] in ("skipped", "published") and event["operation"] not in ("integrity", "cleanup"):
         raise ValueError("skipped and published targets are terminal")
     operation, data = event["operation"], event["data"]
+    if "project" in target and operation.startswith("publication-"):
+        raise NeedsDecision("local_publication", "project reviews are local assessments; no GitHub publication applies")
     if operation in ("assignment", "recover", "task-ready", "started", "complete", "publication-intent", "test-copy") and any(integrity_failures(result)):
         raise NeedsDecision("source_integrity", "source integrity changed or unknown; hold further dispatch records and publication")
     if operation in ("prepare", "freeze", "index-setup", "catalog", "plan", "assignment", "started", "complete", "publication-intent", "test-copy") and target["resources_removed"]:
@@ -642,49 +782,57 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             require_phase(target, "intake")
         else:
             require_phase(target, "intake", "setup")
-        fields(data, ("base_sha", "head_sha", "diff_base_sha", "mode", "source_root", "source_fingerprint", "inventory", "parent_root", "parent_fingerprint"), ("preparation",))
-        expected_mode = target.get("comparison", {}).get("mode", "pr-merge-base")
-        choice(data["mode"], (expected_mode,), "comparison mode")
-        for field in ("base_sha", "head_sha", "diff_base_sha"):
-            preparation.oid(data[field])
-        if "comparison" not in target and any(data[field] != target["intake"][field] for field in ("base_sha", "head_sha")):
-            raise ValueError("comparison moved since intake; create a new run")
-        for field in ("source_root", "parent_root"):
-            if not Path(data[field]).is_absolute():
-                raise ValueError(f"{field} must be absolute")
-        for field in ("source_fingerprint", "parent_fingerprint"):
-            if not isinstance(data[field], str) or not re.fullmatch(r"[0-9a-f]{64}", data[field]):
-                raise ValueError(f"{field} must be SHA-256")
-        paths(data["inventory"], empty=True)
-        if "preparation" in data:
-            proof = fields(data["preparation"], ("resource", "artifacts", "baseline_head_sha", "staged_tree_sha"))
-            if not re.fullmatch(r"snapshot-[0-9a-f]{32}", proof["resource"]):
-                raise ValueError("invalid preparation resource")
-            preparation.oid(proof["baseline_head_sha"])
-            if proof["staged_tree_sha"] is not None:
-                preparation.oid(proof["staged_tree_sha"])
-            if ((data["mode"] == "working") != (proof["staged_tree_sha"] is not None)
-                    or proof["baseline_head_sha"] != data["base_sha" if data["mode"] == "working" else "head_sha"]
-                    or (data["mode"] in ("range-two-dot", "working") and data["diff_base_sha"] != data["base_sha"])):
-                raise ValueError("inconsistent preparation comparison")
-            if not isinstance(proof["artifacts"], dict) or not {"owner.json", "source-baseline.json", "parent-baseline.json", "review.patch", "inventory.json", "name-status.z", "numstat.z", "stat.txt"} <= proof["artifacts"].keys():
-                raise ValueError("missing preparation artifacts")
-            for name, checksum in proof["artifacts"].items():
-                if Path(name).name != name or not re.fullmatch(r"[0-9a-f]{64}", checksum):
-                    raise ValueError("invalid preparation artifact")
+        if "project" in target:
+            preparation.validate_project_frozen(data, target)
+        else:
+            fields(data, ("base_sha", "head_sha", "diff_base_sha", "mode", "source_root", "source_fingerprint", "inventory", "parent_root", "parent_fingerprint"), ("preparation",))
+            expected_mode = target.get("comparison", {}).get("mode", "pr-merge-base")
+            choice(data["mode"], (expected_mode,), "comparison mode")
+            for field in ("base_sha", "head_sha", "diff_base_sha"):
+                preparation.oid(data[field])
+            if "comparison" not in target and any(data[field] != target["intake"][field] for field in ("base_sha", "head_sha")):
+                raise ValueError("comparison moved since intake; create a new run")
+            for field in ("source_root", "parent_root"):
+                if not Path(data[field]).is_absolute():
+                    raise ValueError(f"{field} must be absolute")
+            for field in ("source_fingerprint", "parent_fingerprint"):
+                if not isinstance(data[field], str) or not re.fullmatch(r"[0-9a-f]{64}", data[field]):
+                    raise ValueError(f"{field} must be SHA-256")
+            paths(data["inventory"], empty=True)
+            if "preparation" in data:
+                proof = fields(data["preparation"], ("resource", "artifacts", "baseline_head_sha", "staged_tree_sha"))
+                if not re.fullmatch(r"snapshot-[0-9a-f]{32}", proof["resource"]):
+                    raise ValueError("invalid preparation resource")
+                preparation.oid(proof["baseline_head_sha"])
+                if proof["staged_tree_sha"] is not None:
+                    preparation.oid(proof["staged_tree_sha"])
+                if ((data["mode"] == "working") != (proof["staged_tree_sha"] is not None)
+                        or proof["baseline_head_sha"] != data["base_sha" if data["mode"] == "working" else "head_sha"]
+                        or (data["mode"] in ("range-two-dot", "working") and data["diff_base_sha"] != data["base_sha"])):
+                    raise ValueError("inconsistent preparation comparison")
+                if not isinstance(proof["artifacts"], dict) or not {"owner.json", "source-baseline.json", "parent-baseline.json", "review.patch", "inventory.json", "name-status.z", "numstat.z", "stat.txt"} <= proof["artifacts"].keys():
+                    raise ValueError("missing preparation artifacts")
+                for name, checksum in proof["artifacts"].items():
+                    if Path(name).name != name or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+                        raise ValueError("invalid preparation artifact")
         if operation == "freeze" and target["setup"] is not None:
             if "preparation" not in data:
                 raise ValueError("finalization requires owned preparation evidence; use finalize")
             original = target["setup"]
             if (any(data[field] != value for field, value in original.items() if field not in ("source_fingerprint", "preparation"))
                     or any(data["preparation"][field] != original["preparation"][field]
-                           for field in ("resource", "baseline_head_sha", "staged_tree_sha"))
+                           for field in (("resource",) if "project" in target else ("resource", "baseline_head_sha", "staged_tree_sha")))
                     or any(data["preparation"]["artifacts"].get(name) != checksum
                            for name, checksum in original["preparation"]["artifacts"].items())
                     or not {"final-source-baseline.json", "index-result.json"} <= data["preparation"]["artifacts"].keys()):
                 raise ValueError("finalization must retain the original comparison and artifacts")
         target["setup" if operation == "prepare" else "frozen"] = copy.deepcopy(data)
         target["phase"] = "setup" if operation == "prepare" else "prepared"
+        if operation == "prepare" and "project" in target:
+            omissions = {**data["manifest"]["gaps"], **{path: {"reason": reason} for path, reason in data["manifest"]["excluded"].items() if reason != "Git metadata"}}
+            for path, row in omissions.items():
+                gap_id = "capture-" + hashlib.sha256(os.fsencode(path)).hexdigest()[:24]
+                target["coverage_gaps"][gap_id] = {"reason": path + ": " + row["reason"], "material": True, "resolution": None}
     elif operation == "index-setup":
         require_phase(target, "setup")
         fields(data, ("tools", "available", "helper", "helper_fingerprint", "cache_paths"))
@@ -698,7 +846,9 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         paths(data["cache_paths"])
         target["index_setup"] = copy.deepcopy(data)
     elif operation == "baseline":
-        fields(data, ("id", "root", "fingerprint"), ("artifact", "artifact_sha256"))
+        fields(data, ("id", "root", "fingerprint"), ("artifact", "artifact_sha256", "filesystem"))
+        if "filesystem" in data and ("project" not in target or data["filesystem"] is not True or "artifact" not in data):
+            raise ValueError("filesystem baselines require generated project-parent evidence")
         if ("artifact" in data) != ("artifact_sha256" in data):
             raise ValueError("baseline artifact requires its checksum")
         if "artifact" in data and (not isinstance(data["artifact"], str) or not re.fullmatch(r"baseline-[0-9a-f]{32}\.json", data["artifact"])
@@ -710,12 +860,76 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         if not Path(data["root"]).is_absolute() or not re.fullmatch(r"[0-9a-f]{64}", data["fingerprint"]):
             raise ValueError("invalid copy baseline")
         target["baselines"][key] = copy.deepcopy(data)
+    elif operation == "source-read":
+        fields(data, ("assignment_id", "source_target", "source_root", "path", "offset", "length", "total_bytes", "file_sha256", "receipt"))
+        row = target["assignments"].get(data["assignment_id"])
+        if not row or row["status"] != "running" or row.get("authored_report"):
+            raise ValueError("source read requires a running, unsealed assignment")
+        selected = result["targets"].get(data["source_target"])
+        if (selected is None or selected["resources_removed"] or selected["frozen"] is None
+                or (data["source_target"] != event["target"] and
+                    contract.related_targets(target).get(data["source_target"]) != selected["frozen"])):
+            raise ValueError("source read must bind its owning or related frozen target")
+        if data["source_root"] != selected["frozen"]["source_root"]:
+            raise ValueError("source read root differs from its frozen binding")
+        preparation.relative_path(data["path"])
+        if (any(type(data[name]) is not int or data[name] < 0 for name in ("offset", "length", "total_bytes"))
+                or data["length"] > 32768 or data["offset"] + data["length"] > data["total_bytes"]
+                or not isinstance(data["file_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["file_sha256"])):
+            raise ValueError("invalid source read range or digest")
+        if "project" in selected:
+            entry = selected["frozen"]["manifest"]["entries"].get(data["path"], {})
+            if entry.get("kind") != "file" or entry.get("sha256") != data["file_sha256"] or entry.get("size") != data["total_bytes"]:
+                raise ValueError("source read differs from the captured file")
+        handoff.validate(data["receipt"])
+        if not data["receipt"]["artifact"].endswith("/source.json"):
+            raise ValueError("source read requires its original delivery receipt")
+        row.setdefault("source_reads", []).append(copy.deepcopy(data))
+    elif operation in ("source-search-started", "source-search-result"):
+        row = target["assignments"].get(data.get("assignment_id"))
+        if not row or row["status"] != "running" or row.get("authored_report"):
+            raise ValueError("source search requires a running, unsealed assignment")
+        searches = row.setdefault("source_searches", {})
+        if operation == "source-search-started":
+            fields(data, ("assignment_id", "id", "query", "retry_of"))
+            stable_id(data["id"])
+            query = fields(data["query"], ("pattern", "paths", "regex"))
+            evidence(query["pattern"])
+            paths(query["paths"], empty=True)
+            if type(query["regex"]) is not bool or data["id"] in searches:
+                raise ValueError("invalid source search query or duplicate ID")
+            prior = searches.get(data["retry_of"]) if data["retry_of"] is not None else None
+            if data["retry_of"] is not None:
+                if not prior or prior["status"] == "success" or prior.get("retried_by"):
+                    raise ValueError("retry-of requires an unresolved search in this assignment")
+                prior["retried_by"] = data["id"]
+            searches[data["id"]] = dict(copy.deepcopy(data), status="pending")
+        else:
+            fields(data, ("assignment_id", "id", "exit_code", "receipt"))
+            search = searches.get(data["id"])
+            if not search or search["status"] != "pending" or search.get("retried_by"):
+                raise ValueError("source search result requires its exact pending execution")
+            if data["exit_code"] is not None and type(data["exit_code"]) is not int:
+                raise ValueError("invalid search exit code")
+            handoff.validate(data["receipt"])
+            if not data["receipt"]["artifact"].endswith("/search.json"):
+                raise ValueError("source search requires its execution receipt")
+            search.update(copy.deepcopy(data), status="success" if data["exit_code"] in (0, 1) else "error")
     elif operation == "integrity":
-        fields(data, ("status", "components"))
+        fields(data, ("status", "components"), ("cache_changes",))
         choice(data["status"], ("unchanged", "changed", "unknown"), "integrity status")
         strings(data["components"], "integrity component", empty=True)
         if (target["frozen"] is None and target["setup"] is None) or (data["status"] == "unchanged" and data["components"]):
             raise ValueError("invalid integrity observation")
+        if not isinstance(data.get("cache_changes", []), list):
+            raise ValueError("cache changes must be a list")
+        for change in data.get("cache_changes", []):
+            fields(change, ("root", "path", "before", "after"))
+            if (not isinstance(change["root"], str) or not Path(change["root"]).is_absolute()
+                    or change["path"] != ".codegraph/codegraph.db-shm"
+                    or any(not isinstance(change[name], str) or not re.fullmatch(r"[0-9a-f]{64}", change[name])
+                           for name in ("before", "after"))):
+                raise ValueError("invalid generated-cache change")
         target["integrity"].append(copy.deepcopy(data))
     elif operation == "test-copy":
         fields(data, ("root",))
@@ -733,6 +947,10 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         strings(data["resources"], "removed resource", empty=True)
         if any(row["status"] in ("queued", "running") for row in target["assignments"].values()):
             raise NeedsDecision("active_assignments", "settle active assignments before cleaning review resources")
+        if "project" in target and any(
+                other is not target and other["phase"] != "complete" and event["target"] in contract.related_targets(other)
+                for other in result["targets"].values()):
+            raise NeedsDecision("project_resources", "retain project snapshots until dependent cross-project reviews complete")
         target["resources_removed"] = target["frozen"] is not None or target["setup"] is not None
     elif operation == "catalog":
         require_phase(target, "prepared")
@@ -742,6 +960,8 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         target["catalog"] = copy.deepcopy(data)
     elif operation == "plan":
         require_phase(target, "prepared")
+        if "project" in target:
+            contract.project_plan(result, event["target"], data)
         contract.plan(data, target, result["method"], result["registry"], result["orchestrator"])
         perspectives = strings(data["required_perspectives"], "required family")
         if run["method"] == "pr-review-batch" and len(perspectives) != 1:
@@ -843,7 +1063,10 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         contract.task_block(result, event["target"], row["id"], replay=replay, directory=directory)
     elif operation == "task-ready":
         require_phase(target, "discovery", "vetting", "adjudication")
-        contract.decisions(data, ("assignment_id", "capacity"), "task_preflight", ("handoff",))
+        contract.decisions(data, ("assignment_id", "capacity"), "task_preflight", ("handoff", "source_read_required"))
+        if "source_read_required" in data and (data["source_read_required"] is not True or "project" not in target
+                or target["assignments"][data["assignment_id"]]["kind"] != "discovery" or "handoff" not in data):
+            raise ValueError("source coverage receipts require a generated project discovery task")
         if "handoff" in data:
             handoff.validate(data["handoff"])
             if not data["handoff"]["artifact"].endswith("/task.json"):
@@ -853,6 +1076,8 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             "revision": result["revision"] + 1, "capacity": copy.deepcopy(data["capacity"])}
         if "handoff" in data:
             target["assignments"][data["assignment_id"]]["task_ready"]["handoff"] = copy.deepcopy(data["handoff"])
+        if data.get("source_read_required"):
+            target["assignments"][data["assignment_id"]]["task_ready"]["source_read_required"] = True
     elif operation == "withdraw":
         require_phase(target, "discovery", "vetting", "adjudication")
         fields(data, ("assignment_id", "target", "cause", "evidence"), ("native_reconciliation",))
@@ -1055,6 +1280,7 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             raise ValueError("orchestrator finding must bind the complete frozen target")
         raw = data["finding"]
         finding(raw)
+        contract.project_evidence(target, {"findings": [raw]})
         if not re.fullmatch(r"orchestrator-[0-9]{2,}", raw["id"]) or raw["finder"] != result["orchestrator"]:
             raise ValueError("orchestrator discovery requires its own ID and actual orchestrator identity")
         if raw["id"] in target["findings"]:
@@ -1067,6 +1293,7 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         if raw is None:
             raise ValueError("unknown finding")
         contract.verdict(data, raw)
+        contract.project_evidence(target, data)
         row = target["assignments"].get(data["assignment_id"])
         if row is None or row["kind"] != "vet" or row["status"] != "done" or data["finding_id"] not in row["finding_ids"]:
             raise ValueError("verdict requires its completed cross-family vet assignment")
@@ -1083,6 +1310,7 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         if any(row["status"] in ("queued", "running") for row in target["assignments"].values()):
             raise ValueError("settle all active assignments before the separate adjudication pass")
         contract.adjudication(data, target)
+        contract.project_evidence(target, data)
         key = data["finding_id"]
         if key not in target["findings"] or (key in target["adjudications"] and not readjudication_allowed(target, key)):
             raise ValueError("adjudication requires an existing unadjudicated finding")
@@ -1130,6 +1358,8 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         if type(data["metered_spawns"]) is not int or data["metered_spawns"] < 0:
             raise ValueError("metered authorization must be a nonnegative spawn count")
         evidence(data["evidence"])
+        if "project" in target and (data["submission"] or "approved_review" in data):
+            raise NeedsDecision("local_publication", "project reviews cannot authorize PR submission or approval verdicts")
         if "approved_review" in data:
             approved = fields(data["approved_review"], ("event", "body"))
             choice(approved["event"], ("APPROVE", "REQUEST_CHANGES"), "approved review event")
@@ -1142,6 +1372,8 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         require_phase(target, "discovery", "vetting", "adjudication")
         fields(data, ("coverage_evidence",))
         evidence(data["coverage_evidence"])
+        if "project" in target:
+            contract.project_plan(result, event["target"], target["plan"])
         gaps = completion_gaps(result, target)
         if gaps:
             raise NeedsDecision("incomplete_review", "incomplete review: " + "; ".join(gaps))
@@ -1325,7 +1557,7 @@ def status(run: dict) -> dict:
                      "publication_context": target["publication_context"], "publication_discussion": target["publication_discussion"],
                      "publication": target["publication"],
                      "derived_event": review_event(target) if phase in ("complete", "publication-pending", "published") else None})
-    return {"run_id": run["run_id"], "revision": run["revision"], "method": run["method"],
+    result = {"run_id": run["run_id"], "revision": run["revision"], "method": run["method"],
             "owner": run["owner"], "limits": {"per_thread": 15, "overall": 30},
             "admission_mode": run.get("admission_mode", "observed"), "native_parent": run.get("native_parent"),
             "unavailable_lanes": run["unavailable_lanes"],
@@ -1333,6 +1565,11 @@ def status(run: dict) -> dict:
                             "write_prevention": False, "publication": True},
             "batch_waves": [{name: wave[name] for name in ("id", "slots", "reserved", "allocations", "held", "deferred")}
                             for wave in run["batch_waves"]], "targets": rows}
+    if "projects" in run["intake"]:
+        result["complete"] = bool(rows) and not any(integrity_failures(run)) and all(
+            target["phase"] == "complete" and not completion_gaps(run, target) for target in run["targets"].values())
+        result["project_requests"] = copy.deepcopy(run["intake"]["projects"])
+    return result
 
 
 def report_text(value: object) -> str:
@@ -1389,7 +1626,7 @@ def report(run: dict) -> str:
             Recommendations apply only to the completed frozen comparison.
     """
     snapshot = status(run)
-    lines = ["# PR review report", "", f"Run: {report_text(run['run_id'])}; revision: {run['revision']}; method: {run['method']}.",
+    lines = ["# Project review report" if "projects" in run["intake"] else "# PR review report", "", f"Run: {report_text(run['run_id'])}; revision: {run['revision']}; method: {run['method']}.",
              f"Parent: {report_text(run['thread_id'])}; authenticated owner: {report_text(run['owner'] or 'none (local comparison)')}.",
              f"Orchestrator (recorded): {report_text(report_identity(run['orchestrator']))}."]
     lines.append(f"Admission: {report_text(snapshot['admission_mode'])}; captured parent: {report_text(snapshot['native_parent'])}.")
@@ -1398,7 +1635,9 @@ def report(run: dict) -> str:
     collection = run["intake"]
     groups = collection.get("repositories", [collection])
     repositories = [group["repository"] for group in groups if "repository" in group]
-    lines.append(f"Requested scope: {report_text(collection.get('organization') or collection.get('local') or repositories)}.")
+    lines.append(f"Requested scope: {report_text(collection.get('projects') or collection.get('organization') or collection.get('local') or repositories)}.")
+    if "projects" in collection:
+        lines.append(f"All requested projects complete: {snapshot['complete']}. Project results are local assessments, without PR approval or merge verdicts.")
     if repositories:
         lines.append(f"Collected visible repositories (including empty groups): {report_text(repositories)}.")
     summary = []
@@ -1409,6 +1648,10 @@ def report(run: dict) -> str:
         recommendation = "review incomplete"
         if row["phase"] == "skipped":
             recommendation = "not reviewed"
+        elif "project" in target and row["phase"] == "complete":
+            recommendation = "assessment complete; retained findings" if retained else "assessment complete; no retained findings"
+            if row["next"].get("code") == "source_integrity":
+                recommendation = "assessment held; original project or captured evidence changed"
         elif completed:
             recommendation = "do not merge" if any(item["severity"] == "blocker" for item in retained) else (
                 "merge after fixes" if row["derived_event"] == "REQUEST_CHANGES" else "merge-ready (optional nits)" if retained else "merge-ready")
@@ -1438,7 +1681,11 @@ def report(run: dict) -> str:
         comparison = target["frozen"] or target["setup"]
         if comparison:
             for field in ("mode", "base_sha", "head_sha", "diff_base_sha", "source_root", "source_fingerprint", "inventory"):
-                lines.append(f"- {field}: {report_text(comparison[field])}")
+                if field in comparison:
+                    lines.append(f"- {field}: {report_text(comparison[field])}")
+            if "project" in target:
+                for field in ("parent_root", "parent_fingerprint", "manifest_fingerprint", "manifest"):
+                    lines.append(f"- {field}: {report_text(comparison[field])}")
         else:
             lines.append("- Frozen comparison: not prepared.")
         lines.append(f"- Next / hold: {report_text(row['next'].get('code', row['next']['status']))}: {report_text(row['next'].get('reason', 'none'))}.")
@@ -1456,7 +1703,8 @@ def report(run: dict) -> str:
                             f"{decision['decision']} / {decision['capability']}", decision["evidence"]) for name, decision in plan["profiles"].items()])]
         if target["catalog"]:
             units = target["catalog"]["units"]
-            lines.append(f"Measured patch: {len(units)} metadata/hunk units, {sum(unit['bytes'] for unit in units.values())} bytes across recorded patch artifacts.")
+            measure = "Measured filesystem" if "project" in target else "Measured patch"
+            lines.append(f"{measure}: {len(units)} units, {sum(unit['bytes'] for unit in units.values())} bytes across recorded source artifacts.")
         assignments = target["assignments"]
         lines += report_table(("Assignment", "Kind / role / status", "Profile", "Requested identity", "Recorded actual identity", "Runtime handle", "Recovery"),
             [(key, f"{unit['kind']} / {unit['role']} / {unit['status']}", unit["profile"], report_identity(unit["identity"]),
@@ -1464,7 +1712,7 @@ def report(run: dict) -> str:
         for key, unit in assignments.items():
             lines += ["", f"### Assignment {report_text(key)}", "", f"- Scope: {report_text(unit['scope'])}; units: {report_text(unit['units'])}; interactions: {report_text(unit['interactions'])}.",
                       f"- Workload: {report_text(unit['workload'])}; tests planned: {report_text(unit['test_plan'])}."]
-            for field in ("runtime_evidence", "runtime_copy", "runtime_outcome", "withdrawal", "superseded_by"):
+            for field in ("runtime_evidence", "runtime_copy", "runtime_outcome", "withdrawal", "superseded_by", "source_searches", "source_reads"):
                 if unit.get(field):
                     lines.append(f"- {field}: {report_text(unit[field])}")
             if unit.get("rejected_report"):
@@ -1494,7 +1742,7 @@ def report(run: dict) -> str:
         groups = [(root, min((retained[key]["severity"] for key in ids), key=SEVERITIES.index), sorted(ids)) for root, ids in roots.items()]
         groups.sort(key=lambda group: (SEVERITIES.index(group[1]), group[0]))
         lines += report_table(("Group", "Adjudicated root cause", "Highest retained severity", "Raw IDs"),
-            [(f"F-{number:02d}" if row["derived_event"] is not None else "provisional", *group) for number, group in enumerate(groups, 1)])
+            [(f"F-{number:02d}" if row["derived_event"] is not None or ("project" in target and row["phase"] == "complete") else "provisional", *group) for number, group in enumerate(groups, 1)])
         for key, raw in sorted(target["findings"].items(), key=lambda pair: (SEVERITIES.index(target["adjudications"].get(pair[0], pair[1])["severity"]), pair[0])):
             vet = target["vets"].get(key)
             final = target["adjudications"].get(key)
@@ -1563,6 +1811,8 @@ def next_decision(run: dict, target: dict) -> dict:
                      discussion=metadata["discussion"], baseline=metadata.get("discussion_baseline"),
                      prior_review=metadata.get("prior_review"))
     if target["phase"] == "intake":
+        if "project" in target and target["project"]["error"]:
+            return needs("project_source", target["project"]["error"], requested_roots=target["project"]["requested_roots"])
         return needs("prepare_source", "run prepare with the verified source checkout to pin comparison, patches and baselines")
     if target["phase"] == "setup":
         return needs("finalize_source", "finish selected index setup, then finalize the unchanged comparison; no assignments until finalization",
@@ -1571,7 +1821,7 @@ def next_decision(run: dict, target: dict) -> dict:
         return needs("review_catalog", "run catalog with the configured roster to inventory frozen metadata and hunks")
     if target["plan"] is None:
         if run["method"] == "pr-review-batch":
-            key = f"{target['repository']}#{target['intake']['number']}"
+            key = next(key for key, value in run["targets"].items() if value is target)
             if not any(key in wave["allocations"] for wave in run["batch_waves"]):
                 held = next((wave["held"][key] for wave in reversed(run["batch_waves"]) if key in wave["held"]), None)
                 if held:
@@ -1579,6 +1829,8 @@ def next_decision(run: dict, target: dict) -> dict:
                 return needs("batch_wave", "record discovery reviewer judgments and native capacity to allocate a batch wave")
         return needs("plan_assignments", "choose coherent boundaries, required family perspectives and model-selection reasons")
     if target["phase"] == "complete":
+        if "project" in target:
+            return {"status": "complete", "reason": "local filesystem assessment; no PR approval, merge verdict or GitHub publication"}
         if target["intake"]["classification"] == "self-authored-review":
             return {"status": "complete", "reason": "self-authored review is local; GitHub publication is disabled"}
         if "comparison" in target:
@@ -1707,13 +1959,143 @@ def issue_handoff(directory: Path, saved: dict, run: dict, key: str, assignment_
     data = {"assignment_id": assignment_id, "capacity": capacity}
     approved = apply_event(run, {"target": key, "operation": "task-ready", "data": data}, directory=directory)
     task = contract.dispatch_task(approved, key, assignment_id, capacity, directory=directory)
+    parent = Path(capacity["runtime_parent_root"])
+    if task["dispatch"]["worktree"] == "isolated" and parent.parts[-4:-2] == (".delta", "worktrees"):
+        parents = parent_ledgers(directory, run)
+        metadata = parents[str(parent)]["git"]
+        project = parent.parents[3]
+        if (metadata.get("head") is not None
+                and preparation.clone_reference(parent, project, Path(preparation.common_dir(parent)), metadata["head"])
+                and str(project) not in parents):
+            raise NeedsDecision("runtime_parent", f"register native owning project {project} with baseline before dispatch")
     task["target_id"] = key
     data["handoff"] = handoff.store(directory, {"task.json": (json.dumps(task, ensure_ascii=True) + "\n").encode()})["task.json"]
+    if "project" in run["targets"][key] and run["targets"][key]["assignments"][assignment_id]["kind"] == "discovery":
+        data["source_read_required"] = True
     append_record(directory, saved, run, key, "task-ready", data)
     result = {name: value for name, value in task.items() if name not in ("task", "bootstrap", "report_template", "target_id")}
     result["handoff"] = data["handoff"]
     result["task"] = task["bootstrap"]
     return result
+
+
+def verify_source_reads(directory: Path, target: dict, row: dict) -> None:
+    """Verify retained delivery artifacts before sealing or accepting a report.
+
+    Args:
+        directory (Path): Locked private run directory.
+        target (dict): Frozen target and recovery history.
+        row (dict): Native assignment whose read evidence will be used.
+
+    Raises:
+        ValueError: A receipt changed or disagrees with its recorded metadata.
+        OSError: A private delivery artifact is unavailable.
+    """
+    for read in source_reads(target, row):
+        payload = json.loads(handoff.read(directory, read["receipt"]))
+        if any(payload.get(name) != value for name, value in read.items() if name != "receipt"):
+            raise ValueError("source read receipt differs from its recorded delivery")
+
+
+def source_read(directory: Path, saved: dict, run: dict, key: str, assignment_id: str,
+                name: str, offset: int, length: int, source_target: str | None) -> dict:
+    """Deliver and retain a bounded slice of a verified frozen source file.
+
+    Args:
+        directory (Path): Locked private run directory.
+        saved (dict): Persisted journal envelope.
+        run (dict): Replayed state with source integrity checked by the caller.
+        key (str): Assignment's owning target.
+        assignment_id (str): Registered running reviewer.
+        name (str): Literal relative source filename.
+        offset (int): Zero-based byte offset.
+        length (int): Maximum bytes to deliver, from one through 32768.
+        source_target (str | None): Related target ID, or None for the owner.
+
+    Returns:
+        dict: Exact UTF-8 or base64 content, next offset, hashed receipt and revision.
+
+    Raises:
+        ValueError: The path, range, binding or file identity is unsafe or changed.
+        OSError: Source or private evidence cannot be read or persisted.
+    """
+    handoff_task(directory, run, key, assignment_id)
+    row = run["targets"][key]["assignments"][assignment_id]
+    if row["status"] != "running" or row.get("authored_report"):
+        raise ValueError("source read requires a running, unsealed assignment")
+    preparation.relative_path(name)
+    if type(offset) is not int or offset < 0 or type(length) is not int or not 1 <= length <= 32768:
+        raise ValueError("invalid source read range")
+    selected_key = source_target or key
+    selected = run["targets"].get(selected_key)
+    if (not selected or selected["resources_removed"] or selected["frozen"] is None
+            or selected_key != key and contract.related_targets(run["targets"][key]).get(selected_key) != selected["frozen"]):
+        raise ValueError("source read requires its owning or related frozen target")
+    frozen = selected["frozen"]
+    if "project" in selected and frozen["manifest"]["entries"].get(name, {}).get("kind") != "file":
+        raise ValueError("source read requires a captured regular file; inspect metadata through task-read")
+    root = Path(frozen["source_root"])
+    path = root / name
+    if path.resolve(strict=True) != path or not path.is_relative_to(root):
+        raise ValueError("source read requires an unredirected frozen path")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or offset > before.st_size:
+            raise ValueError("source read requires a regular file and an available byte range")
+        checksum = hashlib.file_digest(source, "sha256").hexdigest()
+        source.seek(offset)
+        raw = source.read(length)
+        after = os.fstat(source.fileno())
+        attributes = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode", "st_uid", "st_nlink")
+        if any(getattr(before, field) != getattr(after, field) for field in attributes):
+            raise ValueError("source changed during bounded read")
+    data = {"assignment_id": assignment_id, "source_target": selected_key, "source_root": str(root), "path": name,
+            "offset": offset, "length": len(raw), "total_bytes": before.st_size, "file_sha256": checksum}
+    try:
+        content, encoding = raw.decode("utf-8"), "utf-8"
+    except UnicodeError:
+        content, encoding = base64.b64encode(raw).decode("ascii"), "base64"
+    payload = dict(data, content=content, encoding=encoding,
+                   next_offset=offset + len(raw) if offset + len(raw) < before.st_size else None)
+    data["receipt"] = handoff.store(directory, {"source.json": (json.dumps(payload, ensure_ascii=True) + "\n").encode()})["source.json"]
+    run = append_record(directory, saved, run, key, "source-read", data)
+    return dict(payload, status="read", receipt=data["receipt"], revision=run["revision"])
+
+
+def source_search(directory: Path, saved: dict, run: dict, key: str, assignment_id: str,
+                  pattern: str, selected: list[str], regex: bool, retry_of: str | None) -> dict:
+    """Journal an execution intent before running one frozen-source search.
+
+    Args:
+        directory (Path): Locked private run directory.
+        saved (dict): Persisted journal envelope.
+        run (dict): Replayed state, already checked for source integrity.
+        key (str): Target key.
+        assignment_id (str): Running native assignment.
+        pattern (str): Search text or regular expression.
+        selected (list[str]): Relative frozen-source paths, or empty for its root.
+        regex (bool): Enable regular expression matching.
+        retry_of (str | None): Explicit failed/interrupted query being corrected.
+
+    Returns:
+        dict: Original output previews, durable receipt, search ID and saved revision.
+
+    Raises:
+        ValueError: The task, query or retry binding is invalid.
+        OSError: Evidence or journal persistence failed; the pending intent remains.
+        NeedsDecision: The assignment has not been registered.
+    """
+    handoff_task(directory, run, key, assignment_id)
+    identifier = "search-" + uuid.uuid4().hex
+    run = append_record(directory, saved, run, key, "source-search-started", {
+        "assignment_id": assignment_id, "id": identifier,
+        "query": {"pattern": pattern, "paths": selected, "regex": regex}, "retry_of": retry_of})
+    result = handoff.search(directory, Path(run["targets"][key]["frozen"]["source_root"]), pattern, selected, regex)
+    run = append_record(directory, saved, run, key, "source-search-result", {
+        "assignment_id": assignment_id, "id": identifier, "exit_code": result["exit_code"], "receipt": result["receipt"]})
+    return dict(result, id=identifier, revision=run["revision"],
+                status="matches" if result["exit_code"] == 0 else "no_matches" if result["exit_code"] == 1 else "error")
 
 
 def author_report(directory: Path, saved: dict, run: dict, key: str, assignment_id: str, input_path: Path) -> dict:
@@ -1746,6 +2128,13 @@ def author_report(directory: Path, saved: dict, run: dict, key: str, assignment_
         raise ValueError("author-report --input requires a readable judgment JSON file path; inline JSON is not supported") from error
     data = {"assignment_id": assignment_id, "task_sha256": row["task_ready"]["handoff"]["sha256"]}
     errors = []
+    verify_source_reads(directory, run["targets"][key], row)
+    for search in row.get("source_searches", {}).values():
+        if "receipt" in search:
+            receipt = json.loads(handoff.read(directory, search["receipt"]))
+            for name in ("stdout", "stderr"):
+                if name in receipt:
+                    handoff.read(directory, receipt[name], limit=0)
     try:
         payload, _ = json.JSONDecoder().raw_decode(task["task"].split("\n", 1)[1])
         reply = handoff.assemble(task["report_template"], json.loads(original), originals=payload.get("retained_findings"))
@@ -1771,11 +2160,11 @@ def author_report(directory: Path, saved: dict, run: dict, key: str, assignment_
     if errors:
         data["errors"] = errors
         append_record(directory, saved, run, key, "report-draft", data)
-        return dict(data, status="needs_decision", code="report_draft", expected_coverage={
+        return dict(data, status="needs_decision", code="report_draft", revision=len(saved["events"]), expected_coverage={
             "checked": row["scope"], "checked_units": row["units"], "checked_interactions": row["interactions"],
             "finding_ids": row.get("finding_ids", [])})
     append_record(directory, saved, run, key, "report-authored", data)
-    return data
+    return dict(data, revision=len(saved["events"]))
 
 
 def read_json(path):
@@ -1824,7 +2213,7 @@ def append_record(directory: Path, saved: dict, run: dict, key: str | None, oper
 
     Args:
         directory (Path): Locked private run directory.
-        saved (dict): Persisted journal envelope, updated after successful validation.
+        saved (dict): Persisted journal envelope, updated after successful persistence.
         run (dict): Current replayed state.
         key (str | None): Target key, or null for a batch wave.
         operation (str): Typed transition.
@@ -1840,8 +2229,8 @@ def append_record(directory: Path, saved: dict, run: dict, key: str | None, oper
     """
     event = {"target": key, "operation": operation, "data": data}
     updated = apply_event(run, event, directory=directory)
+    write_json(directory / "run.json", {**saved, "events": [*saved["events"], event]})
     saved["events"].append(event)
-    write_json(directory / "run.json", saved)
     return updated
 
 
@@ -1941,7 +2330,8 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
         observation = preparation.check(directory, run["run_id"], key, comparison, baselines,
                                         setup=target["index_setup"] if target["frozen"] is None else None,
                                         observations=observations, native_copies=runtime_copies(run, runtime_copy))
-        if record_unchanged or observation["status"] != "unchanged":
+        if (record_unchanged or observation["status"] != "unchanged" or
+                observation.get("cache_changes") and target["integrity"][-1:] != [observation]):
             run = append_record(directory, saved, run, key, "integrity", observation)
     failures, _ = integrity_failures(run)
     if stop and failures:
@@ -2062,6 +2452,9 @@ def main() -> int:
     scope.add_argument("--repo")
     scope.add_argument("--org")
     scope.add_argument("--source", help="local comparison checkout; PR preparation uses prepare --source")
+    scope.add_argument("--project", action="append", help="explicit current-filesystem root; repeat for independent projects")
+    create.add_argument("--exclude", action="append", nargs=2, default=[], metavar=("RELATIVE_PATH", "REASON"),
+                        help="explicit project subtree exclusion and rationale; repeat as needed, applies to every project")
     create.add_argument("--pr", type=int, nargs="+")
     create.add_argument("--review-own-pr", action="store_true", help="review explicitly named self-authored PRs locally; no publication")
     create.add_argument("--admission-mode", choices=ADMISSION_MODES, default="observed",
@@ -2087,10 +2480,20 @@ def main() -> int:
     task.add_argument("--assignment", required=True)
     task.add_argument("--capacity", help="fresh native active counts/evidence JSON; omit in explicit native admission mode")
     task.add_argument("--revision", type=int, required=True)
-    for name in ("task-read", "author-report", "receive-report"):
+    for name in ("task-read", "author-report", "receive-report", "source-search", "source-read"):
         command = commands.add_parser(name, help="verified file-backed native task/report handoff")
         command.add_argument("--target", required=True)
         command.add_argument("--assignment", required=True)
+        if name == "source-read":
+            command.add_argument("--path", required=True, help="literal relative frozen-source file")
+            command.add_argument("--offset", type=int, default=0, help="zero-based byte offset")
+            command.add_argument("--length", type=int, default=16384, help="maximum bytes to deliver, 1..32768")
+            command.add_argument("--source-target", help="explicit related target ID; defaults to the owning target")
+        if name == "source-search":
+            command.add_argument("--pattern", required=True, help="literal search text; use --pattern='text' for leading dashes")
+            command.add_argument("--path", action="append", default=[], help="relative frozen-source path; repeat to narrow scope")
+            command.add_argument("--regex", action="store_true", help="interpret the pattern as a regular expression")
+            command.add_argument("--retry-of", help="failed/interrupted search ID explicitly corrected by this query")
         if name == "task-read":
             command.add_argument("--section", help="sealed evidence key/subkey/list-index; omit to read assignment controls")
             command.add_argument("--offset", type=int, default=0, help="byte offset in section ASCII JSON")
@@ -2126,18 +2529,34 @@ def main() -> int:
             command.add_argument("--evidence", help="why static source inspection covers failed/unavailable indexes")
     args = parser.parse_args()
     directory = Path(args.run).absolute()
+    journal = None
     try:
         if args.command == "create":
             if args.review_own_pr and (not args.repo or not args.pr):
                 raise ValueError("--review-own-pr requires --repo and explicit --pr")
             if directory.parent.resolve() != directory.parent or directory.exists() or directory.is_symlink():
                 raise ValueError("run must be a new directory without symlink parents")
-            checkout = subprocess.run(["rtk", "proxy", "git", "-C", str(directory.parent), "rev-parse", "--show-toplevel"], capture_output=True, check=False)
-            if checkout.returncode == 0:
-                raise ValueError("run records must stay outside Git checkouts")
+            if not directory.parent.is_dir():
+                raise ValueError("run parent directory must already exist; create it before initialization")
+            if args.project:
+                if any((root / ".git").exists() for root in (directory.parent, *directory.parent.parents)):
+                    raise ValueError("run records must stay outside Git checkouts")
+            else:
+                checkout = subprocess.run(["rtk", "proxy", "git", "-C", str(directory.parent), "rev-parse", "--show-toplevel"], capture_output=True, check=False)
+                if checkout.returncode == 0:
+                    raise ValueError("run records must stay outside Git checkouts")
             if args.org and args.pr:
                 raise ValueError("--pr requires --repo")
-            if args.source:
+            if args.project:
+                if args.pr or args.previous_run or args.range or args.branch or args.working or args.base or args.untracked is not None:
+                    raise ValueError("project review cannot combine PR/comparison/history flags")
+                collection = project_collection(args.project, args.exclude)
+                if any(row["source_root"] and (directory.is_relative_to(Path(row["source_root"]))
+                       or Path(row["source_root"]).is_relative_to(directory)) for row in collection["projects"]):
+                    raise ValueError("run and project directories must be separate")
+            elif args.exclude:
+                raise ValueError("--exclude requires --project")
+            elif args.source:
                 if args.previous_run:
                     raise ValueError("--previous-run applies only to PR intake")
                 collection = local_collection(args)
@@ -2165,6 +2584,7 @@ def main() -> int:
             with os.fdopen(descriptor, "w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 saved, run = load_run(directory / "run.json")
+                journal = saved
                 if hasattr(args, "revision") and args.revision != run["revision"]:
                     raise ValueError(f"stale revision; current revision is {run['revision']}")
                 event = fields(read_json(args.event), ("target", "operation", "data")) if args.command == "record" else None
@@ -2173,7 +2593,7 @@ def main() -> int:
                                 and event["operation"] in ("started", "withdraw") and isinstance(event["data"], dict) else None)
                     require_registered_launch(run, settling)
                 if event is not None:
-                    if event["operation"] in ("native-parent", "prepare", "index-setup", "baseline", "integrity", "test-copy", "cleanup", "catalog", "task-ready", "report-draft", "report-authored", "publication-context", "publication-intent", "publication-outcome", "publication-reconciliation", "publication-receipt") or (event["operation"] == "freeze" and "preparation" in event["data"]):
+                    if event["operation"] in ("native-parent", "prepare", "index-setup", "baseline", "integrity", "test-copy", "cleanup", "catalog", "task-ready", "report-draft", "report-authored", "source-read", "source-search-started", "source-search-result", "publication-context", "publication-intent", "publication-outcome", "publication-reconciliation", "publication-receipt") or (event["operation"] == "freeze" and "preparation" in event["data"]):
                         raise ValueError("generated preparation/task/publication evidence requires its dedicated command")
                     if event["operation"] == "started":
                         row = run["targets"][event["target"]]["assignments"].get(event["data"].get("assignment_id"), {})
@@ -2225,7 +2645,7 @@ def main() -> int:
                         raise NeedsDecision("native_capacity", "observed admission requires fresh --capacity counts and evidence")
                     print(json.dumps(issue_handoff(directory, saved, run, args.target, args.assignment, capacity), indent=2))
                     return 0
-                elif args.command in ("task-read", "author-report", "receive-report"):
+                elif args.command in ("task-read", "author-report", "receive-report", "source-search", "source-read"):
                     key = args.target
                     row = run["targets"][key]["assignments"][args.assignment]
                     if args.command == "receive-report":
@@ -2235,6 +2655,7 @@ def main() -> int:
                             raise ValueError("receive-report requires its exact original native handle and unreceived report")
                         handoff.read(directory, row["task_ready"]["handoff"])
                         handoff.read(directory, proof["input"])
+                        verify_source_reads(directory, run["targets"][key], row)
                         raw = handoff.read(directory, proof["report"])
                         try:
                             original = raw.decode("utf-8")
@@ -2253,7 +2674,23 @@ def main() -> int:
                         if row["status"] != "running":
                             raise NeedsDecision("runtime_registration", "send the parent your native pwd -P result and wait for started registration before reading or authoring")
                         run = check_sources(directory, saved, run, stop=args.command == "task-read", record_unchanged=False)
-                        if args.command == "task-read":
+                        if args.command in ("source-search", "source-read"):
+                            if any(integrity_failures(run)):
+                                raise NeedsDecision("source_integrity", "preserve changed source before searching")
+                            result = (source_search(directory, saved, run, key, args.assignment,
+                                                    args.pattern, args.path, args.regex, args.retry_of) if args.command == "source-search" else
+                                      source_read(directory, saved, run, key, args.assignment,
+                                                  args.path, args.offset, args.length, args.source_target))
+                            run = load_run(directory / "run.json")[1]
+                            run = check_sources(directory, saved, run, stop=False, record_unchanged=False)
+                            result["revision"] = run["revision"]
+                            if any(integrity_failures(run)):
+                                result.update(status="needs_decision", code="source_integrity")
+                            print(json.dumps(result, indent=2))
+                            if result.get("status") == "needs_decision":
+                                return 2
+                            return 0 if args.command == "source-read" or result["exit_code"] in (0, 1) else 1
+                        elif args.command == "task-read":
                             command = (f"rtk proxy python3 {shlex.quote(str(Path(__file__).absolute()))} --run {shlex.quote(str(directory))}"
                                        f" task-read --target {shlex.quote(key)} --assignment {shlex.quote(args.assignment)}")
                             print(handoff.task_view(handoff_task(directory, run, key, args.assignment), command,
@@ -2275,6 +2712,9 @@ def main() -> int:
                             raise NeedsDecision("prepare_source", "diff requires existing frozen preparation resources")
                         run = check_sources(directory, saved, run, record_unchanged=False)
                         frozen = target["frozen"]
+                        if "project" in target:
+                            print(json.dumps(frozen["manifest"], indent=2))
+                            return 0
                         output = preparation.git(Path(frozen["source_root"]), "diff", *preparation.DIFF_OPTIONS,
                                                  *preparation.PATCH_OPTIONS, frozen["diff_base_sha"], frozen["head_sha"], "--")
                         sys.stdout.buffer.write(output)
@@ -2293,7 +2733,9 @@ def main() -> int:
                         run = append_record(directory, saved, run, key, "catalog", data)
                     elif args.command == "prepare":
                         require_phase(target, "intake")
-                        source_arg = args.source or run["intake"].get("local", {}).get("source_root")
+                        if "project" in target and target["project"]["error"]:
+                            raise NeedsDecision("project_source", target["project"]["error"])
+                        source_arg = args.source or target.get("project", {}).get("source_root") or run["intake"].get("local", {}).get("source_root")
                         if not source_arg:
                             raise NeedsDecision("source_checkout", "supply the verified source checkout with --source")
                         parent = Path(source_arg).resolve()
@@ -2333,7 +2775,11 @@ def main() -> int:
                         if target["frozen"] is None or target["resources_removed"] or args.id in target["baselines"]:
                             raise ValueError("baseline requires prepared resources and a new copy ID")
                         root = Path(args.root).absolute()
-                        data = preparation.capture_baseline(directory, args.id, root, runtime_copies(run))
+                        cache_recovery = ("project" in target and str(root) == target["frozen"]["parent_root"]
+                                          and any(row["path"] in (".codegraph", ".codegraph/codegraph.db-shm")
+                                                  for row in target["project"]["exclusions"]))
+                        data = preparation.capture_baseline(directory, args.id, root, runtime_copies(run),
+                                                            filesystem="project" in target, cache_recovery=cache_recovery)
                         run = append_record(directory, saved, run, key, "baseline", data)
                     elif args.command == "test-copy":
                         if target["frozen"] is None or target["resources_removed"]:
@@ -2344,6 +2790,7 @@ def main() -> int:
                         root = preparation.test_copy(directory, run["run_id"], key, target["frozen"])
                         run = append_record(directory, saved, run, key, "test-copy", {"root": str(root)})
                     elif args.command == "cleanup":
+                        apply_event(run, {"target": key, "operation": "cleanup", "data": {"resources": []}})
                         if any(row["status"] in ("queued", "running") for row in target["assignments"].values()):
                             raise NeedsDecision("active_assignments", "settle active assignments before cleaning review resources")
                         comparison = target["frozen"] or target["setup"]
@@ -2355,13 +2802,17 @@ def main() -> int:
         else:
             print(json.dumps(status(run), indent=2))
         return 0
-    except NeedsDecision as error:
-        print(json.dumps({"status": "needs_decision", "code": error.code, "reason": str(error)}))
-        return 2
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
-        message = str(error) if isinstance(error, ValueError) and not isinstance(error, json.JSONDecodeError) else "invalid or unreadable run input"
-        print(json.dumps({"status": "invalid", "reason": message, "error_type": type(error).__name__}), file=sys.stderr)
-        return 1
+    except (NeedsDecision, OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        result: dict
+        if isinstance(error, NeedsDecision):
+            result = {"status": "needs_decision", "code": error.code, "reason": str(error)}
+        else:
+            message = str(error) if isinstance(error, ValueError) and not isinstance(error, json.JSONDecodeError) else "invalid or unreadable run input"
+            result = {"status": "invalid", "reason": message, "error_type": type(error).__name__}
+        if journal is not None and not isinstance(error, OSError):
+            result["revision"] = len(journal["events"])
+        print(json.dumps(result), file=sys.stdout if isinstance(error, NeedsDecision) else sys.stderr)
+        return 2 if isinstance(error, NeedsDecision) else 1
 
 
 if __name__ == "__main__":

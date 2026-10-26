@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "skills/pr-review/scripts"
+SCRIPTS = ROOT / "review/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import workflow
 
@@ -404,15 +404,17 @@ class WorkflowTests(unittest.TestCase):
                 run = self.prepared() if kind == "discovery" else self.discovered(findings=[raw()])
                 extra = {} if kind == "discovery" else {"finding_ids": ["review-01"]}
                 run = workflow.apply_event(run, event("assignment", assignment(key, model, kind, **extra)))
-                payload = json.loads(workflow.contract.task_block(run, TARGET, key)["task"].splitlines()[1])
+                task = workflow.contract.task_block(run, TARGET, key)
+                payload = json.loads(task["task"].splitlines()[1])
                 template = payload["report_template"]
-                self.assertEqual({name: template[name] for name in ("assignment_id", "target", "reviewer")},
+                self.assertEqual({name: task["report_template"][name] for name in ("assignment_id", "target", "reviewer")},
                                  {"assignment_id": key, "target": FROZEN, "reviewer": workflow.model_record(model, REGISTRY)})
+                self.assertFalse(set(template) & {"assignment_id", "target", "reviewer"})
                 self.assertIsNone(template["status"])
                 self.assertIsNone(template["source_status"])
                 self.assertEqual(template["evidence"], "")
                 self.assertEqual(payload["severity_values"], list(workflow.contract.SEVERITIES))
-                self.assertEqual(payload["finding_template"]["finder"], template["reviewer"])
+                self.assertNotIn("finder", payload["finding_template"])
                 self.assertEqual(payload["test_plan"], assignment()["test_plan"])
                 reply = copy.deepcopy(template)
                 reply.update({name: value for name, value in report(key).items()
@@ -424,14 +426,14 @@ class WorkflowTests(unittest.TestCase):
                 else:
                     self.assertEqual(len(reply["verdicts"]), 1)
                     self.assertEqual(reply["verdicts"][0]["finding_id"], "review-01")
-                    self.assertEqual(reply["verdicts"][0]["assignment_id"], key)
+                    self.assertNotIn("assignment_id", reply["verdicts"][0])
                     reply["verdicts"][0].update({name: value for name, value in vet().items()
                                                  if name not in ("finding_id", "assignment_id")})
                 run = workflow.apply_event(run, event("started", start(key, model)))
                 unfilled = dict(copy.deepcopy(template), status="done", source_status="unchanged")
                 with self.assertRaises((ValueError, workflow.NeedsDecision)):
-                    workflow.apply_event(run, event("report", unfilled))
-                run = workflow.apply_event(run, event("report", reply))
+                    workflow.apply_event(run, event("report", workflow.handoff.assemble(task["report_template"], unfilled)))
+                run = workflow.apply_event(run, event("report", workflow.handoff.assemble(task["report_template"], reply)))
                 self.assertEqual(run["targets"][TARGET]["assignments"][key]["status"], "done")
 
     def test_maximum_length_assignment_can_still_record_a_finding(self):
@@ -833,10 +835,13 @@ class DispatchGateTests(unittest.TestCase):
             payload = json.loads(task.splitlines()[1])
             index = (source / ".git/index").read_bytes()
             os.utime(source / "feature.txt", (1, 1))
-            for command in (payload["source_git_prefix"] + " status --porcelain",
-                            payload["source_search_prefix"] + " -F -- feature " + shlex.quote(str(source))):
-                result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
-                self.assertEqual(result.returncode, 0, result.stderr)
+            command = payload["source_git_prefix"] + " status --porcelain"
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("source-search --target", payload["source_search_command"])
+            self.assertNotIn("source_search_prefix", payload)
+            result = workflow.handoff.search(Path(directory), source, "feature", [], False)
+            self.assertEqual(result["exit_code"], 0, result["stderr"])
             self.assertEqual((source / ".git/index").read_bytes(), index)
             self.assertEqual(sorted(path.name for path in source.iterdir()), [".git", "feature.txt"])
             self.assertIn("Do not run SessionStart maintenance", task)
@@ -1037,6 +1042,114 @@ class FileHandoffTests(unittest.TestCase):
             code = workflow.main()
         return code
 
+    def search(self, exit_code, *, retry_of=None):
+        receipt = workflow.handoff.store(self.root, {"search.json": b"{\"execution\":\"fixture\"}"})["search.json"]
+        saved, run = self.load()
+        with patch.object(workflow.handoff, "search", return_value={"exit_code": exit_code, "receipt": receipt,
+                          "stdout": "matches" if exit_code == 0 else "", "stderr": "tool failed" if exit_code == 2 else ""}):
+            return workflow.source_search(self.root, saved, run, TARGET, "review", "needle", [], False, retry_of)
+
+    def test_search_error_blocks_done_until_successful_retry_and_replays(self):
+        self.begin()
+        failed = self.search(2)
+        draft = self.author(json.dumps(self.judgments()).encode())
+        self.assertEqual(draft["code"], "report_draft")
+        self.assertTrue(any(error["code"] == "search_errors" for error in draft["errors"]))
+        success = self.search(1, retry_of=failed["id"])
+        self.assertEqual(success["exit_code"], 1)
+        proof = self.author(json.dumps(self.judgments()).encode())
+        self.assertNotIn("errors", proof)
+        _, run = self.load()
+        searches = run["targets"][TARGET]["assignments"]["review"]["source_searches"]
+        self.assertEqual(searches[failed["id"]]["exit_code"], 2)
+        self.assertEqual(searches[failed["id"]]["retried_by"], success["id"])
+        self.assertEqual(workflow.handoff.read(self.root, searches[failed["id"]]["receipt"]), b'{"execution":"fixture"}')
+        self.assertIn(failed["id"], workflow.report(run))
+
+    def test_search_error_can_only_be_reported_as_an_explicit_material_gap(self):
+        self.begin()
+        failed = self.search(2)
+        judgments = self.judgments()
+        judgments["status"] = "partial"
+        self.assertEqual(self.author(json.dumps(judgments).encode())["code"], "report_draft")
+        judgments["coverage_gaps"] = [{"id": failed["id"], "reason": "Tool failed; search coverage is incomplete", "material": True}]
+        self.assertNotIn("errors", self.author(json.dumps(judgments).encode()))
+
+    def test_interrupted_search_intent_cannot_be_sealed_as_done(self):
+        self.begin()
+        saved, run = self.load()
+        with (patch.object(workflow.handoff, "search", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            workflow.source_search(self.root, saved, run, TARGET, "review", "needle", [], False, None)
+        _, run = self.load()
+        self.assertEqual(len(run["targets"][TARGET]["assignments"]["review"]["source_searches"]), 1)
+        self.assertEqual(self.author(json.dumps(self.judgments()).encode())["code"], "report_draft")
+
+    def test_engine_search_quotes_paths_retains_outputs_and_distinguishes_no_match(self):
+        source = self.root / "source with spaces"
+        source.mkdir()
+        (source / "literal.py").write_text("needle\n")
+        commands = []
+        def execute(argv, **kwargs):
+            commands.append(argv)
+            kwargs["stdout"].write(b"literal.py:1:needle\n")
+            return workflow.subprocess.CompletedProcess(argv, 0)
+        with patch.object(workflow.handoff.subprocess, "run", side_effect=execute):
+            result = workflow.handoff.search(self.root, source, "$(literal); --", ["literal.py"], False)
+        self.assertEqual(commands[0][-3:], ["--", "$(literal); --", str(source / "literal.py")])
+        self.assertEqual(result["exit_code"], 0)
+        receipt = json.loads(workflow.handoff.read(self.root, result["receipt"]))
+        self.assertEqual(workflow.handoff.read(self.root, receipt["stdout"]), b"literal.py:1:needle\n")
+        def large_output(argv, **kwargs):
+            kwargs["stdout"].write(b"x" * 20000)
+            return workflow.subprocess.CompletedProcess(argv, 0)
+        with patch.object(workflow.handoff.subprocess, "run", side_effect=large_output):
+            result = workflow.handoff.search(self.root, source, "needle", [], False)
+        self.assertEqual((len(result["stdout"]), result["stdout_bytes"]), (8192, 20000))
+        receipt = json.loads(workflow.handoff.read(self.root, result["receipt"]))
+        self.assertEqual(len(workflow.handoff.read(self.root, receipt["stdout"])), 20000)
+        for failure in (FileNotFoundError("missing tool"), workflow.subprocess.TimeoutExpired("tgrep", 30)):
+            with patch.object(workflow.handoff.subprocess, "run", side_effect=failure):
+                self.assertIsNone(workflow.handoff.search(self.root, source, "needle", [], False)["exit_code"])
+        result = workflow.handoff.search(self.root, source, "needle", ["../run.json"], False)
+        self.assertIsNone(result["exit_code"])
+        (source / ".git").mkdir()
+        (source / "alias").symlink_to(".git", target_is_directory=True)
+        self.assertIsNone(workflow.handoff.search(self.root, source, "needle", ["alias"], False)["exit_code"])
+        (source / "loop").symlink_to("loop")
+        self.assertIsNone(workflow.handoff.search(self.root, source, "needle", ["loop"], False)["exit_code"])
+
+    def test_source_search_cli_returns_structured_failure_and_records_intent(self):
+        self.begin()
+        _, run = self.load()
+        receipt = workflow.handoff.store(self.root, {"search.json": b"{}"})["search.json"]
+        argv = ["workflow.py", "--run", str(self.root), "source-search", "--target", TARGET,
+                "--assignment", "review", "--pattern=needle"]
+        output = io.StringIO()
+        with (patch.object(sys, "argv", argv), patch.object(sys, "stdout", output),
+              patch.object(workflow, "check_sources", side_effect=lambda directory, saved, state, **kwargs: state),
+              patch.object(workflow.handoff, "search", return_value={"exit_code": 2, "receipt": receipt,
+                                "stdout": "", "stderr": "invalid expression"})):
+            self.assertEqual(workflow.main(), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "error")
+        _, current = self.load()
+        self.assertEqual(current["revision"], result["revision"])
+        self.assertEqual(current["revision"], run["revision"] + 2)
+        self.assertEqual(self.author(json.dumps(self.judgments()).encode())["code"], "report_draft")
+
+    def test_changed_search_output_cannot_support_a_sealed_report(self):
+        self.begin()
+        outputs = workflow.handoff.store(self.root, {"stdout.txt": b"original evidence", "stderr.txt": b""})
+        receipt = workflow.handoff.store(self.root, {"search.json": json.dumps({
+            "stdout": outputs["stdout.txt"], "stderr": outputs["stderr.txt"]}).encode()})["search.json"]
+        saved, run = self.load()
+        with patch.object(workflow.handoff, "search", return_value={"exit_code": 0, "receipt": receipt}):
+            workflow.source_search(self.root, saved, run, TARGET, "review", "needle", [], False, None)
+        (self.root / outputs["stdout.txt"]["artifact"]).write_bytes(b"replaced evidence")
+        with self.assertRaisesRegex(ValueError, "artifact changed"):
+            self.author(json.dumps(self.judgments()).encode())
+
     def test_compact_bootstrap_reads_exact_task_and_stale_approval_cannot_be_used(self):
         saved, run = self.load()
         task = workflow.handoff_task(self.root, run, TARGET, "review")
@@ -1052,6 +1165,46 @@ class FileHandoffTests(unittest.TestCase):
         run = workflow.append_record(self.root, saved, run, TARGET, "integrity", {"status": "unchanged", "components": []})
         with self.assertRaisesRegex(ValueError, "current queued approval"):
             workflow.handoff_task(self.root, run, TARGET, "review")
+
+    def test_author_template_sections_omit_transport_fields_without_changing_bindings(self):
+        _, run = self.load()
+        task = workflow.handoff_task(self.root, run, TARGET, "review")
+        encoded = workflow.handoff.task_view(task, "task-read", section="report_template", length=32768)
+        template = json.loads(encoded.split("\n", 1)[1])
+        self.assertFalse(set(template) & {"assignment_id", "target", "reviewer", "related_targets"})
+        finding = workflow.handoff.task_view(task, "task-read", section="finding_template", length=32768)
+        self.assertNotIn("finder", json.loads(finding.split("\n", 1)[1]))
+        self.assertEqual(task["report_template"]["target"], FROZEN)
+        self.assertNotIn("Preserve assignment_id exactly", task["task"])
+        self.assertIn("source-read", task["task"])
+
+    def test_search_obeys_canonical_root_policy_and_fails_closed_when_unavailable(self):
+        policy_home = self.root / "policy-home"
+        (policy_home / ".config").mkdir(parents=True)
+        policy = policy_home / ".config/context-roots"
+        policy.write_text(str(self.root / "allowed") + "/*/*\n")
+        roots = [self.root / "outside", self.root / "allowed/account/repository", self.root / "allowed/account"]
+        for source in roots:
+            source.mkdir(parents=True, exist_ok=True)
+        commands = []
+        def execute(argv, **kwargs):
+            commands.append(argv)
+            return workflow.subprocess.CompletedProcess(argv, 1)
+        with (patch.object(Path, "home", return_value=policy_home),
+              patch.object(workflow.handoff.subprocess, "run", side_effect=execute)):
+            for source in roots:
+                self.assertEqual(workflow.handoff.search(self.root, source, "needle", [], False)["exit_code"], 1)
+            policy.unlink()
+            workflow.handoff.search(self.root, roots[1], "needle", [], False)
+        self.assertEqual([command[2] for command in commands], ["rg", "tgrep", "rg", "rg"])
+        self.assertTrue(all("--hidden" in command and "--no-ignore" in command for command in commands))
+
+    def test_field_errors_identify_unknown_keys_and_receipts_return_saved_revision(self):
+        with self.assertRaisesRegex(ValueError, "unexpected.*evidence"):
+            workflow.fields({"id": "correction", "evidence": "unsupported"}, ("id",))
+        self.begin()
+        receipt = self.author(json.dumps(self.judgments()).encode())
+        self.assertEqual(receipt["revision"], self.load()[1]["revision"])
 
     def test_pending_native_clone_is_not_checked_before_started_registration(self):
         before = (self.root / "run.json").read_bytes()
@@ -1889,7 +2042,8 @@ class FamilyRoutingTests(unittest.TestCase):
         run = self.stand_in_ready()
         unit = assignment("judge", MODEL_C, "adjudication", finding_ids=["review-01"])
         run = workflow.apply_event(run, event("assignment", unit))
-        task = workflow.contract.task_block(run, TARGET, "judge")["task"]
+        envelope = workflow.contract.task_block(run, TARGET, "judge")
+        task = envelope["task"]
         self.assertTrue(task.startswith("ADJUDICATE judge\n"))
         self.assertIn('"findings_to_adjudicate"', task)
         self.assertIn('"vet_verdicts"', task)
@@ -1906,11 +2060,12 @@ class FamilyRoutingTests(unittest.TestCase):
         delegated = copy.deepcopy(payload["report_template"])
         self.assertIsNone(delegated["status"])
         self.assertEqual(delegated["adjudications"][0]["finding_id"], "review-01")
-        self.assertEqual(delegated["adjudications"][0]["assignment_id"], "judge")
+        self.assertNotIn("assignment_id", delegated["adjudications"][0])
         delegated.update({name: value for name, value in self.judge_report().items()
                           if name not in ("assignment_id", "target", "reviewer", "adjudications")})
         delegated["adjudications"][0].update({name: value for name, value in self.judge_report()["adjudications"][0].items()
                                              if name not in ("finding_id", "assignment_id")})
+        delegated = workflow.handoff.assemble(envelope["report_template"], delegated)
         run = workflow.apply_event(run, event("adjudication-report", delegated))
         self.assertEqual(original["targets"][TARGET]["assignments"]["judge"]["status"], "running")
         with self.assertRaises(workflow.NeedsDecision) as caught:
@@ -2215,14 +2370,15 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(task["runtime_handle"], "review-handle")
         payload = json.loads(task["task"].splitlines()[1])
         self.assertIn(rejected["reason"], payload["correction"]["reason"])
-        self.assertEqual(payload["report_template"]["assignment_id"], "correct")
-        self.assertEqual(payload["report_template"]["target"], FROZEN)
-        self.assertEqual(payload["report_template"]["reviewer"], workflow.model_record(MODEL_A, REGISTRY))
+        self.assertEqual(task["report_template"]["assignment_id"], "correct")
+        self.assertEqual(task["report_template"]["target"], FROZEN)
+        self.assertEqual(task["report_template"]["reviewer"], workflow.model_record(MODEL_A, REGISTRY))
+        self.assertFalse(set(payload["report_template"]) & {"assignment_id", "target", "reviewer"})
         self.assertEqual(payload["finding_template"]["id"], "review-NN")
         with self.assertRaisesRegex(ValueError, "reuse"):
             workflow.apply_event(run, event("started", start("correct")))
         run = workflow.apply_event(run, event("started", dict(start("correct"), runtime_handle="review-handle")))
-        corrected = copy.deepcopy(payload["report_template"])
+        corrected = copy.deepcopy(task["report_template"])
         corrected.update({name: value for name, value in report("correct", findings=[raw()]).items()
                           if name not in ("assignment_id", "target", "reviewer")})
         run = self.receive(run, corrected, "correct")
@@ -2845,6 +3001,37 @@ print(json.dumps(result))
             workflow.write_json(path, {"replacement": True})
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(list(self.base.glob(".review-record-*")), [])
+
+    def test_failed_append_preserves_saved_events_and_omits_uncertain_revision(self):
+        self.assertEqual(self.create().returncode, 0)
+        journal = self.directory / "run.json"
+        before = journal.read_bytes()
+        saved, run = workflow.load_run(journal)
+        original = copy.deepcopy(saved)
+        arguments = ["workflow.py", "--run", str(self.directory), "native-parent", "--revision", "0"]
+        with patch.object(workflow, "write_json", side_effect=OSError("private failure detail")):
+            with self.assertRaises(OSError):
+                workflow.append_record(self.directory, saved, run, None, "native-parent", {
+                    "root": str(self.base), "thread_id": "thread", "source": "terminal-cwd"})
+            self.assertEqual(saved, original)
+            output, errors = io.StringIO(), io.StringIO()
+            with patch.object(sys, "argv", arguments), patch.object(sys, "stdout", output), patch.object(sys, "stderr", errors):
+                self.assertEqual(workflow.main(), 1)
+        error = json.loads(errors.getvalue())
+        self.assertEqual(error["error_type"], "OSError")
+        self.assertNotIn("revision", error)
+        self.assertNotIn("private failure detail", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(journal.read_bytes(), before)
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            patch.object(workflow.os, "fsync", side_effect=[None, OSError("directory sync failed")]),
+            patch.object(sys, "argv", arguments), patch.object(sys, "stdout", output), patch.object(sys, "stderr", errors),
+        ):
+            self.assertEqual(workflow.main(), 1)
+        self.assertNotIn("revision", json.loads(errors.getvalue()))
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(workflow.load_run(journal)[1]["revision"], 1)
 
     def test_missing_identity_judgment_returns_needs_decision_without_creating_a_run(self):
         registry = copy.deepcopy(REGISTRY)

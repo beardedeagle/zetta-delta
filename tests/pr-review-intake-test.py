@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-HELPER = ROOT / "skills/pr-review/scripts/intake.py"
+HELPER = ROOT / "review/scripts/intake.py"
 sys.path.insert(0, str(HELPER.parent))
 import intake
 

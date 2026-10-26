@@ -1,5 +1,14 @@
 # Resolve the repository
 
+Explicit `--project '<root>'` or whole-project filesystem intent takes the project
+route in `review-workflow.md` before PR resolution. Use current files without
+deriving a remote, PR or GitHub owner. Repeated roots retain independent snapshots
+and results; aliases to the same canonical root share one target while preserving
+request mappings. Nested roots and distinct roots with identical content remain
+separate. Missing roots remain visible and prevent all-project completion.
+Project reports are local. A bare path or repository name keeps the PR-collection
+meaning below; never silently interpret it as filesystem review.
+
 Normalize each PR target to `owner/repo#number` before freezing source. Accept:
 
 - A PR URL: use its repository and number, verified through GitHub metadata.

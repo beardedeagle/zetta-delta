@@ -13,7 +13,7 @@ repository, then run:
 ./bootstrap.sh --force
 ```
 
-Bootstrap installs build prerequisites and GitHub CLI from `Brewfile`, builds the
+Bootstrap installs build prerequisites, GitHub CLI and ripgrep from `Brewfile`, builds the
 pinned context tools, and installs the bundle with `--configure-delta`. Its defaults
 match this machine's accounts: Z.AI Max, Qwen Pro, MiniMax plan, ChatGPT/Grok
 subscriptions, and an 8-agent thread limit (16 overall). Override the documented
@@ -123,24 +123,25 @@ way.
 | `skills/orchestrate/SKILL.md` | `~/.agents/skills/orchestrate/` | Always |
 | `skills/orchestrate/references/best-of-n.md` | same `references/` | Always |
 | `skills/orchestrate/scripts/bon.sh` | same `scripts/`, and `~/.agents/skills/isolated/scripts/` | Always; best-of-N snapshot, patch handoff, apply, cleanup |
-| `skills/orchestrate/scripts/identity.py` and `references/effective-identity.md` | each installed skill's `scripts/` and `references/` | Always; resolve effective model overrides from sanitized local metadata |
+| `skills/orchestrate/scripts/identity.py` and `references/effective-identity.md` | each skill's `scripts/` and `references/`; helper also in the shared review runtime | Always; resolve effective model overrides from sanitized local metadata |
 | `references/identity-registry.json` | each installed skill's `references/` | Generated provider lanes, billing/budgets, and exact model-family bindings |
 | `skills/adversarial/SKILL.md` | `~/.agents/skills/adversarial/` | Always |
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
 | `skills/pr-review/SKILL.md` | `~/.agents/skills/pr-review/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
 | `skills/pr-review-batch/SKILL.md` and `references/notes.md` | `~/.agents/skills/pr-review-batch/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
-| `skills/pr-review/scripts/intake.py` and `references/review-intake.md` | both PR review skills' `scripts/` and `references/` | Always; shared PR authorship and owner-review eligibility check before dispatch |
-| `skills/pr-review/references/{repositories,review-publication,review-voice,review-voice-sources}.md` | both PR review skills' `references/` | Always; repository resolution, shared submission contract, derived voice, and source coverage |
+| `review/scripts/intake.py` and `references/review-intake.md` | `~/.local/share/zetta-delta/review/scripts/` and both skills' `references/` | Always; shared PR authorship and owner-review eligibility check before dispatch |
+| `review/references/{repositories,review-publication,review-voice,review-voice-sources}.md` | both PR review skills' `references/` | Always; repository resolution, shared submission contract, derived voice, and source coverage |
 | `skills/find-docs/SKILL.md` | `~/.agents/skills/find-docs/` | Always; current developer documentation through Context7 |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
 | `tests/install-test.sh` | Not installed | Regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
 | `tests/pr-review-intake-test.py` | Not installed | Offline PR eligibility, pagination, and lookup-failure checks: `python3 tests/pr-review-intake-test.py` |
-| `skills/pr-review/scripts/workflow.py` | Both review skills' `scripts/` | Shared private journal, preparation, catalog, gated tasks, factual reports and authorized publication; no native dispatch |
-| `skills/pr-review/scripts/review_contract.py` | Both review skills' `scripts/` | Roster-bound assignments, compact task generation and method-specific coverage/evidence validation |
-| `skills/pr-review/scripts/preparation.py` | Both review skills' `scripts/` | Pinned comparisons, independent snapshots, complete patches, source checks, maintainer API coordination and owned cleanup |
-| `skills/pr-review/scripts/publication.py` | Both review skills' `scripts/` | Evidence-bound bodies, live account/comparison/discussion checks, one frozen-head review and independent receipt reads |
-| `stack/context-indexes/ensure-context-indexes.py` | Both review skills' `scripts/` | Shared index lifecycle API; owns setup, budgets, locks, queue/receipt checks and freshness. Bundled API keeps static preparation independent of the machine installation |
-| `skills/pr-review/references/review-workflow.md` | Both review skills' `references/` | Shared commands, record/report contract, analytical responsibilities and native integration limits |
+| `review/entrypoint.py.tmpl` | Both review skills' `scripts/{intake,workflow}.py` | Small launchers preserve command paths stored in existing run artifacts; all review code runs from the common runtime |
+| `review/scripts/workflow.py` | `~/.local/share/zetta-delta/review/scripts/` | Shared private journal, preparation, catalog, gated tasks, factual reports and authorized publication; no native dispatch |
+| `review/scripts/review_contract.py` | `~/.local/share/zetta-delta/review/scripts/` | Roster-bound assignments, compact task generation and method-specific coverage/evidence validation |
+| `review/scripts/preparation.py` | `~/.local/share/zetta-delta/review/scripts/` | Pinned comparisons, independent snapshots, complete patches, source checks, maintainer API coordination and owned cleanup |
+| `review/scripts/publication.py` | `~/.local/share/zetta-delta/review/scripts/` | Evidence-bound bodies, live account/comparison/discussion checks, one frozen-head review and independent receipt reads |
+| `stack/context-indexes/ensure-context-indexes.py` | `~/.local/share/zetta-delta/review/scripts/` | Shared index lifecycle API; owns setup, budgets, locks, queue/receipt checks and freshness. Bundled API keeps static preparation independent of the machine installation |
+| `review/references/review-workflow.md` | Both review skills' `references/` | Shared commands, record/report contract, analytical responsibilities and native integration limits |
 | `tests/pr-review-workflow-test.py` | Not installed | Run transitions, assignment/report contracts, review methods, publication holds and competing writers: `rtk proxy python3 tests/pr-review-workflow-test.py` |
 | `tests/pr-review-publication-test.py` | Not installed | Offline publication, authorization/materiality holds, interrupted responses and receipt reconciliation: `rtk proxy python3 tests/pr-review-publication-test.py` |
 | `tests/pr-review-preparation-test.py` | Not installed | Offline Git fixtures for comparisons, user-work preservation, index lifecycle, test copies and cleanup: `rtk proxy python3 tests/pr-review-preparation-test.py` |
@@ -506,7 +507,20 @@ unambiguous local shorthand resolve through the verified source remote. Multiple
 PRs, repository-only requests, or explicit `org:<name>` targets route to batch
 review below.
 
-Both modes run the same [intake helper](skills/pr-review/scripts/intake.py) before
+Use `/pr-review --project '<root>'` for explicit whole-project filesystem review;
+repeat `--project` for independent roots and required cross-project contracts.
+`pr-review-batch` accepts the same project targets with its existing batch routing.
+This reviews current bytes, including modified, untracked and ignored source and
+actionable existing defects. Plain folders require no Git repository, commits,
+remote or GitHub account. Aliases share a target, while nested roots and distinct
+identical-content roots remain independent. Explicit exclusions require rationale;
+unsafe links and unsupported entries remain visible coverage gaps. Reports are
+local assessments without PR approval or merge verdicts. The shared
+[workflow reference](review/references/review-workflow.md#project-filesystem-targets)
+documents capture, coverage, cross-project bindings and completion. Bare paths
+and slugs retain their existing PR-collection meaning.
+
+Both modes run the same [intake helper](review/scripts/intake.py) before
 any reviewer launch, for one PR, explicit lists, whole-repo requests, and
 organization targets. By default, it collects the requested PRs and first skips those whose
 creator matches the authenticated `gh` account, case-insensitively, including
@@ -520,7 +534,7 @@ decision. Only evidence adding/removing a finding or changing its severity reope
 the full review. Risk acceptance or declining a fix alone does not erase a valid
 finding. Owner
 is the authenticated `gh` user. Failed lookups hold dispatch for the requested
-collection. [Shared intake](skills/pr-review/references/review-intake.md) documents
+collection. [Shared intake](review/references/review-intake.md) documents
 the commands and comparison checks. GitHub records the reviewed head, so this
 eligibility check detects head changes; base/head verification still binds review
 setup and publication. Targets without a PR bypass owner-review intake.
@@ -576,10 +590,21 @@ requires a snapshot-bound finding-materiality judgment; nonmaterial changes reus
 the completed review. `preflight --draft` previews exact wording without posting.
 Native dispatch and real end-to-end publication remain untested.
 
-The shared [review voice](skills/pr-review/references/review-voice.md) governs
+Both review skills invoke one runtime installed at
+`~/.local/share/zetta-delta/review/scripts/`, sourced from `review/scripts/`.
+Their shared reference sources live in `review/references/`; each skill keeps
+its own rendered instructions, roster and identity registry. `--skill-dir`
+changes the skill entry-point location; the runtime stays under the installing
+user's `~/.local/share/zetta-delta/`. Existing skill-local intake/workflow command
+paths forward to that runtime so saved task commands remain usable. During an
+upgrade, the installer backs up and retires the other old module copies using
+its existing `--force`/dry-run rules. Review methods and journal formats stay the
+same.
+
+The shared [review voice](review/references/review-voice.md) governs
 review bodies and ordinary review-flow messages. It captures Randy's direct,
 concise cadence with professional grammar and no profanity. Its
-[source coverage](skills/pr-review/references/review-voice-sources.md) records
+[source coverage](review/references/review-voice-sources.md) records
 the assessment across both machines and connected sources, including sampling
 and access gaps. Private conversations and email text are not bundled.
 
@@ -775,7 +800,7 @@ pinned commit, with this repository's patches applied in order:
 | tgrep | microsoft/tgrep v1.0.11 | none |
 | semble | MinishLab/semble v0.6.1 | none |
 | codegraph | colbymchenry/codegraph v1.6.2 | inline Rust tests count as callers; Elixir; root-only Git ignores stay anchored; source under `build/` remains eligible |
-| zvec-grep | zvec-ai/zvec-grep v0.2.2 | Metal tensor opt-out; node-llama-cpp 3.22.1 (Metal tensor kernels on Apple M5); exact Git exclusions; source under `build/` remains eligible |
+| zvec-grep | zvec-ai/zvec-grep v0.2.2 | Metal tensor opt-out; node-llama-cpp 3.22.1 (Metal tensor kernels on Apple M5); exact Git exclusions; source under `build/` remains eligible; local embedding concurrency; daemon record recovery with serialized stale takeover and complete UTF-8 writes |
 | rtk | rtk-ai/rtk v0.51.0 | a failed command no longer prints a TOML filter's `on_empty` "ok" |
 | ctx7, githits, caveman | npm 0.5.13, 0.26.0, 2.0.1 | none |
 
@@ -789,6 +814,9 @@ removes on exit. Where things go:
   install under that prefix, and uv links Semble there.
 - Semble installs with its `mcp` extra, so agents that use Semble's MCP
   server keep working.
+- Local embedding catalog entries default to two concurrent batches. For GGUF
+  contexts, `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY` overrides automatic
+  parallelism; `ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` remains the fallback name.
 - CodeGraph: its self-contained bundle in
   `~/.codegraph/versions/`, in a directory identified by upstream version,
   patch hash, platform, and a unique build suffix, with `~/.local/bin/codegraph`

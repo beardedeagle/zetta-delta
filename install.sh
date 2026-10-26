@@ -142,7 +142,7 @@ if ((HELP)); then usage; exit 0; fi
 # The same PATH prefix travels in the generated rules to Delta's POSIX shell.
 TOOL_BIN="${PREFIX:-$HOME/.local}/bin"
 export PATH="$TOOL_BIN:$PATH"
-REQUIRED_TOOLS=(python3 git gh rtk tgrep semble codegraph zg ctx7 githits caveman node)
+REQUIRED_TOOLS=(python3 git gh rg rtk tgrep semble codegraph zg ctx7 githits caveman node)
 for tool in "${REQUIRED_TOOLS[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found; run bootstrap.sh from a clone first"
 done
@@ -380,6 +380,10 @@ canonical_dir() {
 }
 CONFIG_DIR="$(canonical_dir "$(delta_config_dir)" "Delta config")"
 SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"
+REVIEW_DIR="$(canonical_dir "$HOME/.local/share/zetta-delta/review" "review runtime")"
+[[ $REVIEW_DIR != *$'\n'* && $REVIEW_DIR != *$'\r'* && ! $REVIEW_DIR =~ \{\{[A-Z_]*\}\} ]] \
+  || die "review runtime directory must not contain line breaks or template placeholder syntax"
+REVIEW_SCRIPTS_PY="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$REVIEW_DIR/scripts")"
 # Preserve the tools preflight actually accepted, plus their runtime/build tools.
 # Do not import unrelated ambient PATH entries into desktop rules.
 TOOL_PATH=""
@@ -484,8 +488,9 @@ install_file() {
         -e "s|{{SKILL_DIR}}|$(sed_literal "$SKILL_DIR")|g" \
         -e "s|{{BON_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/bon.sh")")|g" \
         -e "s|{{IDENTITY_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/identity.py")")|g" \
-        -e "s|{{INTAKE_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/intake.py")")|g" \
-        -e "s|{{WORKFLOW_SH}}|$(sed_literal "$(shell_argument "$SKILL_DIR/scripts/workflow.py")")|g" \
+        -e "s|{{INTAKE_SH}}|$(sed_literal "$(shell_argument "$REVIEW_DIR/scripts/intake.py")")|g" \
+        -e "s|{{WORKFLOW_SH}}|$(sed_literal "$(shell_argument "$REVIEW_DIR/scripts/workflow.py")")|g" \
+        -e "s|{{REVIEW_SCRIPTS_PY}}|$(sed_literal "$REVIEW_SCRIPTS_PY")|g" \
         -e "s|{{IDENTITY_REGISTRY}}|$(sed_literal "$(shell_argument "$SKILL_DIR/references/identity-registry.json")")|g" \
         "$@" -- "$src" |
       if [[ $src == "$SCRIPT_DIR"/profiles/*.toml.tmpl ]]; then
@@ -653,6 +658,14 @@ if ((PRUNE_LEGACY)); then
     [[ ! -e $f && ! -L $f ]] || RETIRE+=("$f")
   done
 fi
+
+# The shared runtime replaces private module copies; keep old CLI paths as launchers.
+for skill in pr-review pr-review-batch; do
+  for module in handoff preparation publication review_contract ensure-context-indexes; do
+    f="$SKILL_ROOT/$skill/scripts/$module.py"
+    [[ ! -e $f && ! -L $f ]] || RETIRE+=("$f")
+  done
+done
 
 # ----------------------------------------------------------------- roster --
 
@@ -939,21 +952,22 @@ write_bundle() {
   install_file "$SCRIPT_DIR/skills/pr-review-batch/SKILL.md" "$SKILL_DIR/SKILL.md" render
   install_file "$SCRIPT_DIR/skills/pr-review-batch/references/notes.md" "$SKILL_DIR/references/notes.md"
   install_file "$SCRIPT_DIR/skills/find-docs/SKILL.md" "$SKILL_ROOT/find-docs/SKILL.md"
+  for module in intake workflow handoff preparation publication review_contract; do
+    install_file "$SCRIPT_DIR/review/scripts/$module.py" "$REVIEW_DIR/scripts/$module.py"
+  done
+  install_file "$SCRIPT_DIR/skills/orchestrate/scripts/identity.py" "$REVIEW_DIR/scripts/identity.py"
+  install_file "$SCRIPT_DIR/stack/context-indexes/ensure-context-indexes.py" "$REVIEW_DIR/scripts/ensure-context-indexes.py"
   for skill in pr-review pr-review-batch; do
     SKILL_DIR="$SKILL_ROOT/$skill"
-    install_file "$SCRIPT_DIR/skills/pr-review/references/repositories.md" "$SKILL_DIR/references/repositories.md"
-    install_file "$SCRIPT_DIR/skills/pr-review/references/review-intake.md" "$SKILL_DIR/references/review-intake.md" render
-    install_file "$SCRIPT_DIR/skills/pr-review/scripts/intake.py" "$SKILL_DIR/scripts/intake.py"
-    install_file "$SCRIPT_DIR/skills/pr-review/scripts/workflow.py" "$SKILL_DIR/scripts/workflow.py"
-    install_file "$SCRIPT_DIR/skills/pr-review/scripts/handoff.py" "$SKILL_DIR/scripts/handoff.py"
-    install_file "$SCRIPT_DIR/skills/pr-review/scripts/preparation.py" "$SKILL_DIR/scripts/preparation.py"
-    install_file "$SCRIPT_DIR/skills/pr-review/scripts/publication.py" "$SKILL_DIR/scripts/publication.py"
-    install_file "$SCRIPT_DIR/skills/pr-review/scripts/review_contract.py" "$SKILL_DIR/scripts/review_contract.py"
-    install_file "$SCRIPT_DIR/stack/context-indexes/ensure-context-indexes.py" "$SKILL_DIR/scripts/ensure-context-indexes.py"
-    install_file "$SCRIPT_DIR/skills/pr-review/references/review-workflow.md" "$SKILL_DIR/references/review-workflow.md" render
-    install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice.md" "$SKILL_DIR/references/review-voice.md"
-    install_file "$SCRIPT_DIR/skills/pr-review/references/review-voice-sources.md" "$SKILL_DIR/references/review-voice-sources.md"
-    install_file "$SCRIPT_DIR/skills/pr-review/references/review-publication.md" "$SKILL_DIR/references/review-publication.md"
+    install_file "$SCRIPT_DIR/review/references/repositories.md" "$SKILL_DIR/references/repositories.md"
+    install_file "$SCRIPT_DIR/review/references/review-intake.md" "$SKILL_DIR/references/review-intake.md" render
+    # Preserve command paths embedded in existing run artifacts without another runtime copy.
+    install_file "$SCRIPT_DIR/review/entrypoint.py.tmpl" "$SKILL_DIR/scripts/intake.py" render
+    install_file "$SCRIPT_DIR/review/entrypoint.py.tmpl" "$SKILL_DIR/scripts/workflow.py" render
+    install_file "$SCRIPT_DIR/review/references/review-workflow.md" "$SKILL_DIR/references/review-workflow.md" render
+    install_file "$SCRIPT_DIR/review/references/review-voice.md" "$SKILL_DIR/references/review-voice.md"
+    install_file "$SCRIPT_DIR/review/references/review-voice-sources.md" "$SKILL_DIR/references/review-voice-sources.md"
+    install_file "$SCRIPT_DIR/review/references/review-publication.md" "$SKILL_DIR/references/review-publication.md"
   done
   for skill in $SKILLS; do
     SKILL_DIR="$SKILL_ROOT/$skill"

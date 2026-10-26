@@ -1,0 +1,10 @@
+"""Forward existing review command paths to the single installed runtime."""
+
+import runpy
+import sys
+from pathlib import Path
+
+if __name__ == "__main__":
+    scripts = Path({{REVIEW_SCRIPTS_PY}})
+    sys.path.insert(0, str(scripts))
+    runpy.run_path(str(scripts / Path(__file__).name), run_name="__main__")

@@ -19,7 +19,7 @@ ORCHESTRATE = ROOT / 'skills/orchestrate/SKILL.md'
 BATCH = ROOT / 'skills/pr-review-batch/SKILL.md'
 BATCH_NOTES = ROOT / 'skills/pr-review-batch/references/notes.md'
 REVIEW = ROOT / 'skills/pr-review/SKILL.md'
-PUBLICATION = ROOT / 'skills/pr-review/references/review-publication.md'
+PUBLICATION = ROOT / 'review/references/review-publication.md'
 
 
 def decisions(path, title):

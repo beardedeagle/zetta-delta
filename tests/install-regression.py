@@ -26,7 +26,7 @@ class InstallerTests(unittest.TestCase):
         shutil.copy2(ROOT / "install.sh", self.bundle / "install.sh")
         for filename in ("bootstrap.sh", "Brewfile"):
             shutil.copy2(ROOT / filename, self.bundle / filename)
-        for directory in ("profiles", "rules", "skills", "scripts", "settings"):
+        for directory in ("profiles", "rules", "skills", "scripts", "settings", "review"):
             shutil.copytree(ROOT / directory, self.bundle / directory)
         indexes = self.bundle / "stack/context-indexes"
         indexes.mkdir(parents=True)
@@ -39,7 +39,7 @@ class InstallerTests(unittest.TestCase):
         curl = self.base / "bin/curl"
         curl.write_text("#!/bin/sh\nexit 77\n")
         curl.chmod(0o755)
-        for name in ("gh", "rtk", "tgrep", "semble", "codegraph", "zg", "ctx7", "githits", "caveman", "node", "pgrep"):
+        for name in ("gh", "rg", "rtk", "tgrep", "semble", "codegraph", "zg", "ctx7", "githits", "caveman", "node", "pgrep"):
             tool = self.base / "bin" / name
             tool.write_text("#!/bin/sh\nexit " + ("1" if name == "pgrep" else "0") + "\n")
             tool.chmod(0o755)
@@ -63,6 +63,7 @@ class InstallerTests(unittest.TestCase):
     def assertNoWrites(self):
         self.assertFalse((self.config / "profiles").exists())
         self.assertFalse((self.home / ".agents").exists())
+        self.assertFalse((self.home / ".local/share/zetta-delta/review").exists())
         self.assertEqual(list((self.base / "state").iterdir()), [])
 
     def roster(self):
@@ -160,6 +161,10 @@ class InstallerTests(unittest.TestCase):
                          ("custom:k", "k3", "Kimi", "Kimi Code", "flat", 3))
 
     def test_pr_review_skills_resolve_identity_without_sibling_skills(self):
+        self.home = self.base / "home with 'apostrophe' & space"
+        self.home.mkdir()
+        self.env["HOME"] = str(self.home)
+        runtime = self.home / ".local/share/zetta-delta/review/scripts"
         path = self.base / "skills with 'apostrophe' & space"
         models = self.base / "models.json"
         models.write_text(json.dumps([{"provider_id": "custom:k", "model_id": "k3"}]))
@@ -205,11 +210,12 @@ class InstallerTests(unittest.TestCase):
                 for filename in ("repositories.md", "review-voice.md", "review-publication.md"):
                     self.assertIn("references/" + filename, body)
                     self.assertEqual((skill / "references" / filename).read_bytes(),
-                                     (ROOT / "skills/pr-review/references" / filename).read_bytes())
+                                     (ROOT / "review/references" / filename).read_bytes())
+                self.assertEqual({p.name for p in (skill / "scripts").iterdir()}, {"identity.py", "intake.py", "workflow.py"})
                 self.assertNotIn("llm-wiki-igo", (skill / "references/review-voice.md").read_text())
                 self.assertIn("review-voice-sources.md", (skill / "references/review-voice.md").read_text())
                 self.assertEqual((skill / "references/review-voice-sources.md").read_bytes(),
-                                 (ROOT / "skills/pr-review/references/review-voice-sources.md").read_bytes())
+                                 (ROOT / "review/references/review-voice-sources.md").read_bytes())
                 command = next(line.strip() for line in reference.read_text().splitlines()
                                if line.strip().startswith("python3 "))
                 command = (command.replace("<sanitized-models-json>", shlex.quote(str(models)))
@@ -223,8 +229,8 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"]),
                                  ("custom:k", "k3", "Kimi", "Kimi Code"))
                 self.assertIn("references/review-intake.md", body)
-                self.assertEqual((skill / "scripts/intake.py").read_bytes(),
-                                 (ROOT / "skills/pr-review/scripts/intake.py").read_bytes())
+                self.assertEqual((runtime / "intake.py").read_bytes(),
+                                 (ROOT / "review/scripts/intake.py").read_bytes())
                 intake_reference = (skill / "references/review-intake.md").read_text()
                 self.assertNotIn("{{", intake_reference)
                 command = next(line for line in intake_reference.splitlines()
@@ -248,17 +254,17 @@ class InstallerTests(unittest.TestCase):
                 groups = json.loads("\n".join(lines))["repositories"]
                 self.assertEqual(groups[0]["repository"], "fixture/project")
                 self.assertEqual(groups[0]["pull_requests"][0]["classification"], "new")
-                self.assertEqual((skill / "scripts/workflow.py").read_bytes(),
-                                 (ROOT / "skills/pr-review/scripts/workflow.py").read_bytes())
-                self.assertEqual((skill / "scripts/handoff.py").read_bytes(),
-                                 (ROOT / "skills/pr-review/scripts/handoff.py").read_bytes())
-                self.assertEqual((skill / "scripts/review_contract.py").read_bytes(),
-                                 (ROOT / "skills/pr-review/scripts/review_contract.py").read_bytes())
-                self.assertEqual((skill / "scripts/preparation.py").read_bytes(),
-                                 (ROOT / "skills/pr-review/scripts/preparation.py").read_bytes())
-                self.assertEqual((skill / "scripts/publication.py").read_bytes(),
-                                 (ROOT / "skills/pr-review/scripts/publication.py").read_bytes())
-                self.assertEqual((skill / "scripts/ensure-context-indexes.py").read_bytes(),
+                self.assertEqual((runtime / "workflow.py").read_bytes(),
+                                 (ROOT / "review/scripts/workflow.py").read_bytes())
+                self.assertEqual((runtime / "handoff.py").read_bytes(),
+                                 (ROOT / "review/scripts/handoff.py").read_bytes())
+                self.assertEqual((runtime / "review_contract.py").read_bytes(),
+                                 (ROOT / "review/scripts/review_contract.py").read_bytes())
+                self.assertEqual((runtime / "preparation.py").read_bytes(),
+                                 (ROOT / "review/scripts/preparation.py").read_bytes())
+                self.assertEqual((runtime / "publication.py").read_bytes(),
+                                 (ROOT / "review/scripts/publication.py").read_bytes())
+                self.assertEqual((runtime / "ensure-context-indexes.py").read_bytes(),
                                  (ROOT / "stack/context-indexes/ensure-context-indexes.py").read_bytes())
                 workflow_reference = (skill / "references/review-workflow.md").read_text()
                 self.assertNotIn("{{", workflow_reference)
@@ -307,6 +313,72 @@ class InstallerTests(unittest.TestCase):
                 resource = Path(frozen["source_root"]).parent
                 self.assertIn(b"+target", (resource / "review.patch").read_bytes())
                 self.assertTrue((resource / "final-source-baseline.json").exists())
+                project = self.base / (name + " plain project")
+                project.mkdir()
+                (project / "ignored.py").write_text("current source\n")
+                (project / ".gitignore").write_text("ignored.py\n")
+                project_run = self.base / (name + " project run")
+                project_command = next(line for line in workflow_reference.splitlines()
+                                       if line.startswith("rtk proxy python3 ") and " create " in line and " --project " in line)
+                project_command = (project_command.replace("'<new-absolute-private-run-directory>'", shlex.quote(str(project_run)))
+                    .replace("--method pr-review ", "--method " + name + " ")
+                    .replace("'<actual-parent-thread-id>'", "fixture-thread")
+                    .replace("'<project-root>'", shlex.quote(str(project)))
+                    .replace("'<sanitized-identity.json>'", shlex.quote(str(orchestrator))))
+                result = subprocess.run(["/bin/sh", "-c", project_command], cwd=self.base, env=intake_env,
+                                        text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines.pop(), "exit=0")
+                state = json.loads("\n".join(lines))
+                self.assertIsNone(state["owner"])
+                key = state["targets"][0]["target"]
+                project_executable = [sys.executable, str(runtime / "workflow.py"), "--run", str(project_run)]
+                for operation in ("prepare", "finalize", "catalog"):
+                    extra = ["--roster", str(skill / "references/roster.md")] if operation == "catalog" else []
+                    result = subprocess.run([*project_executable, operation, "--target", key, "--revision", str(state["revision"]), *extra],
+                                            env=intake_env, text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    state = json.loads(result.stdout)
+                self.assertIn("ignored.py", state["targets"][0]["frozen"]["inventory"])
+                self.assertNotIn("head_sha", state["targets"][0]["frozen"])
+                self.assertTrue(state["targets"][0]["catalog"]["units"])
+
+    def test_review_runtime_upgrade_preserves_legacy_callbacks_and_backups(self):
+        legacy = self.home / ".agents/skills/pr-review/scripts"
+        legacy.mkdir(parents=True)
+        modules = ("intake", "workflow", "handoff", "preparation", "publication", "review_contract", "ensure-context-indexes")
+        originals = {}
+        for name in modules:
+            path = legacy / (name + ".py")
+            originals[path] = ("# locally edited legacy " + name + "\n").encode()
+            path.write_bytes(originals[path])
+        runtime = self.home / ".local/share/zetta-delta/review/scripts"
+        result = self.install("--force", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(runtime.exists())
+        for path, raw in originals.items():
+            self.assertEqual(path.read_bytes(), raw)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(runtime.exists())
+        result = self.install("--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((runtime / "workflow.py").is_file())
+        for path, raw in originals.items():
+            saved = list((self.base / "state/zetta-delta/backups").glob("*/" + str(path).lstrip("/")))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].read_bytes(), raw)
+            if path.stem not in ("workflow", "intake"):
+                self.assertFalse(path.exists())
+                self.assertEqual(path.with_suffix(".py.retired").read_bytes(), raw)
+        for skill in ("pr-review", "pr-review-batch"):
+            for command in ("workflow", "intake"):
+                callback = self.home / ".agents/skills" / skill / "scripts" / (command + ".py")
+                result = subprocess.run([sys.executable, str(callback), "--help"], env=self.env,
+                                        text=True, capture_output=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage:", result.stdout)
 
     def test_missing_settings_and_runtime_tools_refuse_before_writes(self):
         settings = self.config / "settings.json"
@@ -316,7 +388,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("no settings.json", result.stderr)
         self.assertNoWrites()
         settings.write_text("{}\n")
-        for name in ("gh", "node"):
+        for name in ("gh", "rg", "node"):
             tool = self.base / "bin" / name
             contents = tool.read_text()
             tool.unlink()

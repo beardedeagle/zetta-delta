@@ -1,8 +1,8 @@
 # Shared executable review workflow
 
-Both skills use `scripts/workflow.py`, `scripts/preparation.py`,
-`scripts/review_contract.py` and `scripts/publication.py`, installed
-from shared Python sources.
+Both skills invoke one runtime at `~/.local/share/zetta-delta/review/scripts/`,
+installed from the neutral `review/scripts/` source directory. Skill-local
+`intake.py` and `workflow.py` launchers preserve paths in existing task commands.
 It reuses the existing intake and effective-identity helpers. Run records stay
 outside Git checkouts in a new private directory; do not put raw voice sources
 in them. Creation reads GitHub metadata and never writes GitHub or Delta settings.
@@ -28,6 +28,10 @@ Supply sanitized JSON files for the orchestrator's exact provider/model identity
 and the existing generated identity registry. The identity file contains only
 `provider_id`, `model_id`, and, when required by the resolver, explicit `family`
 and `family_evidence`. Never dump settings or credentials.
+
+The run's parent directory must already exist outside Git checkouts. Create only
+the intended private parent first; initialization creates the new run directory,
+not missing ancestors. A missing or nondirectory parent is rejected before intake.
 
 ```sh
 rtk proxy python3 {{WORKFLOW_SH}} --run '<new-absolute-private-run-directory>' create --method pr-review --thread-id '<actual-parent-thread-id>' --repo '<verified-owner/repo>' --pr <number> --registry {{IDENTITY_REGISTRY}} --orchestrator '<sanitized-identity.json>'; echo "exit=$?"
@@ -121,13 +125,45 @@ rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' status; echo "exit=$?"
 ```
 
 The helper locks the record, rejects stale revisions, validates the event,
-and atomically replaces the saved journal. Status replays and validates the
-journal; an invalid event produces no partial state. Exit 0 returns recorded
-state, exit 2 returns a precise `needs_decision` JSON result, and exit 1 rejects
-invalid/unreadable input. A hold can retain newly observed integrity failures or
-setup intent; read the current revision before retrying. Files are mode 0600 and
-the run directory is mode 0700. Only initialization creates that directory;
-cleanup retains the journal and never removes another run or user checkout.
+and atomically replaces the saved journal. An invalid event is not applied, but
+preceding integrity observations can already be persisted, including unchanged
+observations. Holds can also retain setup intent or integrity failures.
+Exit 0 returns recorded state on stdout; exit 2 returns `needs_decision` JSON on
+stdout; exit 1 returns invalid-input JSON on stderr. Argument-parser errors instead
+print usage on stderr. After a valid journal is loaded, error/hold JSON includes
+the last saved `revision` observed by that invocation. Filesystem errors omit it
+because persistence may be uncertain; run `status` before any retry. Another
+writer can advance the journal after the invocation releases its lock. Correct
+the reported input or hold and use a fresh revision; never blindly repeat a
+launch or publication. Status replays without adding events or fresh source scans.
+Files are mode 0600 and the run directory is mode 0700. Cleanup retains the journal
+and never removes another run or user checkout.
+
+Inspect the command's exit status before parsing its output or issuing the next
+mutation. Do not chain a JSON reader after a failed command with `;`, or assume
+stderr/usage is a successful state response. For example:
+
+```sh
+if rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' catalog --target '<target-id>' --roster '<installed-roster.md>' --revision <last-returned-revision> > '<catalog.json>' 2> '<catalog-error.txt>'; then
+    rtk proxy python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["revision"])' '<catalog.json>'
+else
+    rtk proxy cat '<catalog-error.txt>'
+fi
+```
+
+Use the same success gate for `receive-report` and `record` recovery commands;
+an unconditional JSON reader after `;` is invalid. Read `status` immediately
+before each receipt/recovery mutation, because reviewer drafts advance revisions.
+Author-report responses include their last saved revision; another writer can
+advance it afterward. Invalid-record diagnostics name missing and unexpected keys.
+For example, `recover` accepts its documented reason/capacity fields, not an
+additional `evidence` key; place explanatory evidence in its required `reason`.
+
+Catalog `units` and `profiles` are objects keyed by unit ID and profile name.
+Iterate `.items()` for keys and records or `.values()` for records; iterating the
+object alone yields strings. Keep the required `catalog --roster` argument and
+use run-level `target: null` for `batch-wave`, with project/PR keys inside its
+`reviewers` map.
 
 ## Reporting
 
@@ -233,11 +269,44 @@ bounded index maintainer, reusing its cache, embedding and build limits.
 Finalization seals the source, including prepared caches. Native reviewers must
 not run `SessionStart` maintenance, create caches or refresh indexes there afterward.
 Use the emitted `source_git_prefix` (`GIT_OPTIONAL_LOCKS=0`) for Git reads and
-`source_search_prefix` (`tgrep --no-index`) for static searches. Prepared indexes
+`source_search_command` for static searches. Append `--pattern='<literal>'`,
+optional `--regex`, and repeated `--path '<relative-path>'` to narrow the frozen
+source scope. The engine supplies the search executable, argument separator and
+the source root; do not append raw search flags, another root or a trailing `--`.
+
+Within roots authorized by `~/.config/context-roots`, static search uses
+`tgrep --no-index`. Everywhere else, including default private run snapshots,
+it routes directly to `rg --no-config`; no cache-capable tool is invoked there.
+Missing/unreadable policy fails closed to that route. Both routes include hidden
+and ignored source, exclude Git administration, and preserve literal/regex search.
+Prepared indexes
 are usable only through a read-only route that cannot start a writer; otherwise
 inspect statically. Preserve unexpected changes and prepare a new run rather
 than cleaning or replacing its baseline. A clean Git status does not establish
 full integrity: ignored caches and index metadata are checked too.
+For new project captures explicitly excluding `.codegraph` or its
+`codegraph.db-shm`, an existing regular SHM file may change content while retaining
+its recorded identity, size, owner and permissions. The cache directory and SQLite
+database identities must also remain unchanged and safely owned. Each observation
+retains original/current SHM hashes as `cache_changes`; original baselines remain
+immutable. Database/WAL changes, additions, removals, replacements, symlinks,
+ownership/permission changes and all other source/Git changes still hold the run.
+Reviewed caches and legacy baselines without recorded recovery identities stay
+strict; this is not a blanket cache exclusion or a cache repair.
+
+`source-search` journals a pending execution before running, retains full stdout
+and stderr with hashes, and returns previews of at most 8192 bytes each. Exit zero
+means matches, one means no matches, and other codes, timeouts or missing tools
+are errors. The CLI returns success for either matches or no matches; inspect
+the JSON `status` and original `exit_code`. Read retained output artifacts in
+bounded portions when previews are incomplete. No tests are executed by search.
+Correct a failed or interrupted query using the same generated command with
+`--retry-of '<search-id>'`; a successful retry retains the original failed receipt.
+Otherwise report that search ID as a material `coverage_gaps` entry and use a
+non-`done` status. Failed/interrupted searches cannot seal a `done` report or be
+silently treated as absence. Adjudication reports with unresolved search errors
+must likewise remain non-`done`. These gates cover engine-routed searches;
+Delta's direct native tool calls have no universal interception hook.
 Indexed setup requires the updated maintainer's lifecycle contract. An older
 installed maintainer returns `index_maintainer`; static preparation remains
 available through the maintainer API shipped with each self-contained skill.
@@ -312,7 +381,10 @@ For Delta's split layout, the checkout must be exactly
 Generated `clone_store` evidence binds that exact store's full content/permissions
 and `refs/delta/<native-id>/<repository>/<head>` in the project's Git store.
 When the actual native parent and child are sibling checkouts, register both
-the project root and actual parent before dispatch. Generated `project_root`
+the project root and actual parent before dispatch. For a parent in Delta's split
+layout, `task` checks the owning project's baseline before issuing an isolated
+launch. A missing baseline returns `runtime_parent` with that project's root;
+register it before requesting another task. Generated `project_root`
 identifies the registered owner of those exact new resources; `parent_root`
 still binds the approved actual native parent. Ownership cannot substitute for
 parent registration or change the dispatch binding.
@@ -615,6 +687,11 @@ requires an immediate native root message, then waits for the parent to confirm
 without fingerprinting sources or changing the journal: the newly spawned clone
 has not yet been accounted for. Only the registered running attempt can read the
 task or author a report. Its original approval and artifact remain bound.
+For a planned launch wave, register each native start serially, then send
+proceed acknowledgements after the wave's starts are all settled. Do not release
+the first reviewer and immediately create a second pending launch that blocks
+its reads. A one-assignment wave can proceed immediately after its registration.
+This scheduling rule preserves the global pending-launch guard.
 Changed bytes, redirected files, stale bindings and unsafe sources are rejected.
 Assignment reservation and dispatch use the same generated input floor: complete
 task, file-report instructions, native bootstrap, default controls and assigned
@@ -652,6 +729,31 @@ the separately recorded running native identity. `--input` names a readable file
 not inline JSON; file
 errors identify the judgment input without echoing its contents or diagnosing
 the run as unreadable.
+
+For newly generated tasks, both the control view and `report_template` section
+show the author-only schema; `finding_template` likewise omits `finder`.
+The private task envelope retains the complete transport template and identity
+bindings for verification. Author instructions never ask the reviewer to copy
+those reserved transport fields into a judgment file.
+
+Read source files with the emitted `source_read_command`, followed by
+`--path '<relative-file>' --offset <byte> --length <1..32768>`. Use this terminal
+route for external snapshot paths; Delta's native `read_file` rejects their
+absolute paths. Source reads default to 16384 bytes and return `next_offset`
+(null at EOF), total size, the complete file digest and a retained delivery
+receipt. Content is UTF-8 when the selected bytes decode completely, otherwise
+base64; no bytes are discarded. `--source-target '<related-target-id>'` selects
+an explicitly bound foreign snapshot for interaction evidence.
+
+New project discovery handoffs require complete byte-delivery receipts for
+every regular file named in `checked`. Read through EOF before claiming a whole
+file checked. Duplicate/overlapping reads do not fill gaps; metadata units remain
+bound to their captured manifest entries. An unread file must be omitted from
+checked coverage and reported as incomplete, with material gaps where applicable.
+Only a recovery in the same native conversation can reuse earlier receipts;
+another conversation must inspect independently. Read artifacts are verified
+before sealing and receipt. This establishes byte delivery, not attention or
+analytical correctness. Old sealed tasks and journals retain their original contract.
 
 Before final sealing, the command checks the same report contract used by receipt.
 An invalid draft returns exit 2 with `code: report_draft`, field/code/reason
@@ -935,3 +1037,106 @@ configuration, authentication, provider or profile changes are required by this
 implementation. Source fingerprints detect persistent changes at observation
 time; they do not prevent writes or detect changes restored between observations.
 Live dispatch and end-to-end publication remain untested.
+
+## Project filesystem targets
+
+Explicit `--project` or unambiguous whole-project filesystem intent reviews current
+files, not a PR or an invented commit comparison. Bare repositories and paths keep
+their open-PR collection meaning. Normalize explicit project intent to this command:
+
+```sh
+rtk proxy python3 {{WORKFLOW_SH}} --run '<new-absolute-private-run-directory>' create --method pr-review --thread-id '<actual-parent-thread-id>' --project '<project-root>' --registry {{IDENTITY_REGISTRY}} --orchestrator '<sanitized-identity.json>'; echo "exit=$?"
+```
+
+Use `--method pr-review-batch` for the existing batch discovery-wave/stand-in policy.
+Both entry points accept repeated `--project '<another-root>'` flags in one run.
+Creation needs no GitHub authentication or Git commands for plain directories.
+It retains every requested-to-canonical mapping and resolution failure. Aliases
+share one target; parent/child roots and different roots with identical bytes stay
+independent. Failed requested roots remain visible and prevent `status.complete`.
+Project flags cannot be combined with PR, comparison or previous-PR-history flags.
+
+Optional repeated `--exclude '<relative-path>' '<reason>'` pairs apply to every
+project. They exclude exact paths/subtrees, require nonempty rationale and are
+retained in each manifest. There is no implicit Git-ignore filter. Git metadata
+is excluded from review content and separately protected when it exists. Modified,
+untracked and ignored substantive source remain included. Safe internal relative
+links, executable file modes, binary bytes and empty directories retain identity.
+Absolute, escaping, cyclic or excluded-target links and special entries are not
+followed/copied; their explicit gaps remain in the manifest.
+
+Use returned `project-...` target IDs, never folder basenames or content hashes,
+for the ordinary preparation commands:
+
+```sh
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' prepare --target '<project-target-id>' --revision <last-returned-revision>
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' finalize --target '<project-target-id>' --revision <last-returned-revision>
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' catalog --target '<project-target-id>' --roster '<installed-roster.md>' --revision <last-returned-revision>
+```
+
+Preparation reuses the private owned resource, original-source protection and
+cleanup contract. It records `mode: project`, the complete `manifest`, its
+`manifest_fingerprint`, source/parent roots and fingerprints, inventory and owned
+artifact hashes. It creates no Git repository, SHAs, patch, remote or PR metadata.
+Manifest file/metadata units cover every included entry. Existing defects are
+in scope without changed-line or introduction-date requirements.
+
+Optional index setup uses the existing lifecycle owner before finalization. An
+index is useful only where its actual corpus covers the manifest; Git-tracked
+coverage cannot establish coverage of included ignored/untracked files. Retain the
+existing explicit static fallback for unavailable/inadequate tools; never change
+the sealed source or introduce a different index lifecycle. Authorized `test-copy`
+creates an independent filesystem copy, without generated index caches. Test
+execution authority and the shared native admission/identity/recovery gates stay
+unchanged. `baseline` protects plain native-parent directories as filesystem
+ledgers for project runs, and still protects existing Git administration.
+
+Preparation records a provisional material `capture-...` gap for each explicit
+nonmetadata omission or unsupported entry. Assess those records, preserve actual
+material gaps, and use the existing `resolve-gap` evidence path only when there is
+a supported disposition. Neither an excluded path nor a skipped special entry
+silently counts as reviewed. Original-source movement and manifest/copy tampering
+hold further work; a later clean observation cannot erase the failure history.
+
+### Plans and cross-project evidence
+
+Every project plan adds `cross_project: {required: boolean, evidence: string}` to
+the ordinary plan. Record whether cross-project contracts require review and why.
+When required, include explicit interaction questions. Each cross-project
+interaction retains its ordinary `question`, owning `units`, `families` and
+`shortfall`, plus `targets` mapping every involved project ID to
+`{frozen: <complete-frozen-record>, units: [<that-projects-unit-ids>]}`. Include the
+owning project and at least one other project. Prepare and catalog participating
+roots first. Wrong roots, fingerprints, missing resources and unknown units fail
+validation; identical content never substitutes for target identity.
+
+Assign and attest interaction IDs through the existing discovery coverage path.
+The task includes every foreign snapshot in `related_targets`; file-backed report
+binding supplies that field automatically alongside assignment/target/reviewer.
+Reviewer judgment files omit all these reserved bindings. References use
+`side: target` only. Omit `target_id` for the owning root; supply the exact related
+`target_id` for another project's literal manifest path. A finding anchors in its
+owning project and cites other involved targets explicitly. Independent vet and
+separate final judgments must cite every target referenced by the original claim.
+Do not replace original IDs, raw judgments or independent family provenance.
+
+Task sizing includes the assigned foreign units as well as local units and full
+controls. Read manifests and related snapshots through bounded sealed evidence
+and explicit frozen roots. No Git/diff instructions are generated for project
+tasks. Snapshots needed by another unfinished cross-project review cannot be
+cleaned; after dependent work completes, ordinary owned cleanup applies.
+
+### Local completion
+
+Complete each target with the existing coverage, category, verification, vet,
+adjudication and integrity gates. `status` reports every original request,
+per-target holds and an all-project `complete` flag; one failed/incomplete root
+cannot disappear. `report` renders filesystem assessments and original finding
+ledgers. It performs no fresh checks, so record `check` before relying on current
+original-project freshness. Completed static-fallback reviews retain their exact
+coverage limitations.
+
+Project targets cannot authorize submission/PR approval, derive GitHub review
+or merge verdicts, or enter publication preflight/submission/reconciliation.
+These holds apply even when a caller attempts to supply publication authority.
+PR/range journals and existing PR publication safeguards keep their behavior.

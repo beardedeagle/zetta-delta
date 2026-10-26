@@ -1,0 +1,84 @@
+From: beardedeagle <randy@heroictek.com>
+Date: Sun, 25 Oct 2026 03:55:00 -0500
+Subject: [PATCH 7/7] feat(catalog): give local models a default embedding concurrency
+
+The indexing pipeline resolves its batch concurrency from the model's catalog entry.
+Local models that do not declare defaultConcurrency fall back to a hardcoded single
+worker, so an index job embeds one file at a time even though local embeddings
+parallelize fine. Only the model2vec potion-* entries declare it today.
+
+Give every local llama-cpp and transformers-js model a default of 2, matching the
+existing potion-* entries. Two contexts measured fastest on an M-series host: eight
+peaked near 11 GB and ran slower, while two ran at 3.75 GB.
+
+ src/engine/models/catalog.ts | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/engine/models/catalog.ts b/src/engine/models/catalog.ts
+index 9e035e6..46daaff 100644
+--- a/src/engine/models/catalog.ts
++++ b/src/engine/models/catalog.ts
+@@ -34,6 +34,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     format: "embeddinggemma",
+     contextSize: 2048,
+     maxBatchSize: 16,
++    defaultConcurrency: 2,
+   },
+ 
+   "local/qwen3-embedding-0.6b": {
+@@ -66,6 +67,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     format: "qwen3",
+     contextSize: 8192,
+     maxBatchSize: 8,
++    defaultConcurrency: 2,
+   },
+ 
+   "qwen/text-embedding-v4": {
+@@ -165,6 +167,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     queryPrefix: "Represent this sentence for searching relevant passages: ",
+     maxInputTokens: 512,
+     maxBatchSize: 4,
++    defaultConcurrency: 2,
+   },
+ 
+   "local/all-minilm-l6-v2": {
+@@ -223,6 +226,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     normalize: true,
+     maxInputTokens: 256,
+     maxBatchSize: 4,
++    defaultConcurrency: 2,
+   },
+ 
+   "local/potion-retrieval-32m": {
+@@ -403,6 +407,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     documentPrefix: "passage: ",
+     maxInputTokens: 512,
+     maxBatchSize: 4,
++    defaultConcurrency: 2,
+   },
+ 
+   "local/jina-embeddings-v2-base-code": {
+@@ -455,6 +460,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     normalize: true,
+     maxInputTokens: 8192,
+     maxBatchSize: 2,
++    defaultConcurrency: 2,
+   },
+ 
+   "local/gte-modernbert-base": {
+@@ -507,6 +513,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     normalize: true,
+     maxInputTokens: 8192,
+     maxBatchSize: 2,
++    defaultConcurrency: 2,
+   },
+ 
+   "local/nomic-embed-text-v1.5": {
+@@ -561,6 +568,7 @@ export const EMBEDDING_MODEL_CATALOG = {
+     documentPrefix: "search_document: ",
+     maxInputTokens: 8192,
+     maxBatchSize: 2,
++    defaultConcurrency: 2,
+   },
+ } as const;
+ 

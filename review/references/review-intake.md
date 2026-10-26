@@ -3,7 +3,10 @@
 Run this before launching any review subagent for actual PR targets: one PR,
 an explicit list, all open PRs in a repository, or an explicit `org:<name>` target.
 Resolve inputs through `repositories.md` first. Commit ranges, branches, and working changes without a
-PR bypass this check; do not invent a PR association.
+PR bypass this check; do not invent a PR association. Explicit `--project` and
+whole-project filesystem requests also bypass GitHub intake. Use workflow project
+creation, retain every requested root and failed resolution, and review current
+files rather than a synthetic Git comparison. See `review-workflow.md`.
 
 ## Collect and classify
 
