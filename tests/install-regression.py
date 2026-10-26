@@ -161,7 +161,7 @@ class InstallerTests(unittest.TestCase):
                          ("custom:k", "k3", "Kimi", "Kimi Code", "flat", 3))
 
     def test_pr_review_skills_resolve_identity_without_sibling_skills(self):
-        self.home = self.base / "home with 'apostrophe' & space"
+        self.home = self.base / "home 🧪 with 'apostrophe' & space"
         self.home.mkdir()
         self.env["HOME"] = str(self.home)
         runtime = self.home / ".local/share/zetta-delta/review/scripts"

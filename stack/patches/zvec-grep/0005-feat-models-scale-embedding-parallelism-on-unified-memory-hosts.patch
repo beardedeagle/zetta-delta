@@ -15,11 +15,11 @@ rest of the machine for the same memory.
 Also accept ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY as the preferred override
 name, keeping ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM as the legacy fallback.
 
- src/engine/models/backends/llama-cpp.ts | 47 +++++++++++++++++++++++++++++-
- 1 file changed, 44 insertions(+), 3 deletions(-)
+Keep invalid-override diagnostics bound to the selected variable name and
+cover the preferred and legacy overrides without loading an embedding model.
 
 diff --git a/src/engine/models/backends/llama-cpp.ts b/src/engine/models/backends/llama-cpp.ts
-index 288fe47..e78b08e 100644
+index 288fe47..5ca17e4 100644
 --- a/src/engine/models/backends/llama-cpp.ts
 +++ b/src/engine/models/backends/llama-cpp.ts
 @@ -6,6 +6,7 @@ import {
@@ -47,19 +47,20 @@ index 288fe47..e78b08e 100644
  const DEFAULT_DARWIN_CMAKE_OPTIONS = {
    GGML_OPENMP: "OFF",
  } as const;
-@@ -187,7 +198,10 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
+@@ -187,7 +198,11 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
      );
      this.gpu = embeddingDeviceToLlamaGpuSelection(options.device ?? "cpu");
      this.parallelism = resolveParallelismOverride(
 -      process.env.ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM,
 +      process.env.ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY ??
 +        process.env.ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM,
-+      process.env.ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY ??
-+        process.env.ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM,
++      process.env.ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY !== undefined
++        ? "ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY"
++        : "ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM",
      );
      this.dependencies = { ...defaultDependencies, ...dependencies };
    }
-@@ -650,6 +664,27 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
+@@ -650,6 +665,27 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
        }
      }
  
@@ -87,7 +88,7 @@ index 288fe47..e78b08e 100644
      return 1;
    }
  
-@@ -783,6 +818,7 @@ function embeddingDeviceToLlamaGpuSelection(
+@@ -783,6 +819,7 @@ function embeddingDeviceToLlamaGpuSelection(
  
  function resolveParallelismOverride(
    envValue: string | undefined,
@@ -95,7 +96,7 @@ index 288fe47..e78b08e 100644
  ): number | undefined {
    const normalized = envValue?.trim() ?? "";
    if (!normalized) {
-@@ -792,7 +828,7 @@ function resolveParallelismOverride(
+@@ -792,7 +829,7 @@ function resolveParallelismOverride(
    const parsed = Number.parseInt(normalized, 10);
    if (!Number.isInteger(parsed) || parsed < 1) {
      process.stderr.write(
@@ -104,3 +105,38 @@ index 288fe47..e78b08e 100644
      );
      return undefined;
    }
+diff --git a/test/unit/models/llama-cpp.test.mjs b/test/unit/models/llama-cpp.test.mjs
+index 6aadf5c..95dc0c6 100644
+--- a/test/unit/models/llama-cpp.test.mjs
++++ b/test/unit/models/llama-cpp.test.mjs
+@@ -190,6 +190,30 @@ async function captureStderr(callback) {
+   }
+ }
+ 
++test("parallelism override warnings identify the selected environment variable", async () => {
++  const preferred = "ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY";
++  const legacy = "ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM";
++  const previous = { [preferred]: process.env[preferred], [legacy]: process.env[legacy] };
++  try {
++    for (const name of [preferred, legacy]) {
++      delete process.env[preferred];
++      delete process.env[legacy];
++      process.env[name] = "invalid-value";
++      if (name === preferred) process.env[legacy] = "2";
++      const { messages } = await captureStderr(async () => {
++        const model = new LlamaCppEmbeddingModel(entry(), { device: "cpu" });
++        await model.dispose();
++      });
++      assert.ok(messages.join("").includes(`invalid ${name}="invalid-value"`));
++    }
++  } finally {
++    for (const name of [preferred, legacy]) {
++      if (previous[name] === undefined) delete process.env[name];
++      else process.env[name] = previous[name];
++    }
++  }
++});
++
+ test("local embedding loads GGUF, formats and truncates text, parallelizes, caches, and disposes", async (t) => {
+   const modelFile = await ggufFile(t);
+   const setup = createDependencies(modelFile.path);

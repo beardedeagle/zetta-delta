@@ -383,7 +383,7 @@ SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"
 REVIEW_DIR="$(canonical_dir "$HOME/.local/share/zetta-delta/review" "review runtime")"
 [[ $REVIEW_DIR != *$'\n'* && $REVIEW_DIR != *$'\r'* && ! $REVIEW_DIR =~ \{\{[A-Z_]*\}\} ]] \
   || die "review runtime directory must not contain line breaks or template placeholder syntax"
-REVIEW_SCRIPTS_PY="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$REVIEW_DIR/scripts")"
+REVIEW_SCRIPTS_PY="$(python3 -c 'import sys; print(repr(sys.argv[1]))' "$REVIEW_DIR/scripts")"
 # Preserve the tools preflight actually accepted, plus their runtime/build tools.
 # Do not import unrelated ambient PATH entries into desktop rules.
 TOOL_PATH=""
