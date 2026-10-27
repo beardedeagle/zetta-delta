@@ -13,7 +13,7 @@ repository, then run:
 ./bootstrap.sh --force
 ```
 
-Bootstrap installs build prerequisites and GitHub CLI from `Brewfile`, builds the
+Bootstrap installs build prerequisites, GitHub CLI and ripgrep from `Brewfile`, builds the
 pinned context tools, and installs the bundle with `--configure-delta`. Its defaults
 match this machine's accounts: Z.AI Max, Qwen Pro, MiniMax plan, ChatGPT/Grok
 subscriptions, and an 8-agent thread limit (16 overall). Override the documented
@@ -41,10 +41,11 @@ The installer adds:
   reviewer order generated for your accounts.
 - `/adversarial` and `/isolated`: two more ways to run a thread, for any
   task (section 8).
-- `/pr-review`: independent PR or commit-range review across configured model
-  families, followed by cross-family vetting and explicit orchestrator adjudication
+- `/pr-review`: one finder, one vetter, and the orchestrator from three different
+  model families, with reciprocal spillover vetting and explicit adjudication
   of every finding (section 8).
-- `/pr-review-batch`: one strong reviewer per PR, orchestrator adjudication, and
+- `/pr-review-batch`: one strong discovery reviewer per PR, different-family
+  vetting, orchestrator adjudication with a parallel stand-in for family overlap, and
   explicitly authorized GitHub reviews for a PR list or all open PRs needing
   review at their current head, including explicit organization targets (section 8).
 - The context router and Ponytail rules, written into Delta's Personal
@@ -122,18 +123,28 @@ way.
 | `skills/orchestrate/SKILL.md` | `~/.agents/skills/orchestrate/` | Always |
 | `skills/orchestrate/references/best-of-n.md` | same `references/` | Always |
 | `skills/orchestrate/scripts/bon.sh` | same `scripts/`, and `~/.agents/skills/isolated/scripts/` | Always; best-of-N snapshot, patch handoff, apply, cleanup |
-| `skills/orchestrate/scripts/identity.py` and `references/effective-identity.md` | each installed skill's `scripts/` and `references/` | Always; resolve effective model overrides from sanitized local metadata |
+| `skills/orchestrate/scripts/identity.py` and `references/effective-identity.md` | each skill's `scripts/` and `references/`; helper also in the shared review runtime | Always; resolve effective model overrides from sanitized local metadata |
 | `references/identity-registry.json` | each installed skill's `references/` | Generated provider lanes, billing/budgets, and exact model-family bindings |
 | `skills/adversarial/SKILL.md` | `~/.agents/skills/adversarial/` | Always |
 | `skills/isolated/SKILL.md` | `~/.agents/skills/isolated/` | Always |
 | `skills/pr-review/SKILL.md` | `~/.agents/skills/pr-review/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
 | `skills/pr-review-batch/SKILL.md` and `references/notes.md` | `~/.agents/skills/pr-review-batch/` | Always; includes its own generated roster, identity registry, resolver, and identity reference |
-| `skills/pr-review/scripts/intake.py` and `references/review-intake.md` | both PR review skills' `scripts/` and `references/` | Always; shared PR authorship and owner-review eligibility check before dispatch |
-| `skills/pr-review/references/{repositories,review-publication,review-voice,review-voice-sources}.md` | both PR review skills' `references/` | Always; repository resolution, shared submission contract, derived voice, and source coverage |
+| `review/scripts/intake.py` and `references/review-intake.md` | `~/.local/share/zetta-delta/review/scripts/` and both skills' `references/` | Always; shared PR authorship and owner-review eligibility check before dispatch |
+| `review/references/{repositories,review-publication,review-voice,review-voice-sources}.md` | both PR review skills' `references/` | Always; repository resolution, shared submission contract, derived voice, and source coverage |
 | `skills/find-docs/SKILL.md` | `~/.agents/skills/find-docs/` | Always; current developer documentation through Context7 |
 | `tests/bon-test.sh` | Not installed | Regression check for `bon.sh`: `sh tests/bon-test.sh` |
 | `tests/install-test.sh` | Not installed | Regression check for the installer's curl mode, refusals, backups, the Personal AGENTS.md update, and `--clean`: `sh tests/install-test.sh` |
 | `tests/pr-review-intake-test.py` | Not installed | Offline PR eligibility, pagination, and lookup-failure checks: `python3 tests/pr-review-intake-test.py` |
+| `review/entrypoint.py.tmpl` | Both review skills' `scripts/{intake,workflow}.py` | Small launchers preserve command paths stored in existing run artifacts; all review code runs from the common runtime |
+| `review/scripts/workflow.py` | `~/.local/share/zetta-delta/review/scripts/` | Shared private journal, preparation, catalog, gated tasks, factual reports and authorized publication; no native dispatch |
+| `review/scripts/review_contract.py` | `~/.local/share/zetta-delta/review/scripts/` | Roster-bound assignments, compact task generation and method-specific coverage/evidence validation |
+| `review/scripts/preparation.py` | `~/.local/share/zetta-delta/review/scripts/` | Pinned comparisons, independent snapshots, complete patches, source checks, maintainer API coordination and owned cleanup |
+| `review/scripts/publication.py` | `~/.local/share/zetta-delta/review/scripts/` | Evidence-bound bodies, live account/comparison/discussion checks, one frozen-head review and independent receipt reads |
+| `stack/context-indexes/ensure-context-indexes.py` | `~/.local/share/zetta-delta/review/scripts/` | Shared index lifecycle API; owns setup, budgets, locks, queue/receipt checks and freshness. Bundled API keeps static preparation independent of the machine installation |
+| `review/references/review-workflow.md` | Both review skills' `references/` | Shared commands, record/report contract, analytical responsibilities and native integration limits |
+| `tests/pr-review-workflow-test.py` | Not installed | Run transitions, assignment/report contracts, review methods, publication holds and competing writers: `rtk proxy python3 tests/pr-review-workflow-test.py` |
+| `tests/pr-review-publication-test.py` | Not installed | Offline publication, authorization/materiality holds, interrupted responses and receipt reconciliation: `rtk proxy python3 tests/pr-review-publication-test.py` |
+| `tests/pr-review-preparation-test.py` | Not installed | Offline Git fixtures for comparisons, user-work preservation, index lifecycle, test copies and cleanup: `rtk proxy python3 tests/pr-review-preparation-test.py` |
 | `tests/prepare-test.sh` | Not installed | Regression check for `examples/agents-prepare.sh`: `sh tests/prepare-test.sh` |
 | `references/roster.md` | each skill's `references/` | Generated by the installer, the same copy in each skill |
 | `rules/personal-AGENTS.md` | Not installed | Source of the router block in Personal AGENTS.md |
@@ -142,7 +153,7 @@ way.
 | `examples/agents-prepare.sh` | your project's `.agents/prepare` | By hand, per project |
 | `stack/install.sh` | Not installed | Run by hand; builds and installs the context tools (section 9) |
 | `stack/patches/<tool>/` | Not installed | Applied in order to each tool's pinned upstream release |
-| `stack/context-indexes/ensure-context-indexes.py` | `~/.local/share/zetta-delta/` | By `stack/install.sh`; tests: `python3 -m unittest` in that folder |
+| `stack/context-indexes/ensure-context-indexes.py` | `~/.local/share/zetta-delta/` | By `stack/install.sh`; durable queued/startup receipts protect review finalization and cleanup; tests: `rtk proxy python3 -m unittest` in that folder |
 | `stack/zvec-grep/verify-install.py` | `~/.local/share/zvec-grep/` | By `stack/install.sh`, pinned to the zvec-grep it installs; tests: `python3 -m unittest` in that folder |
 | `deploy.env.example` | Not installed | Template for `deploy.env` (ignored by git), sourced before `install.sh` to repeat an install |
 | `bootstrap.sh` and `Brewfile` | Not installed | Fresh-machine prerequisites, pinned context tools, and configured bundle installation |
@@ -390,6 +401,13 @@ same runs the maintainer removes the caches of that root's deleted Delta
 checkouts, and only those: Semble's own `semble clear orphans` would also
 remove the cache of a folder on an unmounted drive.
 
+Owned PR-review snapshots stop managed maintenance after finalization. The
+maintainer authenticates the private `index-seal.json` outside the checkout
+against its resource owner and final artifacts, then skips SessionStart, search
+hook and background maintenance there. Incomplete or changed evidence holds
+maintenance. Pre-seal setup and mutable test copies still work; arbitrary native
+processes and upstream daemons remain outside this gate.
+
 ## 6. Context rules (Personal AGENTS.md)
 
 Delta has no MCP servers or hooks, so the context tools reach agents through
@@ -481,6 +499,7 @@ model; that label is Delta's, not the subagent's self-report.
 
 ```
 /pr-review <PR URL, PR number, or main...feature_branch>
+/pr-review --review-own-pr <PR URL or PR number>
 ```
 
 This mode reviews one PR or commit range. Repository slugs, clone paths, and
@@ -488,36 +507,75 @@ unambiguous local shorthand resolve through the verified source remote. Multiple
 PRs, repository-only requests, or explicit `org:<name>` targets route to batch
 review below.
 
-Both modes run the same [intake helper](skills/pr-review/scripts/intake.py) before
+Use `/pr-review --project '<root>'` for explicit whole-project filesystem review;
+repeat `--project` for independent roots and required cross-project contracts.
+`pr-review-batch` accepts the same project targets with its existing batch routing.
+This reviews current bytes, including modified, untracked and ignored source and
+actionable existing defects. Plain folders require no Git repository, commits,
+remote or GitHub account. Aliases share a target, while nested roots and distinct
+identical-content roots remain independent. Explicit exclusions require rationale;
+unsafe links and unsupported entries remain visible coverage gaps. Reports are
+local assessments without PR approval or merge verdicts. The shared
+[workflow reference](review/references/review-workflow.md#project-filesystem-targets)
+documents capture, coverage, cross-project bindings and completion. Bare paths
+and slugs retain their existing PR-collection meaning.
+
+Both modes run the same [intake helper](review/scripts/intake.py) before
 any reviewer launch, for one PR, explicit lists, whole-repo requests, and
-organization targets. It collects the requested PRs and first skips those whose
+organization targets. By default, it collects the requested PRs and first skips those whose
 creator matches the authenticated `gh` account, case-insensitively, including
 PRs opened by the orchestrator under that account. These stay in the inventory as
 `self-authored` without review-history lookups, subagents, or publication. For
 other authors' PRs, it compares each current head with your latest
 submitted, non-dismissed GitHub review. No prior review or a changed head means a
-full review; the same head means skip, with no subagents or GitHub activity. Owner
+full review. The same head skips when captured discussion has been evaluated;
+changed or previously uncaptured discussion first needs a finding-materiality
+decision. Only evidence adding/removing a finding or changing its severity reopens
+the full review. Risk acceptance or declining a fix alone does not erase a valid
+finding. Owner
 is the authenticated `gh` user. Failed lookups hold dispatch for the requested
-collection. [Shared intake](skills/pr-review/references/review-intake.md) documents
+collection. [Shared intake](review/references/review-intake.md) documents
 the commands and comparison checks. GitHub records the reviewed head, so this
 eligibility check detects head changes; base/head verification still binds review
 setup and publication. Targets without a PR bypass owner-review intake.
 
-The thread pins the comparison, plans from changed-file and hunk metadata,
-and sizes independent review assignments to each model's capacity. It considers
-every configured profile, selects useful perspectives across model families,
-and queues work within lane and thread limits. Small changes may use fewer
-models; larger changes may need several waves. Reviewers read changed hunks
-and retrieve focused context as needed.
+Use `--review-own-pr` with explicitly named PRs to review your own change locally.
+Both skills pass it to intake and workflow creation, which record the override,
+capture prior discussion and classify these targets `self-authored-review`.
+GitHub publication remains disabled for them, even if later authorized. The flag
+does not change other authors' eligibility and rejects repository-wide,
+organization and local-comparison requests.
+
+The thread pins the comparison and plans from changed-file and hunk metadata.
+It selects one finder and one vetter from two distinct actual model families,
+reserving a third family for the orchestrator. The finder covers the complete
+change through workload-sized units and interaction questions. Reviewers read
+changed hunks and retrieve focused context as needed. Jobs remain within native
+15-per-parent and 30-overall limits.
 
 Every original finding gets three passes before deduplication: independent discovery,
 vetting by another model family, and explicit adjudication by the orchestrator. The
 third pass includes rejected findings, compares both evidence trails, and records a
 reasoned final disposition. Missing vetting or adjudication leaves the review incomplete.
+When the vetter discovers a separate issue, the original finder vets it and the
+orchestrator adjudicates it. Keep the actual finder identity; all three stages
+use different families for each finding. The shared Python contract validates
+these routes, recorded coverage and bounded recovery: one runtime retry and one
+report correction per unit, plus one focused dispute follow-up per finding.
+Original reports and unresolved evidence remain recorded; native Delta still
+owns actual admission and dispatch. Both skills require a fresh Python `task`
+approval before each launch/follow-up; the CLI requires that current recorded
+approval before accepting `started`. Native interception remains deferred.
 The review covers bugs, security, regressions, privacy/PII,
 data governance, idiomatic code, anti-patterns, test value, and unnecessary code.
-The report preserves finder/vetter/adjudicator identities, rejected and unresolved claims,
-and coverage gaps. Review setup and any tests use disposable snapshots as needed;
+The read-only `workflow.py --run '<private-run>' report` command renders a factual
+Markdown table and completion evidence from the replayed journal. It preserves
+finder/vetter/adjudicator identities, rejected and unresolved raw claims, coverage
+and test evidence, authorization, holds and publication receipts. `status` retains
+its JSON interface. Reports perform no fresh source, runtime or GitHub checks;
+derived events and local recommendations are separate from verified publication.
+Both skills retain analytical judgment, voice and the required native handoff,
+while Python owns procedural validation. Review setup and any tests use disposable snapshots as needed;
 the skill requires source and your checkout to remain unchanged.
 
 After adjudication, both review modes use the same publication contract when
@@ -527,24 +585,44 @@ approve with the nits in that same body, explicitly stating they do not block
 merging. Incomplete reviews or changed base/head comparisons hold submission.
 Each result produces one review and no separate nit comments. Publication
 rechecks the target, binds the review to the frozen head, verifies the receipt,
-and checks for duplicates before retrying an uncertain submission.
+and reconciles uncertain responses without issuing another POST. Changed discussion
+requires a snapshot-bound finding-materiality judgment; nonmaterial changes reuse
+the completed review. `preflight --draft` previews exact wording without posting.
+Native dispatch and real end-to-end publication remain untested.
 
-The shared [review voice](skills/pr-review/references/review-voice.md) governs
+Both review skills invoke one runtime installed at
+`~/.local/share/zetta-delta/review/scripts/`, sourced from `review/scripts/`.
+Their shared reference sources live in `review/references/`; each skill keeps
+its own rendered instructions, roster and identity registry. `--skill-dir`
+changes the skill entry-point location; the runtime stays under the installing
+user's `~/.local/share/zetta-delta/`. Existing skill-local intake/workflow command
+paths forward to that runtime so saved task commands remain usable. During an
+upgrade, the installer backs up and retires the other old module copies using
+its existing `--force`/dry-run rules. Review methods and journal formats stay the
+same.
+
+The shared [review voice](review/references/review-voice.md) governs
 review bodies and ordinary review-flow messages. It captures Randy's direct,
 concise cadence with professional grammar and no profanity. Its
-[source coverage](skills/pr-review/references/review-voice-sources.md) records
+[source coverage](review/references/review-voice-sources.md) records
 the assessment across both machines and connected sources, including sampling
 and access gaps. Private conversations and email text are not bundled.
 
 ```mermaid
 flowchart TD
   U["You: /pr-review PR or range"] --> I["PR: shared owner-review intake<br/>Range: proceed directly"]
-  I -->|"self-authored / unchanged PR"| K["Skip; no subagents or GitHub publication"]
+  I -->|"self-authored without override / evaluated unchanged PR"| K["Skip; no subagents or GitHub publication"]
+  I -->|"explicit --review-own-pr; local report only"| T
+  I -->|"same head; discussion changed or unassessed"| M["Judge discussion materiality<br/>add/remove finding or change severity"]
+  M -->|"no material effect"| K
+  M -->|"supported material effect"| T
   I -->|"new / changed PR or range"| T["Pin comparison and freeze source<br/>measure changed files and hunks"]
-  T --> S["Select useful configured perspectives<br/>size assignments and schedule waves"]
-  S --> D["Independent discovery<br/>across selected model families"]
+  T --> S["Select finder and vetter<br/>reserve orchestrator's third family"]
+  S --> D["One finder covers the complete change<br/>through bounded units"]
   D --> V["Vet every original finding<br/>with a different model family"]
-  V --> A["Orchestrator adjudicates every finding<br/>record evidence and final disposition"]
+  V -->|"new spillover finding"| F["Original finder vets spillover<br/>preserve actual finder provenance"]
+  V --> A["Third-family orchestrator adjudicates<br/>record evidence and final disposition"]
+  F --> A
   A --> R["Deduplicate adjudicated claims<br/>report findings, identities, and coverage gaps"]
 ```
 
@@ -552,14 +630,22 @@ flowchart TD
 
 ```
 /pr-review-batch owner/repo 12, 18, 23
+/pr-review-batch --review-own-pr owner/repo 12, 18, 23
 /pr-review-batch owner/repo
 /pr-review-batch org:organization-name
 ```
 
 Lists accept numbers, URLs, commas, spaces, and bullets. A repository without a
 list means all open PRs. Both forms use the shared eligibility check above before
-dispatch: self-authored PRs are skipped first; other authors' new PRs and changed
-heads get a full review, while unchanged heads are skipped.
+dispatch: self-authored PRs are skipped unless explicitly opted into local review;
+other authors' new PRs and changed
+heads get a full review. Same-head PRs remain skipped unless a recorded discussion
+judgment would add/remove a finding or change its severity. Intake captures the
+description, reviews, issue comments and inline replies; changed discussion or
+a missing historical snapshot requests lightweight assessment before any full
+review. Use `create --previous-run` to reuse evaluated snapshots and finding history.
+An explanation can change a finding; accepting risk or declining a fix alone
+does not resolve a supported claim.
 
 An explicit `org:<name>` target collects all repositories visible to the
 authenticated GitHub account, then every open PR in each. Repository, PR, and
@@ -568,11 +654,29 @@ numbers and comparisons; any lookup failure holds the entire requested org run
 before reviewer dispatch. Hidden repositories are outside its coverage. A bare
 name remains repository shorthand and never expands to an organization.
 
-Each PR gets one eligible strong reviewer within roster budgets, followed by
-top-level orchestrator vetting and adjudication. This mode does not require a
-separate cross-family vet. It remains read-only until you explicitly authorize
-publication; test execution also requires authorization and a disposable copy.
-It follows the same three publication outcomes and shared voice described above.
+Each PR gets one eligible strong discovery reviewer and different-family vetting.
+The orchestrator adjudicates the other findings while a high-end model handles
+findings from PRs where the orchestrator's family participated. The stand-in must
+respect that PR's family history and have near/equivalent/higher capability than
+the orchestrator. Its family can already be reviewing other PRs in the batch.
+The orchestrator incorporates its decisions without adjudicating them again.
+
+Family allocation follows eligible PRs in the active wave within native 15/30
+limits. Prefer suitable families other than the orchestrator's before assigning
+its family. There is no fixed two-per-model or two-per-family cap and no provider
+quota or token/spend budget management. The shared record validates finder/vetter
+family separation and incorporates completed stand-in decisions with actual
+provenance. Recorded `batch-wave` judgments now generate rotated discovery
+allocations, bind later finder selections and retain local reservations within
+observed 15/30 capacity. Python gates launch instructions and records approval;
+the skills require using that gate before Delta's native launch tool. Native
+interception remains deferred, so bypassed launches are outside Python's control.
+Vetter-originated batch
+spillover holds for an independent routing decision.
+
+This mode remains read-only until you explicitly authorize publication; test
+execution also requires authorization and a disposable copy. It follows the same
+three publication outcomes and shared voice described above.
 
 ### Orchestrate
 
@@ -696,7 +800,7 @@ pinned commit, with this repository's patches applied in order:
 | tgrep | microsoft/tgrep v1.0.11 | none |
 | semble | MinishLab/semble v0.6.1 | none |
 | codegraph | colbymchenry/codegraph v1.6.2 | inline Rust tests count as callers; Elixir; root-only Git ignores stay anchored; source under `build/` remains eligible |
-| zvec-grep | zvec-ai/zvec-grep v0.2.2 | Metal tensor opt-out; node-llama-cpp 3.22.1 (Metal tensor kernels on Apple M5); exact Git exclusions; source under `build/` remains eligible |
+| zvec-grep | zvec-ai/zvec-grep v0.2.2 | Metal tensor opt-out; node-llama-cpp 3.22.1 (Metal tensor kernels on Apple M5); exact Git exclusions; source under `build/` remains eligible; local embedding concurrency; daemon record recovery with serialized stale takeover and complete UTF-8 writes |
 | rtk | rtk-ai/rtk v0.51.0 | a failed command no longer prints a TOML filter's `on_empty` "ok" |
 | ctx7, githits, caveman | npm 0.5.13, 0.26.0, 2.0.1 | none |
 
@@ -710,6 +814,9 @@ removes on exit. Where things go:
   install under that prefix, and uv links Semble there.
 - Semble installs with its `mcp` extra, so agents that use Semble's MCP
   server keep working.
+- Local embedding catalog entries default to two concurrent batches. For GGUF
+  contexts, `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY` overrides automatic
+  parallelism; `ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` remains the fallback name.
 - CodeGraph: its self-contained bundle in
   `~/.codegraph/versions/`, in a directory identified by upstream version,
   patch hash, platform, and a unique build suffix, with `~/.local/bin/codegraph`

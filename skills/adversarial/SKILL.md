@@ -1,6 +1,6 @@
 ---
 name: adversarial
-description: Run this thread as the moderator of an adversarial room. A defender does the user's task or holds a position on it; a challenger from a different model family tries to break or refute it with evidence; they take turns until one gives a verdict or the round limit is reached. Any task: code, questions, research, investigations. Runs only when explicitly invoked with /adversarial.
+description: "Run this thread as the moderator of an adversarial room. A defender does the user's task or holds a position on it; a challenger from a different model family tries to break or refute it with evidence; they take turns until one gives a verdict or the round limit is reached. Any task: code, questions, research, investigations. Runs only when explicitly invoked with /adversarial."
 disable-model-invocation: true
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: isolated
-description: Run this thread as the dispatcher of an isolated room. The same task goes to two to four models from different families, none sees another's work, and the user compares the results side by side, keeps one, and continues with it. Any task: code, questions, research, investigations. Runs only when explicitly invoked with /isolated.
+description: "Run this thread as the dispatcher of an isolated room. The same task goes to two to four models from different families, none sees another's work, and the user compares the results side by side, keeps one, and continues with it. Any task: code, questions, research, investigations. Runs only when explicitly invoked with /isolated."
 disable-model-invocation: true
 ---
 

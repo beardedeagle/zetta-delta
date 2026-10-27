@@ -5,13 +5,13 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 HOOK = Path(__file__).with_name("ensure-context-indexes.py")
@@ -31,6 +31,10 @@ class HookTest(unittest.TestCase):
                                         "SEMBLE_CACHE_LOCATION": str(self.base / "semble-cache")})
         cache.start()
         self.addCleanup(cache.stop)
+        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
+        assert spec is not None and spec.loader is not None
+        self.hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.hook)
         self.root = self.base / "repo"
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         (self.root / "sub").mkdir()
@@ -61,7 +65,7 @@ else:
 
     def invoke(self, payload=None, env=None):
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload or self.payload),
-                              text=True, capture_output=True, env=env or self.env, timeout=8)
+                              text=True, capture_output=True, env=env or self.env, timeout=8, check=False)
 
     def builds(self):
         p = self.root / ".git" / "builds"
@@ -100,6 +104,7 @@ else:
         env = dict(self.env, SLOW_INDEX="0.6")
         first = subprocess.Popen([sys.executable, str(HOOK)], stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        assert first.stdin is not None
         first.stdin.write(json.dumps(self.payload))
         first.stdin.close()
         first.stdin = None
@@ -118,12 +123,10 @@ else:
         self.assertEqual(self.builds(), 1)
 
     def test_zg_failures_explain_config_mismatch_without_repeating_stderr(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         for detail, expected in (
-            ("Code: ZVEC_GREP.ENGINE.CONFIG.INVALID\n"
-             "  detail: defaults.disableMetalTensor is not supported\n",
+            (("Code: ZVEC_GREP.ENGINE.CONFIG.INVALID\n"
+              "  detail: defaults.disableMetalTensor is not supported\n"),
              "zg rejects defaults.disableMetalTensor; verify the installed zg build includes local configuration support"),
             ("Code: ZVEC_GREP.ENGINE.CONFIG.INVALID\n",
              "zg rejected global configuration; verify the installed zg build against ~/.zvec-grep/config.json"),
@@ -142,10 +145,18 @@ else:
                     if "CONFIG.INVALID" in detail:
                         self.assertEqual(run.call_count, 1, "invalid config must not trigger another attempt")
 
+    def test_missing_zg_has_a_clear_failure_before_catalog_lookup(self):
+        with (
+            patch.object(self.hook, "load_json", side_effect=[{"defaults": {"embedding": "local/fixture"}}, {}]),
+            patch.dict(os.environ, {"ZVEC_GREP_EMBEDDING": "local/fixture"}),
+            patch.object(self.hook.Path, "exists", return_value=True),
+            patch.object(self.hook.shutil, "which", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "zg is not installed"),
+        ):
+            self.hook.zvec_model(self.root, time.monotonic() + 5)
+
     def test_zg_installation_drift_stops_before_model_selection(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         checker = self.base / ".local/share/zvec-grep/verify-install.py"
         checker.parent.mkdir(parents=True)
         checker.touch()
@@ -167,9 +178,7 @@ else:
             model.assert_called_once()
 
     def test_zg_uses_and_fingerprints_git_excluded_ignore_file(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         rules = self.root / ".ignore"
         exclude = self.root / ".git/info/exclude"
         exclude.write_text(exclude.read_text() + "\n.ignore\n")
@@ -197,6 +206,7 @@ else:
         first = subprocess.Popen([sys.executable, str(HOOK)], stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         try:
+            assert first.stdin is not None
             first.stdin.write(json.dumps(self.payload))
             first.stdin.close()
             first.stdin = None
@@ -216,6 +226,7 @@ else:
         p = subprocess.Popen([sys.executable, str(HOOK)], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env)
         try:
+            assert p.stdin is not None
             p.stdin.write(json.dumps(self.payload))
             p.stdin.flush()
             self.assertEqual(p.wait(timeout=4), 0)
@@ -225,9 +236,7 @@ else:
             p.communicate()
 
     def test_local_embedding_policy_and_timeout_cleanup(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         index = self.root / ".zvec-grep"
         index.mkdir()
         (index / "manifest.json").write_text(json.dumps({"indexPolicy": "enabled", "rootPaths": [],
@@ -306,16 +315,14 @@ else:
                   "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.BUDGET_SECONDS=1; m.main()")
         start = time.monotonic()
         result = subprocess.run([sys.executable, "-c", script], input=json.dumps(self.payload), text=True,
-                                capture_output=True, env=dict(self.env, SLOW_INDEX="10"), timeout=3)
+                                capture_output=True, env=dict(self.env, SLOW_INDEX="10"), timeout=3, check=False)
         self.assertEqual(result.returncode, 0)
         self.assertIn("hook budget exhausted", result.stderr)
         self.assertLess(time.monotonic() - start, 2)
         self.assertFalse((self.root / ".tgrep/ready").exists())
 
     def test_selected_target_and_worktree_root(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         selected = module.selection({"hook_event_name": "PreToolUse", "cwd": str(self.base),
                     "tool_name": "mcp__codegraph__codegraph_explore", "tool_input": {"projectPath": str(self.root / "sub")}})
         self.assertEqual(selected, (self.root, ["codegraph"]))
@@ -329,9 +336,7 @@ else:
         self.assertEqual(selected[0], worktree)
 
     def test_allowlisted_nongit_roots(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         for relative in ("projects/app/sub", "projects/broken", "scripts/tool", "elsewhere"):
             (self.base / relative).mkdir(parents=True)
         (self.base / "projects/broken/.git").mkdir()  # a Git marker git_root rejected stays rejected
@@ -351,9 +356,7 @@ else:
                 self.assertIsNone(pick(refused), refused)
 
     def test_nongit_root_keeps_state_outside_and_honors_gitignore(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         app = self.base / "projects/app"
         (app / "results").mkdir(parents=True)
         (app / "main.py").write_text("x = 1\n")
@@ -376,14 +379,14 @@ else:
             self.assertEqual(run.call_args_list[0].args[0][-2:], ["--ignore-file", app / ".gitignore"])
 
     def test_first_zg_build_runs_detached_then_refreshes_inline(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         state_dir = self.root / ".git"
         with patch.object(module.subprocess, "Popen") as popen:
-            module.start_background_zg(self.root, state_dir, "stamp")
+            module.start_background_zg(self.root, state_dir, "stamp", {})
         self.assertIn("--zg-build", popen.call_args.args[0])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        # The mocked worker never ran; clear its fixture intent before the next scenario.
+        (state_dir / "codex-context-indexes.json").unlink()
         with patch.object(module.shutil, "which", return_value="/usr/bin/true"), \
              patch.object(module, "zg_preflight") as preflight, \
              patch.object(module, "zg_index_usable", side_effect=lambda *args: (self.root / ".zvec-grep").exists()), \
@@ -398,7 +401,7 @@ else:
                 fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 module.ensure(self.root, ["zg"], time.monotonic() + 5)
                 start.assert_called_once()  # a running build is not started twice
-            maintain.side_effect = lambda *args: (self.root / ".zvec-grep").mkdir(exist_ok=True)
+            maintain.side_effect = lambda *args, **kwargs: (self.root / ".zvec-grep").mkdir(exist_ok=True)
             module.build_zg_in_background(self.root, "stamp")
             maintain.assert_called_once()
             start_next.assert_called_once()  # a finished build hands the machine to the next queued one
@@ -407,9 +410,7 @@ else:
             self.assertEqual(maintain.call_count, 2, "a built index refreshes inline")
 
     def test_first_zg_builds_run_one_at_a_time_on_this_machine(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         state = self.root / ".git/codex-context-indexes.json"
         with patch.object(module.shutil, "which", return_value="/usr/bin/true"), \
              patch.object(module, "zg_preflight"), \
@@ -425,27 +426,31 @@ else:
                     module.build_zg_in_background(self.root, "stamp")  # a hook that raced past the check
                 maintain.assert_not_called()
             self.assertEqual(module.zg_queue().read_text(), f"{self.root}\n", "queued once")
-            self.assertNotIn("zg", json.loads(state.read_text()), "a deferred build sets no backoff")
+            queued_state = json.loads(state.read_text())["zg"]
+            self.assertEqual(queued_state["pending"], "queued")
+            self.assertNotIn("retry_after", queued_state, "a deferred build sets no backoff")
             with patch.object(module.subprocess, "Popen") as popen:
                 module.start_queued_zg()  # what the running build does when it ends
             self.assertEqual(popen.call_args.args[0][-2:], ["--zg-queued", str(self.root)])
+            self.assertEqual(module.zg_queue().read_text(), f"{self.root}\n", "startup retains queue evidence")
+            module.ensure(self.root, ["zg"], time.monotonic() + 5, queued=True)  # what that child does
             self.assertEqual(module.zg_queue().read_text(), "")
-            module.ensure(self.root, ["zg"], time.monotonic() + 5)  # what that maintainer run does
             start.assert_called_once()
         # The queued run's entry point: a real root reaches ensure for zg alone; anything else is ignored.
-        path = os.pathsep.join([str(self.bin), str(Path(shutil.which("git")).parent)])
+        git = shutil.which("git")
+        assert git is not None
+        path = os.pathsep.join([str(self.bin), str(Path(git).parent)])
         for target, expected in ((self.root, "zg is not installed"), (self.base / "nowhere", "")):
             if shutil.which("zg", path=path):
                 self.skipTest("a real zg sits next to git; this check would start a real build")
+            module.queue_zg(target)
             done = subprocess.run([sys.executable, str(HOOK), "--zg-queued", str(target)], capture_output=True,
-                                  text=True, timeout=8, env=dict(self.env, PATH=path))
+                                  text=True, timeout=8, env=dict(self.env, PATH=path), check=False)
             self.assertEqual(done.returncode, 0)
             self.assertIn(expected, done.stderr)
 
     def test_zg_runs_with_two_embedding_contexts_unless_set(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         log = self.base / "zg.log"
         fake = self.bin / "zg"
         fake.write_text("#!" + sys.executable + "\nimport os, sys\nwith open(" + repr(str(log)) + ", 'a') as f:\n"
@@ -463,9 +468,7 @@ else:
             self.assertEqual(log.read_text(), "index 4\nstatus 4\n", "a value the user set wins")
 
     def test_codegraph_full_build_over_the_limit_is_never_started(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         real, calls = module.run, []
 
         def fake(args, *rest, **kwargs):
@@ -474,32 +477,36 @@ else:
             calls.append(args[1])
             return subprocess.CompletedProcess(args, 0, '{"initialized": false}', "")
         with patch.object(module, "run", side_effect=fake):
-            with patch.dict(module.FIRST_BUILD_MAX_FILES, {"codegraph": 0}):
-                with self.assertRaisesRegex(RuntimeError, "full build skipped: 1 files"):
-                    module.maintain_codegraph(self.root, True, time.monotonic() + 5)
+            with (
+                patch.dict(module.FIRST_BUILD_MAX_FILES, {"codegraph": 0}),
+                self.assertRaisesRegex(RuntimeError, "full build skipped: 1 files"),
+            ):
+                module.maintain_codegraph(self.root, True, time.monotonic() + 5)
             self.assertNotIn("init", calls)
             with self.assertRaisesRegex(RuntimeError, "not ready"):  # the fake never reports success
                 module.maintain_codegraph(self.root, True, time.monotonic() + 5)
             self.assertIn("init", calls)
 
     def test_background_timeout_drops_only_its_own_partial_index_and_stops(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         index = self.root / ".zvec-grep"
         index.mkdir()
-        with patch.object(module, "maintain_zg", side_effect=subprocess.TimeoutExpired("zg", 1)):
-            with self.assertRaises(subprocess.TimeoutExpired):
-                module.build_zg_in_background(self.root, "stamp")
+        with (
+            patch.object(module, "maintain_zg", side_effect=subprocess.TimeoutExpired("zg", 1)),
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            module.build_zg_in_background(self.root, "stamp")
         self.assertTrue(index.exists(), "an index the build did not create is kept")
         index.rmdir()
 
-        def killed(*args):
+        def killed(*args, **kwargs):
             index.mkdir(exist_ok=True)
             raise subprocess.TimeoutExpired("zg", 1)
-        with patch.object(module, "maintain_zg", side_effect=killed):
-            with self.assertRaises(subprocess.TimeoutExpired):
-                module.build_zg_in_background(self.root, "stamp")
+        with (
+            patch.object(module, "maintain_zg", side_effect=killed),
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            module.build_zg_in_background(self.root, "stamp")
         self.assertFalse(index.exists())
         with patch.object(module.shutil, "which", return_value="/usr/bin/true"), \
              patch.object(module, "zg_preflight"), \
@@ -510,9 +517,7 @@ else:
         self.assertIn("zg skipped", note.call_args.args[0])
 
     def test_nested_repositories_count_for_freshness_not_for_zg_size(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         nested = self.root / "vendor/lib"
         nested.mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(nested)], check=True)
@@ -536,9 +541,7 @@ else:
         self.assertIn("(1 files)", note.call_args.args[0])
 
     def test_delta_checkouts_get_a_git_excluded_sembleignore(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         patcher = patch.object(module, "semble_clear_orphans")  # never touch the real Semble cache
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -572,9 +575,7 @@ else:
         self.assertIn("committed .sembleignore lacks .delta/", note.call_args.args[0])
 
     def test_semble_cleanup_drops_only_deleted_delta_checkouts(self):
-        spec = importlib.util.spec_from_file_location("index_hook", HOOK)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = self.hook
         cache = Path(os.environ["SEMBLE_CACHE_LOCATION"])
 
         def entry(source, key=None):

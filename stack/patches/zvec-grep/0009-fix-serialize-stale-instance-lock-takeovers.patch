@@ -1,0 +1,573 @@
+From: beardedeagle <randy@heroictek.com>
+Subject: [PATCH] fix(daemon): serialize stale instance record takeovers safely
+
+Guard stale record takeover with immutable, generation-specific owner entries.
+Reclamation and release unlink only the observed claim and remove directories
+only when empty, so an old observer cannot rename or delete a new live guard.
+Encode host/PID/creation identity in each claim name to protect in-progress
+publication. Retain legacy stale guard, empty guard and crashed-owner recovery.
+
+Preserve initial atomic publication and denied-unlink/rename recovery. Keep
+in-place UTF-8 writes complete and truncate by byte length. Cover competing
+processes with both a stale instance and stale guard, replacement-owner release,
+crashed claims, denied-unlink recovery and complete non-ASCII records.
+
+diff --git a/src/daemon/server-controller.ts b/src/daemon/server-controller.ts
+index b098603..684cd6f 100644
+--- a/src/daemon/server-controller.ts
++++ b/src/daemon/server-controller.ts
+@@ -9,7 +9,10 @@ import {
+   daemonHome,
+   resolveClientToken,
+ } from "./config.js";
+-import { processIsAlive } from "../engine/utils/daemon-lease.js";
++import {
++  acquireDaemonLeaseGuardAtPath,
++  processIsAlive,
++} from "../engine/utils/daemon-lease.js";
+ import { replaceFileAtomically } from "../engine/utils/atomic-file.js";
+ import {
+   DEFAULT_MCP_TOOLSET,
+@@ -87,25 +90,38 @@ export class DaemonInstanceLock {
+           return new DaemonInstanceLock(path, record);
+         } catch (error) {
+           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+-          const existing = await readInstanceRecord(home);
+-          if (
+-            existing &&
+-            existing.hostname === hostname() &&
+-            processIsAlive(existing.pid)
+-          ) {
+-            throw new Error(
+-              `zvec-grep server is already running with PID ${existing.pid}`,
+-              { cause: error },
+-            );
++          // A stale record can be rewritten only by one contender. Recheck
++          // liveness under the existing lease guard before touching its inode.
++          const guard = acquireDaemonLeaseGuardAtPath(
++            join(daemonHome(home), "instance.guard"),
++            record.instanceToken,
++          );
++          if (!guard) {
++            throw new Error("zvec-grep server instance lock acquisition is already in progress.");
+           }
+-          // The previous owner is gone. Take the record over in place:
+-          // removing the stale file first needs permission to unlink, which
+-          // restricted filesystems deny, and the retry loop would never make
+-          // progress there.
+-          if (await takeOverInstanceRecord(path, record)) {
+-            return new DaemonInstanceLock(path, record);
++          try {
++            const existing = await readInstanceRecord(home);
++            if (
++              existing &&
++              existing.hostname === hostname() &&
++              processIsAlive(existing.pid)
++            ) {
++              throw new Error(
++                `zvec-grep server is already running with PID ${existing.pid}`,
++                { cause: error },
++              );
++            }
++            // The previous owner is gone. Take the record over in place:
++            // removing the stale file first needs permission to unlink, which
++            // restricted filesystems deny, and the retry loop would never make
++            // progress there.
++            if (await takeOverInstanceRecord(path, record)) {
++              return new DaemonInstanceLock(path, record);
++            }
++            await unlink(path).catch(() => undefined);
++          } finally {
++            guard.release();
+           }
+-          await unlink(path).catch(() => undefined);
+         }
+       }
+       throw new Error("Could not acquire the zvec-grep server instance lock.");
+@@ -192,10 +208,11 @@ async function writeRecordInPlace(
+ ): Promise<void> {
+   const handle = await open(path, "r+");
+   try {
+-    await handle.write(payload, 0, "utf8");
++    await handle.writeFile(payload, "utf8");
++    const bytes = Buffer.byteLength(payload, "utf8");
+     const { size } = await handle.stat();
+-    if (size > payload.length) {
+-      await handle.truncate(payload.length);
++    if (size > bytes) {
++      await handle.truncate(bytes);
+     }
+     await handle.sync();
+   } finally {
+diff --git a/src/engine/utils/daemon-lease.ts b/src/engine/utils/daemon-lease.ts
+index 4e05299..8edbe22 100644
+--- a/src/engine/utils/daemon-lease.ts
++++ b/src/engine/utils/daemon-lease.ts
+@@ -1,10 +1,13 @@
+ import { hostname } from "node:os";
++import { createHash, randomUUID } from "node:crypto";
+ import {
++  closeSync,
+   existsSync,
+   mkdirSync,
++  openSync,
++  readdirSync,
+   readFileSync,
+-  renameSync,
+-  rmSync,
++  rmdirSync,
+   statSync,
+   unlinkSync,
+   writeFileSync,
+@@ -37,7 +40,20 @@ export function acquireDaemonLeaseGuard(
+   root: string,
+   instanceToken: string,
+ ): DaemonLeaseGuard | undefined {
+-  const path = daemonLeaseGuardPath(root);
++  return acquireDaemonLeaseGuardAtPath(daemonLeaseGuardPath(root), instanceToken);
++}
++
++/**
++ * Acquire a guard through a unique, immutable owner entry.
++ *
++ * Its name carries liveness metadata before JSON publication completes. Reapers
++ * and releasers remove only that entry; nonrecursive rmdir cannot remove a
++ * replacement guard once another owner has published its claim.
++ */
++export function acquireDaemonLeaseGuardAtPath(
++  path: string,
++  instanceToken: string,
++): DaemonLeaseGuard | undefined {
+   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+   const record: DaemonLeaseRecord = {
+     pid: process.pid,
+@@ -47,40 +63,85 @@ export function acquireDaemonLeaseGuard(
+     updatedAt: Date.now(),
+   };
+   for (let attempt = 0; attempt < 3; attempt++) {
++    const owner = `owner-${createHash("sha256").update(record.hostname).digest("hex")}-${record.pid}-${record.createdAt}-${randomUUID()}.json`;
++    let published = false;
+     try {
+       mkdirSync(path, { recursive: false, mode: 0o700 });
+-      writeFileSync(join(path, "owner.json"), `${JSON.stringify(record)}\n`, {
+-        mode: 0o600,
+-      });
++      const descriptor = openSync(join(path, owner), "wx", 0o600);
++      published = true;
++      try {
++        writeFileSync(descriptor, `${JSON.stringify(record)}\n`);
++      } finally {
++        closeSync(descriptor);
++      }
++      // A reaper may have removed an abandoned empty directory before this
++      // claim was written. Never enter if a competing claim shares its path.
++      const owners = readdirSync(path);
++      if (owners.length !== 1 || owners[0] !== owner) {
++        removeGuardOwner(path, owner);
++        return undefined;
++      }
+       let released = false;
+       return {
+         release() {
+           if (!released) {
+             released = true;
+-            rmSync(path, { recursive: true, force: true });
++            removeGuardOwner(path, owner);
+           }
+         },
+       };
+     } catch (error) {
++      if (published) removeGuardOwner(path, owner);
++      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+         throw error;
+       }
+-      if (!guardIsStale(path)) {
++      if (!reapStaleGuard(path)) {
+         return undefined;
+       }
+-      const quarantine = `${path}.stale-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+-      try {
+-        renameSync(path, quarantine);
+-      } catch (renameError) {
+-        if ((renameError as NodeJS.ErrnoException).code === "ENOENT") {
+-          continue;
++    }
++  }
++  return undefined;
++}
++
++function removeGuardOwner(path: string, owner: string): void {
++  try {
++    unlinkSync(join(path, owner));
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
++    throw error;
++  }
++  try {
++    rmdirSync(path);
++  } catch (error) {
++    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) {
++      throw error;
++    }
++  }
++}
++
++function reapStaleGuard(path: string): boolean {
++  try {
++    const owners = readdirSync(path);
++    if (owners.length === 0) {
++      if (Date.now() - statSync(path).mtimeMs <= 30_000) return false;
++    } else {
++      if (!owners.every((owner) => guardOwnerIsStale(path, owner))) return false;
++      for (const owner of owners) {
++        // A missing observed entry means this directory may already belong to
++        // a replacement owner. Do not remove its directory or any new entry.
++        try {
++          unlinkSync(join(path, owner));
++        } catch {
++          return false;
+         }
+-        return undefined;
+       }
+-      rmSync(quarantine, { recursive: true, force: true });
+     }
++    rmdirSync(path);
++    return true;
++  } catch (error) {
++    return (error as NodeJS.ErrnoException).code === "ENOENT";
+   }
+-  return undefined;
+ }
+ 
+ export function readDaemonLease(root: string): DaemonLeaseRecord | undefined {
+@@ -170,10 +231,21 @@ function daemonLeaseActiveError(root: string, pid: number): EngineError {
+   });
+ }
+ 
+-function guardIsStale(path: string): boolean {
++function guardOwnerIsStale(path: string, owner: string): boolean {
++  const modern = /^owner-([0-9a-f]{64})-(\d+)-(\d+)-[0-9a-f-]{36}\.json$/.exec(owner);
++  if (modern) {
++    const pid = Number(modern[2]);
++    const createdAt = Number(modern[3]);
++    if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(createdAt)) return false;
++    return modern[1] === createHash("sha256").update(hostname()).digest("hex")
++      ? !processIsAlive(pid)
++      : Date.now() - createdAt > 30_000;
++  }
++  if (owner !== "owner.json") return false;
++  const ownerPath = join(path, owner);
+   try {
+     const record = JSON.parse(
+-      readFileSync(join(path, "owner.json"), "utf8"),
++      readFileSync(ownerPath, "utf8"),
+     ) as Partial<DaemonLeaseRecord>;
+     if (
+       record.hostname === hostname() &&
+@@ -193,12 +265,12 @@ function guardIsStale(path: string): boolean {
+     ) {
+       return Date.now() - record.updatedAt > 30_000;
+     }
+-    return Date.now() - statSync(path).mtimeMs > 30_000;
++    return Date.now() - statSync(ownerPath).mtimeMs > 30_000;
+   } catch {
+     try {
+-      return Date.now() - statSync(path).mtimeMs > 30_000;
++      return Date.now() - statSync(ownerPath).mtimeMs > 30_000;
+     } catch {
+-      return true;
++      return false;
+     }
+   }
+ }
+diff --git a/test/daemon-guard-recovery.test.mjs b/test/daemon-guard-recovery.test.mjs
+new file mode 100644
+index 0000000..932b226
+--- /dev/null
++++ b/test/daemon-guard-recovery.test.mjs
+@@ -0,0 +1,188 @@
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import { once } from "node:events";
++import fs from "node:fs/promises";
++import { hostname, tmpdir } from "node:os";
++import { join } from "node:path";
++import test from "node:test";
++import { setTimeout as delay } from "node:timers/promises";
++import { acquireDaemonLeaseGuardAtPath } from "../dist/engine/utils/daemon-lease.js";
++
++async function exists(path) {
++  try {
++    await fs.access(path);
++    return true;
++  } catch (error) {
++    if (error.code !== "ENOENT") throw error;
++    return false;
++  }
++}
++
++async function waitFor(check) {
++  const deadline = Date.now() + 5_000;
++  while (!(await check())) {
++    if (Date.now() >= deadline) throw new Error("guard worker timed out");
++    await delay(5);
++  }
++}
++
++const worker = `
++import fs from "node:fs";
++import promises from "node:fs/promises";
++import { syncBuiltinESMExports } from "node:module";
++import { join } from "node:path";
++import { setTimeout as delay } from "node:timers/promises";
++const [home, id, module] = process.argv.slice(1);
++const signal = name => join(home, id + "." + name);
++const read = fs.readFileSync;
++const readAsync = promises.readFile;
++let guardPaused = false;
++let recordPaused = false;
++fs.readFileSync = (...args) => {
++  const result = read(...args);
++  if (!guardPaused && args[0] === join(home, "daemon/instance.guard/owner.json")) {
++    guardPaused = true;
++    fs.writeFileSync(signal("guard"), "");
++    const deadline = Date.now() + 5_000;
++    while (!fs.existsSync(signal("go-guard"))) {
++      if (Date.now() >= deadline) throw new Error("guard barrier timed out");
++      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
++    }
++  }
++  return result;
++};
++promises.readFile = async (...args) => {
++  const result = await readAsync(...args);
++  if (!recordPaused && args[0] === join(home, "daemon/instance.lock")) {
++    recordPaused = true;
++    fs.writeFileSync(signal("record"), "");
++    const deadline = Date.now() + 5_000;
++    while (!fs.existsSync(signal("go-record"))) {
++      if (Date.now() >= deadline) throw new Error("record barrier timed out");
++      await delay(5);
++    }
++  }
++  return result;
++};
++syncBuiltinESMExports();
++const { DaemonInstanceLock } = await import(module);
++let lock;
++let result;
++try {
++  lock = await DaemonInstanceLock.acquire(home, "http://127.0.0.1:1/mcp");
++  result = { acquired: true, token: lock.record.instanceToken };
++} catch (error) {
++  result = { acquired: false, error: error.message };
++}
++fs.writeFileSync(signal("result.tmp"), JSON.stringify(result));
++fs.renameSync(signal("result.tmp"), signal("result"));
++const deadline = Date.now() + 5_000;
++while (!fs.existsSync(signal("release"))) {
++  if (Date.now() >= deadline) throw new Error("release barrier timed out");
++  await delay(5);
++}
++await lock?.release();
++`;
++
++test("two processes cannot steal a new owner while reclaiming a stale instance guard", async (t) => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-stale-guard-"));
++  const children = [];
++  t.after(async () => {
++    for (const id of ["a", "b"]) {
++      for (const name of ["go-guard", "go-record", "release"]) {
++        await fs.writeFile(join(home, id + "." + name), "");
++      }
++    }
++    for (const child of children) {
++      if (child.exitCode === null && child.signalCode === null) {
++        const exited = once(child, "exit");
++        child.kill("SIGKILL");
++        await exited;
++      }
++    }
++    await fs.rm(home, { recursive: true, force: true });
++  });
++  const stale = { pid: 0, hostname: hostname(), instanceToken: "stale",
++    startedAt: 1, createdAt: 1, updatedAt: 1,
++    serverUrl: "http://127.0.0.1:1/mcp", ready: false, mcpToolset: "agent" };
++  await fs.mkdir(join(home, "daemon/instance.guard"), { recursive: true });
++  await fs.writeFile(join(home, "daemon/instance.guard/owner.json"), JSON.stringify(stale));
++  await fs.writeFile(join(home, "daemon/instance.lock"), JSON.stringify(stale));
++  const module = new URL("../dist/daemon/server-controller.js", import.meta.url).href;
++  for (const id of ["a", "b"]) {
++    children.push(spawn(process.execPath, ["--input-type=module", "-e", worker, home, id, module],
++      { stdio: "ignore" }));
++  }
++  await waitFor(async () => await exists(join(home, "a.guard")) && await exists(join(home, "b.guard")));
++  await fs.writeFile(join(home, "a.go-guard"), "");
++  await waitFor(() => exists(join(home, "a.record")));
++  await fs.writeFile(join(home, "b.go-guard"), "");
++  await waitFor(async () => await exists(join(home, "b.record")) || await exists(join(home, "b.result")));
++  await fs.writeFile(join(home, "a.go-record"), "");
++  await fs.writeFile(join(home, "b.go-record"), "");
++  await waitFor(async () => await exists(join(home, "a.result")) && await exists(join(home, "b.result")));
++  const results = await Promise.all(["a", "b"].map(async (id) =>
++    JSON.parse(await fs.readFile(join(home, id + ".result"), "utf8"))));
++  assert.equal(results.filter(result => result.acquired).length, 1);
++  const current = JSON.parse(await fs.readFile(join(home, "daemon/instance.lock"), "utf8"));
++  assert.equal(current.instanceToken, results.find(result => result.acquired).token);
++});
++
++test("releasing an old guard preserves a replacement owner's directory", async () => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-guard-release-"));
++  const path = join(home, "guard");
++  const first = acquireDaemonLeaseGuardAtPath(path, "first");
++  let second;
++  try {
++    assert.ok(first);
++    await fs.rename(path, join(home, "old-guard"));
++    second = acquireDaemonLeaseGuardAtPath(path, "second");
++    assert.ok(second);
++    const names = await fs.readdir(path);
++    const before = await Promise.all(names.map(name => fs.readFile(join(path, name), "utf8")));
++    first.release();
++    assert.deepEqual(await fs.readdir(path), names);
++    assert.deepEqual(await Promise.all(names.map(name => fs.readFile(join(path, name), "utf8"))), before);
++  } finally {
++    first?.release();
++    second?.release();
++    await fs.rm(home, { recursive: true, force: true });
++  }
++});
++
++test("abandoned empty guards recover and recent incomplete guards remain held", async () => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-empty-guard-"));
++  const path = join(home, "guard");
++  let guard;
++  try {
++    await fs.mkdir(path);
++    assert.equal(acquireDaemonLeaseGuardAtPath(path, "recent"), undefined);
++    const old = new Date(Date.now() - 60_000);
++    await fs.utimes(path, old, old);
++    guard = acquireDaemonLeaseGuardAtPath(path, "recovered");
++    assert.ok(guard);
++  } finally {
++    guard?.release();
++    await fs.rm(home, { recursive: true, force: true });
++  }
++});
++
++test("a unique guard claim recovers after its owning process exits", async () => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-orphan-claim-"));
++  const path = join(home, "guard");
++  let guard;
++  try {
++    const module = new URL("../dist/engine/utils/daemon-lease.js", import.meta.url).href;
++    const child = spawn(process.execPath, ["--input-type=module", "-e",
++      `const { acquireDaemonLeaseGuardAtPath } = await import(process.argv[1]);
++       if (!acquireDaemonLeaseGuardAtPath(process.argv[2], "orphan")) process.exitCode = 1;`,
++      module, path], { stdio: "ignore" });
++    const [code] = await once(child, "exit");
++    assert.equal(code, 0);
++    guard = acquireDaemonLeaseGuardAtPath(path, "recovered");
++    assert.ok(guard);
++  } finally {
++    guard?.release();
++    await fs.rm(home, { recursive: true, force: true });
++  }
++});
+diff --git a/test/instance-lock-race.test.mjs b/test/instance-lock-race.test.mjs
+index 7bfe8ca..925bf2f 100644
+--- a/test/instance-lock-race.test.mjs
++++ b/test/instance-lock-race.test.mjs
+@@ -1,7 +1,7 @@
+ import assert from "node:assert/strict";
+ import fs from "node:fs/promises";
+ import { syncBuiltinESMExports } from "node:module";
+-import { tmpdir } from "node:os";
++import { hostname, tmpdir } from "node:os";
+ import { join } from "node:path";
+ import test from "node:test";
+ import {
+@@ -81,6 +81,82 @@ test("markReady fails explicitly after instance ownership is lost", async () =>
+   }
+ });
+ 
++test("concurrent stale instance takeovers select exactly one owner", async () => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-instance-stale-"));
++  const locks = [];
++  try {
++    await fs.mkdir(join(home, "daemon"));
++    await fs.writeFile(join(home, "daemon/instance.lock"), JSON.stringify({
++      pid: 0, hostname: hostname(), instanceToken: "stale", startedAt: 1,
++      updatedAt: 1, serverUrl: "http://127.0.0.1:1/mcp", ready: false,
++      mcpToolset: "agent",
++    }));
++    const outcomes = await Promise.allSettled(Array.from({ length: 8 }, () =>
++      DaemonInstanceLock.acquire(home, "http://127.0.0.1:1/mcp")));
++    for (const outcome of outcomes) {
++      if (outcome.status === "fulfilled") locks.push(outcome.value);
++    }
++    assert.equal(locks.length, 1);
++    assert.equal((await readInstanceRecord(home)).instanceToken,
++      locks[0].record.instanceToken);
++    assert.deepEqual(await fs.readdir(join(home, "daemon")), ["instance.lock"]);
++  } finally {
++    for (const lock of locks) await lock.release();
++    await fs.rm(home, { recursive: true, force: true });
++  }
++});
++
++test("released records can be taken over when instance unlink is denied", async () => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-instance-released-"));
++  const first = await DaemonInstanceLock.acquire(home, "http://127.0.0.1:1/mcp");
++  const originalUnlink = fs.unlink;
++  let second;
++  try {
++    fs.unlink = async (path) => {
++      if (path === join(home, "daemon/instance.lock")) {
++        throw Object.assign(new Error("unlink denied"), { code: "EPERM" });
++      }
++      return originalUnlink(path);
++    };
++    syncBuiltinESMExports();
++    await first.release();
++    assert.equal((await readInstanceRecord(home)).pid, 0);
++    second = await DaemonInstanceLock.acquire(home, "http://127.0.0.1:1/mcp");
++    await second.markReady();
++    assert.equal((await readInstanceRecord(home)).instanceToken,
++      second.record.instanceToken);
++    assert.equal((await readInstanceRecord(home)).ready, true);
++  } finally {
++    fs.unlink = originalUnlink;
++    syncBuiltinESMExports();
++    await second?.release();
++    await first.release();
++    await fs.rm(home, { recursive: true, force: true });
++  }
++});
++
++test("in-place readiness preserves complete UTF-8 records above padding width", async () => {
++  const home = await fs.mkdtemp(join(tmpdir(), "zg-instance-utf8-"));
++  const serverUrl = "http://127.0.0.1:1/" + "é".repeat(600);
++  const lock = await DaemonInstanceLock.acquire(home, serverUrl);
++  const originalRename = fs.rename;
++  try {
++    fs.rename = async () => {
++      throw Object.assign(new Error("replacement denied"), { code: "EPERM" });
++    };
++    syncBuiltinESMExports();
++    await lock.markReady();
++    const record = await readInstanceRecord(home);
++    assert.equal(record?.serverUrl, serverUrl);
++    assert.equal(record?.ready, true);
++  } finally {
++    fs.rename = originalRename;
++    syncBuiltinESMExports();
++    await lock.release();
++    await fs.rm(home, { recursive: true, force: true });
++  }
++});
++
+ test("instance readiness writes never expose a truncated lock to bridge polls", async () => {
+   const home = await fs.mkdtemp(join(tmpdir(), "zg-instance-race-"));
+   const lock = await DaemonInstanceLock.acquire(home, "http://127.0.0.1:1/mcp");

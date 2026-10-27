@@ -1,0 +1,44 @@
+From: beardedeagle <randy@heroictek.com>
+Date: Sun, 25 Oct 2026 04:15:00 -0500
+Subject: [PATCH 8/8] fix(models): drive backend concurrency limits from the catalog
+
+The llama-cpp backend hardcoded limits.maxConcurrentBatches: 1. The indexing policy
+clamps with Math.min(requestedConcurrency, maxConcurrentBatches), so every value was
+clamped to one worker -- including an explicit --index-embedding-concurrency and
+ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY. The automatic path collapsed to one worker
+too, because neither llama-cpp nor transformers-js mapped the catalog's
+defaultConcurrency into the model info; only model2vec did.
+
+Map defaultConcurrency into the model info for both backends and use it for
+maxConcurrentBatches, so the catalog entry is the single source of truth for local
+embedding concurrency. The default stays at one when a catalog entry does not
+declare it.
+
+ src/engine/models/backends/llama-cpp.ts      | 4 ++--
+ src/engine/models/backends/transformers-js.ts | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/engine/models/backends/llama-cpp.ts b/src/engine/models/backends/llama-cpp.ts
+index e78b08e..2b5138f 100644
+--- a/src/engine/models/backends/llama-cpp.ts
++++ b/src/engine/models/backends/llama-cpp.ts
+@@ -185,6 +185,7 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
+       name: entry.model,
+       dimension: entry.dimension,
+       metric: entry.metric,
++      defaultConcurrency: entry.defaultConcurrency,
+       inputKinds: ["text"],
+       limits: {
+         maxBatchSize: entry.maxBatchSize,
+diff --git a/src/engine/models/backends/transformers-js.ts b/src/engine/models/backends/transformers-js.ts
+index a52f721..79b9f8c 100644
+--- a/src/engine/models/backends/transformers-js.ts
++++ b/src/engine/models/backends/transformers-js.ts
+@@ -144,6 +144,7 @@ export class TransformersJsEmbeddingModel extends BaseEmbeddingModel {
+       name: entry.model,
+       dimension: entry.dimension,
+       metric: entry.metric,
++      defaultConcurrency: entry.defaultConcurrency,
+       inputKinds: ["text"],
+       limits: {
+         maxBatchSize: entry.maxBatchSize,

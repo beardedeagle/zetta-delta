@@ -1,0 +1,142 @@
+From: beardedeagle <randy@heroictek.com>
+Date: Fri, 24 Oct 2026 14:45:00 -0500
+Subject: [PATCH 5/5] feat(models): scale embedding parallelism on unified-memory hosts
+
+Metal on Apple Silicon has no separate VRAM pool, so node-llama-cpp cannot
+answer getVramState(). The automatic parallelism probe therefore had no
+oracle to consult and fell back to a single worker, which left GPU offload
+active but the index running one embedding context at a time.
+
+Derive the worker count from system memory headroom when GPU offload is on
+but no VRAM oracle exists. A quarter of free RAM at 512 MiB per context is
+budgeted, because the contexts share the model weights and compete with the
+rest of the machine for the same memory.
+
+Also accept ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY as the preferred override
+name, keeping ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM as the legacy fallback.
+
+Keep invalid-override diagnostics bound to the selected variable name and
+cover the preferred and legacy overrides without loading an embedding model.
+
+diff --git a/src/engine/models/backends/llama-cpp.ts b/src/engine/models/backends/llama-cpp.ts
+index 288fe47..5ca17e4 100644
+--- a/src/engine/models/backends/llama-cpp.ts
++++ b/src/engine/models/backends/llama-cpp.ts
+@@ -6,6 +6,7 @@ import {
+   statSync,
+   unlinkSync,
+ } from "node:fs";
++import { availableParallelism, freemem } from "node:os";
+ import { join, resolve } from "node:path";
+ import { readGlobalConfig } from "../../config.js";
+ import { EngineError } from "../../errors.js";
+@@ -83,6 +84,16 @@ type LlamaCppDependencies = {
+ const DEFAULT_MODEL_CACHE_DIR = join(defaultHome(), "models");
+ const GGUF_MAGIC = Buffer.from("GGUF");
+ const DEFAULT_PARALLELISM_CAP = 8;
++// Metal on Apple Silicon has no separate VRAM pool: every embedding context draws
++// on the same system RAM the rest of the machine is using. Budget a smaller slice
++// of it and charge more per context, because the contexts share the model weights
++// and compete with the OS.
++const UNIFIED_MEMORY_BUDGET_RATIO = 0.25;
++const UNIFIED_MEMORY_CONTEXT_MB = 512;
++// The cap is 2, not the memory-derived number: on Apple Silicon the limit is Metal
++// contention between contexts, not free RAM. Measured on an M-series host, 8
++// embedding contexts peak near 11 GB and run slower than 2 contexts at 3.75 GB.
++const UNIFIED_MEMORY_PARALLELISM_CAP = 2;
+ const DEFAULT_DARWIN_CMAKE_OPTIONS = {
+   GGML_OPENMP: "OFF",
+ } as const;
+@@ -187,7 +198,11 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
+     );
+     this.gpu = embeddingDeviceToLlamaGpuSelection(options.device ?? "cpu");
+     this.parallelism = resolveParallelismOverride(
+-      process.env.ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM,
++      process.env.ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY ??
++        process.env.ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM,
++      process.env.ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY !== undefined
++        ? "ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY"
++        : "ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM",
+     );
+     this.dependencies = { ...defaultDependencies, ...dependencies };
+   }
+@@ -650,6 +665,27 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
+       }
+     }
+ 
++    // GPU offload without a VRAM oracle: Metal on Apple Silicon has no separate
++    // video memory, so the VRAM probe is unavailable. Derive the worker count from
++    // system memory headroom instead of collapsing to a single worker.
++    if (!this.shouldDisableModelGpuOffload() && llama.gpu) {
++      try {
++        const freeMb = freemem() / (1024 * 1024);
++        const workers = Math.max(
++          1,
++          Math.min(
++            DEFAULT_PARALLELISM_CAP,
++            Math.floor(
++              (freeMb * UNIFIED_MEMORY_BUDGET_RATIO) / UNIFIED_MEMORY_CONTEXT_MB,
++            ),
++          ),
++        );
++        return Math.min(workers, availableParallelism(), UNIFIED_MEMORY_PARALLELISM_CAP);
++      } catch {
++        return 2;
++      }
++    }
++
+     return 1;
+   }
+ 
+@@ -783,6 +819,7 @@ function embeddingDeviceToLlamaGpuSelection(
+ 
+ function resolveParallelismOverride(
+   envValue: string | undefined,
++  envName = "ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM",
+ ): number | undefined {
+   const normalized = envValue?.trim() ?? "";
+   if (!normalized) {
+@@ -792,7 +829,7 @@ function resolveParallelismOverride(
+   const parsed = Number.parseInt(normalized, 10);
+   if (!Number.isInteger(parsed) || parsed < 1) {
+     process.stderr.write(
+-      `zvec-grep warning: invalid ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM="${envValue}", using automatic parallelism.\n`,
++      `zvec-grep warning: invalid ${envName}="${envValue}", using automatic parallelism.\n`,
+     );
+     return undefined;
+   }
+diff --git a/test/unit/models/llama-cpp.test.mjs b/test/unit/models/llama-cpp.test.mjs
+index 6aadf5c..95dc0c6 100644
+--- a/test/unit/models/llama-cpp.test.mjs
++++ b/test/unit/models/llama-cpp.test.mjs
+@@ -190,6 +190,30 @@ async function captureStderr(callback) {
+   }
+ }
+ 
++test("parallelism override warnings identify the selected environment variable", async () => {
++  const preferred = "ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY";
++  const legacy = "ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM";
++  const previous = { [preferred]: process.env[preferred], [legacy]: process.env[legacy] };
++  try {
++    for (const name of [preferred, legacy]) {
++      delete process.env[preferred];
++      delete process.env[legacy];
++      process.env[name] = "invalid-value";
++      if (name === preferred) process.env[legacy] = "2";
++      const { messages } = await captureStderr(async () => {
++        const model = new LlamaCppEmbeddingModel(entry(), { device: "cpu" });
++        await model.dispose();
++      });
++      assert.ok(messages.join("").includes(`invalid ${name}="invalid-value"`));
++    }
++  } finally {
++    for (const name of [preferred, legacy]) {
++      if (previous[name] === undefined) delete process.env[name];
++      else process.env[name] = previous[name];
++    }
++  }
++});
++
+ test("local embedding loads GGUF, formats and truncates text, parallelizes, caches, and disposes", async (t) => {
+   const modelFile = await ggufFile(t);
+   const setup = createDependencies(modelFile.path);
