@@ -172,6 +172,8 @@ canonical_dir() {
   done
   printf '%s\n' "${resolved:-/}"
 }
+RUNTIME_BACKUP_DIR="$(canonical_dir "$BACKUP_DIR" "review backup")"
+readonly RUNTIME_BACKUP_DIR
 
 # Runtime-only upgrades use complete releases and leave profiles/settings alone.
 # Existing commands pin their resolved release; new commands see the new link.
@@ -179,8 +181,7 @@ if ((REVIEW_RUNTIME_ONLY)); then
   command -v python3 >/dev/null 2>&1 || die "python3 not found"
   python3 -c 'import tomllib' 2>/dev/null || die "Python 3.11 or later is required"
   runtime_destination="$(canonical_dir "$HOME/.local/share/zetta-delta/review" "review runtime")"
-  runtime_backup="$(canonical_dir "$BACKUP_DIR" "review backup")"
-  runtime_args=(install --destination "$runtime_destination" --backup-root "$runtime_backup")
+  runtime_args=(install --destination "$runtime_destination" --backup-root "$RUNTIME_BACKUP_DIR")
   ((!FORCE)) || runtime_args+=(--force)
   ((!DRY_RUN)) || runtime_args+=(--dry-run)
   python3 "$SCRIPT_DIR/review/scripts/runtime.py" "${runtime_args[@]}"
@@ -543,7 +544,7 @@ install_output() { # DEST CMD [ARG...]: write CMD's output to DEST
 }
 
 install_review_runtime() {
-  local -a runtime_args=(install --destination "$REVIEW_DIR" --backup-root "$BACKUP_DIR")
+  local -a runtime_args=(install --destination "$REVIEW_DIR" --backup-root "$RUNTIME_BACKUP_DIR")
   if ((PLANNING)); then
     PLANNED+=("$REVIEW_DIR/scripts")
     runtime_args+=(--dry-run)

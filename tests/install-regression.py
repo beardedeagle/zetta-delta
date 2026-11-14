@@ -191,47 +191,59 @@ class InstallerTests(unittest.TestCase):
                 self.assertIn("cannot change Delta configuration", result.stderr)
                 self.assertFalse((self.home / ".local/share/zetta-delta/review").exists())
 
-    def assert_runtime_only_upgrade_with_symlinked_storage(self, storage: str) -> None:
+    def assert_upgrade_with_symlinked_storage(self, storage: str, *, runtime_only: bool = True,
+                                             state_alias_from_start: bool = False) -> None:
         """Upgrade a complete install through an owned directory alias.
 
         Args:
             storage (str): Runtime data or backup state root to relocate.
+            runtime_only (bool): Upgrade only the runtime rather than the full bundle.
+            state_alias_from_start (bool): Use the state alias for initial installation.
         """
         physical = self.base / ("physical " + storage)
-        alias = self.home / ".local/share"
+        alias = self.home / ".local/share" if storage == "data" else self.base / "state"
         if storage == "data":
             physical.mkdir(mode=0o700)
             (self.home / ".local").mkdir(mode=0o700)
             alias.symlink_to(physical, target_is_directory=True)
+        elif state_alias_from_start:
+            alias.rename(physical)
+            alias.symlink_to(physical, target_is_directory=True)
+            preview = self.install("--dry-run")
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            self.assertNoWrites()
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stderr)
         scripts = self.home / ".local/share/zetta-delta/review/scripts"
         pinned = scripts.resolve()
         original = (pinned / "workflow.py").read_bytes()
         receipt = (pinned / "runtime-manifest.json").read_bytes()
-        if storage == "state":
-            alias = self.base / "state"
+        if storage == "state" and not state_alias_from_start:
             alias.rename(physical)
             alias.symlink_to(physical, target_is_directory=True)
         mode = physical.stat().st_mode
         settings = {str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}
-        for name in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER"):
-            self.env.pop(name)
-        (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
+        if runtime_only:
+            for name in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER"):
+                self.env.pop(name)
+            (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
         with (self.bundle / "review/scripts/workflow.py").open("a") as stream:
             stream.write("\n# next source release through directory alias\n")
         releases = set(pinned.parent.parent.iterdir())
-        preview = self.install("--review-runtime-only", "--force", "--dry-run")
+        arguments = ["--review-runtime-only"] if runtime_only else []
+        preview = self.install(*arguments, "--force", "--dry-run")
         self.assertEqual(preview.returncode, 0, preview.stderr)
-        self.assertEqual(json.loads(preview.stdout)["destination"], str(scripts.resolve().parents[2] / "scripts"))
+        if runtime_only:
+            self.assertEqual(json.loads(preview.stdout)["destination"], str(scripts.resolve().parents[2] / "scripts"))
         self.assertEqual(set(pinned.parent.parent.iterdir()), releases)
         self.assertEqual(scripts.resolve(), pinned)
-        upgraded = self.install("--review-runtime-only", "--force")
+        upgraded = self.install(*arguments, "--force")
         self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
         self.assertNotEqual(scripts.resolve(), pinned)
         self.assertEqual((pinned / "workflow.py").read_bytes(), original)
         self.assertEqual((pinned / "runtime-manifest.json").read_bytes(), receipt)
-        self.assertEqual(Path(json.loads(upgraded.stdout)["backup"]).resolve(), pinned)
+        runtime_result, _ = json.JSONDecoder().raw_decode(upgraded.stdout[upgraded.stdout.index("{"):])
+        self.assertEqual(Path(runtime_result["backup"]).resolve(), pinned)
         identity = subprocess.run([sys.executable, str(scripts / "runtime.py"), "identity"],
                                   env=self.env, text=True, capture_output=True, check=False)
         self.assertEqual(identity.returncode, 0, identity.stderr)
@@ -241,10 +253,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual({str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}, settings)
 
     def test_runtime_only_upgrade_accepts_symlinked_data_directory(self):
-        self.assert_runtime_only_upgrade_with_symlinked_storage("data")
+        self.assert_upgrade_with_symlinked_storage("data")
 
     def test_runtime_only_upgrade_accepts_symlinked_state_directory(self):
-        self.assert_runtime_only_upgrade_with_symlinked_storage("state")
+        self.assert_upgrade_with_symlinked_storage("state")
+
+    def test_full_install_and_upgrade_accept_initial_state_directory_alias(self):
+        self.assert_upgrade_with_symlinked_storage("state", runtime_only=False, state_alias_from_start=True)
+
+    def test_full_upgrade_accepts_relocated_state_directory_alias(self):
+        self.assert_upgrade_with_symlinked_storage("state", runtime_only=False)
 
     def test_shared_runtime_manifest_and_old_release_survive_upgrade(self):
         first = self.install()
