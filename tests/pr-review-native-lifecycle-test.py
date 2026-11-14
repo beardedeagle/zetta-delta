@@ -161,8 +161,12 @@ class NativeLifecycleTests(GIT.GitFixture):
         self.assertEqual(code, 0, response)
         self.assertEqual(self.state()[1]["targets"][self.key]["assignments"][assignment_id]["status"], "done")
 
-    def initialize_run(self) -> dict:
+    def initialize_run(self, extra_project: Path | None = None) -> dict:
         """Prepare seventeen physical slices and their native assignments.
+
+        Args:
+            extra_project (Path | None): Additional target left at intake for CLI
+                preparation after the first target's workers have settled.
 
         Returns:
             dict: Frozen project identity shared by the lifecycle regressions.
@@ -173,7 +177,8 @@ class NativeLifecycleTests(GIT.GitFixture):
         self.head = self.git("rev-parse", "HEAD")
         registry = copy.deepcopy(RECORDS.REGISTRY)
         registry["providers"][0]["limit"] = 2
-        run = workflow.new_run("pr-review", workflow.project_collection([str(self.parent)], [[".delta", "native checkout output"]]),
+        roots = [str(self.parent)] + ([str(extra_project)] if extra_project is not None else [])
+        run = workflow.new_run("pr-review", workflow.project_collection(roots, [[".delta", "native checkout output"]]),
                                registry, RECORDS.MODEL_C, "native-lifecycle", admission_mode="native")
         initial = {"method": run["method"], "intake": run["intake"], "registry": registry,
                    "orchestrator": RECORDS.MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"],
@@ -182,7 +187,7 @@ class NativeLifecycleTests(GIT.GitFixture):
         workflow.write_json(self.directory / "run.json", saved)
         run = workflow.append_record(self.directory, saved, run, None, "native-parent", {
             "root": str(self.parent), "thread_id": run["thread_id"], "source": "terminal-cwd"})
-        self.key = next(iter(run["targets"]))
+        self.key = next(key for key, target in run["targets"].items() if target["repository"] == str(self.parent))
         staged = preparation.prepare(self.directory, run["run_id"], self.key, run["targets"][self.key], self.parent)
         self.append("prepare", staged)
         frozen = preparation.finalize(self.directory, run["run_id"], self.key, staged, None, [], None)
@@ -206,6 +211,184 @@ class NativeLifecycleTests(GIT.GitFixture):
             self.append("assignment", RECORDS.assignment(f"slice-{index:02}", scope=scope, units=assigned,
                                                           interactions=["lifecycle"] if index == 0 else []))
         return frozen
+
+    def test_cli_finalizes_another_target_after_completed_checkout_removal(self):
+        other = self.base / "other-project"
+        other.mkdir()
+        (other / "api.py").write_text("VALUE = 1\n")
+        self.initialize_run(other)
+        child, store, pin = self.launch("slice-00")
+        self.inspect("slice-00")
+        self.receive("slice-00", finding=True)
+        shutil.rmtree(child)
+        shutil.rmtree(store)
+        run = self.check()
+        self.assertEqual(workflow.active_native_roots(run), ())
+        self.assertEqual(len(workflow.runtime_copies(run)), 1)
+        self.assertEqual(self.git("rev-parse", pin), self.head)
+        key = next(key for key in run["targets"] if key != self.key)
+        code, result = self.cli("prepare", "--target", key, "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        run = self.state()[1]
+        code, result = self.cli("finalize", "--target", key, "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        run = self.state()[1]
+        self.assertEqual(run["targets"][key]["phase"], "prepared")
+        self.assertEqual(workflow.integrity_failures(run), ([], []))
+        self.assertEqual(self.git("rev-parse", pin), self.head)
+        code, exported = self.cli("export")
+        self.assertEqual(code, 0, exported)
+        self.assertEqual(len(exported["findings"]), 1)
+
+    def test_cli_finalization_reuses_another_targets_adopted_legacy_parent_policy(self):
+        other = self.base / "legacy-project"
+        other.mkdir()
+        (other / "api.py").write_text("VALUE = 1\n")
+        for source in (self.parent, other):
+            (source / "target").mkdir()
+            (source / "target/output").write_text("disposable build output\n")
+        collection = workflow.project_collection([str(self.parent), str(other)], [["target", "build output"]])
+        run = workflow.new_run("pr-review", collection, RECORDS.REGISTRY, RECORDS.MODEL_C, "legacy-policy")
+        initial = {"method": run["method"], "intake": collection, "registry": RECORDS.REGISTRY,
+                   "orchestrator": RECORDS.MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"],
+                   "runtime": workflow.runtime.identity()}
+        workflow.write_json(self.directory / "run.json", {"version": 1, "initial": initial, "events": []})
+        keys = {target["repository"]: key for key, target in run["targets"].items()}
+        first, second = keys[str(self.parent)], keys[str(other)]
+        capture = preparation.project_baseline
+
+        def unversioned(source, exclude=(), **kwargs):
+            kwargs.pop("exclude_generated", None)
+            kwargs.pop("exclude_indexes", None)
+            return capture(source, exclude, **kwargs)
+
+        with patch.object(preparation, "project_baseline", side_effect=unversioned):
+            code, result = self.cli("prepare", "--target", first, "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        # Discarding excluded output leaves the first legacy parent unchanged;
+        # the second parent's still-present output needs its recorded policy.
+        shutil.rmtree(self.parent / "target")
+        run = self.state()[1]
+        code, result = self.cli("finalize", "--target", first, "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        for command, key, arguments in (("prepare", second, []),
+                                         ("baseline", first, ["--id", "other-parent", "--root", str(other)])):
+            run = self.state()[1]
+            with patch.object(preparation, "project_baseline", side_effect=unversioned):
+                code, result = self.cli(command, "--target", key, "--revision", str(run["revision"]), *arguments)
+            self.assertEqual(code, 0, result)
+        run = self.state()[1]
+        staged = run["targets"][second]["setup"]
+        artifact = Path(staged["source_root"]).parent / "parent-baseline.json"
+        original = artifact.read_bytes()
+        self.assertNotIn("exclusion_policy", json.loads(original))
+        self.assertEqual(run["targets"][first]["baselines"]["other-parent"]["fingerprint"], staged["parent_fingerprint"])
+        code, result = self.cli("adopt-baseline-policy", "--target", first, "--root", str(other),
+                                "--exclude", "target", "--exclude-generated", "--revision", str(run["revision"]),
+                                "--evidence", "owner adopted the exact original build-output exclusion")
+        self.assertEqual(code, 0, result)
+        run = self.state()[1]
+        self.assertEqual(workflow.integrity_failures(run), ([], []))
+        code, result = self.cli("finalize", "--target", second, "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        self.assertEqual(self.state()[1]["targets"][second]["phase"], "prepared")
+        self.assertEqual(artifact.read_bytes(), original)
+        (other / "api.py").write_text("actual parent source change\n")
+        code, result = self.cli("check")
+        self.assertEqual(code, 2, result)
+        self.assertEqual(result["code"], "source_integrity")
+
+    def test_cli_shared_parent_baseline_preserves_reviewed_owners_for_native_start(self):
+        cache = self.parent / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("REVIEWED = True\n")
+        self.commit("explicit reviewed source inside an index-looking path")
+        other = self.base / "other-project"
+        other.mkdir()
+        (other / "api.py").write_text("VALUE = 1\n")
+        inventory, baseline = preparation.project_inventory, preparation.project_baseline
+
+        def legacy_inventory(source, *args, **kwargs):
+            kwargs["exclude_indexes"] = False
+            return inventory(source, *args, **kwargs)
+
+        def legacy_baseline(source, *args, **kwargs):
+            kwargs["exclude_indexes"] = False
+            return baseline(source, *args, **kwargs)
+
+        with (patch.object(preparation, "project_inventory", side_effect=legacy_inventory),
+              patch.object(preparation, "project_baseline", side_effect=legacy_baseline)):
+            frozen = self.initialize_run(other)
+        self.assertIn(".codegraph/source.py", frozen["inventory"])
+        child, _, _ = self.launch("slice-00")
+        run = self.check()
+        self.assertEqual(workflow.active_native_roots(run), (str(child),))
+        key = next(key for key in run["targets"] if key != self.key)
+        for command in ("prepare", "finalize"):
+            run = self.state()[1]
+            code, result = self.cli(command, "--target", key, "--revision", str(run["revision"]))
+            self.assertEqual(code, 0, result)
+        self.assertEqual(self.state()[1]["targets"][key]["phase"], "prepared")
+        run = self.state()[1]
+        code, result = self.cli("baseline", "--target", key, "--id", "shared-parent", "--root", str(self.parent),
+                                "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        run = self.check()
+        parents = workflow.parent_ledgers(self.directory, run)
+        self.assertIn(".codegraph/source.py", parents[str(self.parent)]["files"])
+        baseline_record = run["targets"][key]["baselines"]["shared-parent"]
+        original_baseline = (self.directory / baseline_record["artifact"]).read_bytes()
+        ledger = preparation.read_baseline(self.directory, baseline_record)
+        self.assertIn(".codegraph/source.py", ledger["files"])
+        second_frozen = run["targets"][key]["frozen"]
+        catalog = copy.deepcopy(RECORDS.CATALOG)
+        catalog["units"] = workflow.contract.project_units(second_frozen)
+        for profile in catalog["profiles"].values():
+            profile["identity"] = workflow.model_record({name: profile["identity"][name]
+                                                        for name in ("provider_id", "model_id")}, run["registry"])
+        proposed = RECORDS.plan()
+        proposed.update(cross_project={"required": False, "evidence": "independent second project"},
+                        coverage={unit: {"risk": "code", "families": ["family-a"], "shortfall": None} for unit in catalog["units"]})
+        for operation, data in (("catalog", catalog), ("plan", proposed),
+                                ("assignment", RECORDS.assignment("other-review", scope=second_frozen["inventory"],
+                                                                  units=list(catalog["units"])))):
+            saved, run = self.state()
+            workflow.append_record(self.directory, saved, run, key, operation, data)
+        run = self.state()[1]
+        code, result = self.cli("task", "--target", key, "--assignment", "other-review", "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        second_child, _, _ = self.native_clone("other-review")
+        event = {"target": key, "operation": "started", "data": {
+            **RECORDS.start("other-review"), "runtime_root": str(second_child), "runtime_parent_root": str(self.parent)}}
+        event_path = self.base / "second-start.json"
+        event_path.write_text(json.dumps(event))
+        run = self.state()[1]
+        code, result = self.cli("record", "--event", str(event_path), "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        self.assertEqual(self.state()[1]["targets"][key]["assignments"]["other-review"]["runtime_copy"]["root"], str(second_child))
+        self.inspect("slice-00")
+        self.receive("slice-00")
+        run = self.state()[1]
+        for row in run["targets"][self.key]["assignments"].values():
+            if row["status"] == "queued":
+                self.append("withdraw", {"assignment_id": row["id"], "target": frozen, "cause": "cancelled",
+                                         "evidence": "fixture explicitly cancels remaining unstarted source slices"})
+        run = self.state()[1]
+        code, result = self.cli("cleanup", "--target", self.key, "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        self.assertFalse(Path(frozen["source_root"]).parent.exists())
+        shutil.rmtree(child)
+        run = self.check()
+        self.assertIn(".codegraph/source.py", workflow.parent_reviewed_paths(run)[str(self.parent)])
+        self.assertIn(".codegraph/source.py", workflow.parent_ledgers(self.directory, run)[str(self.parent)]["files"])
+        self.assertEqual((self.directory / baseline_record["artifact"]).read_bytes(), original_baseline)
+        (cache / "source.py").write_text("actual shared parent source change\n")
+        (second_child / "feature.txt").write_text("actual active native source change\n")
+        code, result = self.cli("check")
+        self.assertEqual(code, 2, result)
+        self.assertEqual(result["code"], "source_integrity")
+        self.assertIn("native:" + str(second_child), self.state()[1]["targets"][key]["integrity"][-1]["components"])
+        self.assertIn("copy:" + key + "/shared-parent", self.state()[1]["targets"][key]["integrity"][-1]["components"])
 
     def assert_restored_source_rejected(self, kind: str) -> None:
         """Keep real source incidents blocking after their bytes are restored.

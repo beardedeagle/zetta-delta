@@ -2586,6 +2586,32 @@ def local_assessment_complete(target: dict) -> bool:
                 and all(key in target["adjudications"] for key in target["findings"]))
 
 
+def parent_reviewed_paths(run: dict) -> dict[str, tuple[str, ...]]:
+    """Collect known reviewed paths for roots with authenticated parent ledgers.
+
+    Args:
+        run (dict): Replayed frozen/provisional parents and participating baselines.
+
+    Returns:
+        dict[str, tuple[str, ...]]: Deterministic path unions for each recorded root;
+            retained baselines keep former owners' journaled source paths strict
+            after snapshot cleanup, without changing original evidence.
+    """
+    reviewed: dict[str, set[str]] = {}
+    retained = {record["root"] for target in run["targets"].values()
+                for record in target["baselines"].values() if "artifact" in record}
+    for target in run["targets"].values():
+        frozen = target["frozen"] or target["setup"]
+        paths = tuple((frozen or {}).get("manifest", {}).get("entries", (frozen or {}).get("inventory", ())))
+        if (frozen and "preparation" in frozen
+                and (not target["resources_removed"] or frozen["parent_root"] in retained)):
+            reviewed.setdefault(frozen["parent_root"], set()).update(paths)
+        for record in target["baselines"].values():
+            if "artifact" in record:
+                reviewed.setdefault(record["root"], set()).update(paths)
+    return {root: tuple(sorted(paths)) for root, paths in sorted(reviewed.items())}
+
+
 def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
     """Collect recorded parent evidence without assuming the native project's repo.
 
@@ -2602,10 +2628,9 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
         OSError: A private ledger cannot be read.
     """
     records: dict[str, list[dict]] = {}
-    reviewed: dict[str, set[str]] = {}
+    reviewed = parent_reviewed_paths(run)
     for key, target in run["targets"].items():
         frozen = target["frozen"] or target["setup"]
-        paths = tuple((frozen or {}).get("manifest", {}).get("entries", (frozen or {}).get("inventory", ())))
         if frozen and not target["resources_removed"] and "preparation" in frozen:
             root = frozen["parent_root"]
             resource = preparation.owned(directory, frozen["preparation"]["resource"], run["run_id"], key)
@@ -2616,20 +2641,59 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
             if preparation.fingerprint(ledger) != frozen["parent_fingerprint"]:
                 raise ValueError("parent ledger disagrees with frozen fingerprint")
             records.setdefault(root, []).append(ledger)
-            reviewed.setdefault(root, set()).update(paths)
         for record in target["baselines"].values():
             if "artifact" in record:
                 ledger = preparation.read_baseline(directory, record)
                 records.setdefault(record["root"], []).append(ledger)
-                reviewed.setdefault(record["root"], set()).update(paths)
     parents = {}
     for root, ledgers in records.items():
-        paths = tuple(sorted(reviewed[root]))
+        paths = reviewed[root]
         original = preparation.reviewed_ledger(ledgers[0], paths)
         if any(preparation.reviewed_ledger(ledger, paths) != original for ledger in ledgers[1:]):
             raise ValueError("protected parent records disagree")
         parents[root] = ledgers[0]
     return parents
+
+
+def source_check_policy(run: dict, key: str, *, runtime_copy: dict | None = None,
+                        runtime_copy_target: str | None = None, legacy_policies: dict | None = None) -> dict:
+    """Keep command and preparation checks on the same recorded source policies.
+
+    Args:
+        run (dict): Current replayed source and native-copy evidence.
+        key (str): Owning target with a frozen or provisional comparison.
+        runtime_copy (dict | None): Validated native-start copy awaiting persistence.
+        runtime_copy_target (str | None): Owning target of that pending copy.
+        legacy_policies (dict | None): Explicit migration policies checked before recording.
+
+    Returns:
+        dict: Global participating baselines, retained copies, active roots, owner
+            paths and applicable legacy policies, with explicit overrides retained.
+    """
+    reviewed_paths: dict[str, tuple[str, ...]] = {}
+    parent_paths = parent_reviewed_paths(run)
+    for owner, target in run["targets"].items():
+        frozen = target["frozen"] or target["setup"] or {}
+        paths = tuple(frozen.get("manifest", {}).get("entries", frozen.get("inventory", ())))
+        for name, record in target["baselines"].items():
+            reviewed_paths["baseline:" + owner + "/" + name] = parent_paths.get(record["root"], paths)
+        for row in target["assignments"].values():
+            if "runtime_copy" in row:
+                reviewed_paths["native:" + row["runtime_copy"]["root"]] = paths
+        if runtime_copy is not None and owner == runtime_copy_target:
+            reviewed_paths["native:" + runtime_copy["root"]] = paths
+    baselines = {owner + "/" + name: record for owner, target in run["targets"].items()
+                 for name, record in target["baselines"].items()}
+    policies = {root: policy for target in run["targets"].values()
+                for root, policy in target.get("baseline_policies", {}).items()}
+    policies.update(legacy_policies or {})
+    target = run["targets"][key]
+    comparison = target["frozen"] or target["setup"]
+    return {"baselines": baselines, "native_copies": runtime_copies(run, runtime_copy),
+            "active_native_roots": active_native_roots(run, runtime_copy), "reviewed_paths": reviewed_paths,
+            "legacy_policies": {root: policy for root, policy in policies.items()
+                                if root == comparison["parent_root"]
+                                or any(row.get("filesystem") and row["root"] == root for row in baselines.values())}}
 
 
 def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
@@ -2657,36 +2721,17 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
         OSError: Journal persistence failed.
     """
     observations: dict = {}
-    reviewed_paths: dict[str, tuple[str, ...]] = {}
-    for key, target in run["targets"].items():
-        frozen = target["frozen"] or target["setup"] or {}
-        paths = tuple(frozen.get("manifest", {}).get("entries", frozen.get("inventory", ())))
-        for name in target["baselines"]:
-            reviewed_paths["baseline:" + key + "/" + name] = paths
-        for row in target["assignments"].values():
-            if "runtime_copy" in row:
-                reviewed_paths["native:" + row["runtime_copy"]["root"]] = paths
-        if runtime_copy is not None and key == runtime_copy_target:
-            reviewed_paths["native:" + runtime_copy["root"]] = paths
-    baselines = {key + "/" + name: record for key, target in run["targets"].items()
-                 for name, record in target["baselines"].items()}
-    policies = {root: policy for target in run["targets"].values()
-                for root, policy in target.get("baseline_policies", {}).items()}
-    policies.update(legacy_policies or {})
     for key, target in list(run["targets"].items()):
         comparison = target["frozen"] or target["setup"]
         if comparison is None or target["resources_removed"]:
             continue
         if "preparation" not in comparison:
             raise NeedsDecision("prepare_source", "recorded freeze evidence lacks owned preparation resources; create and prepare a new run")
-        observation = preparation.check(directory, run["run_id"], key, comparison, baselines,
+        observation = preparation.check(directory, run["run_id"], key, comparison,
                                         setup=target["index_setup"] if target["frozen"] is None else None,
-                                        observations=observations, native_copies=runtime_copies(run, runtime_copy),
-                                        active_native_roots=active_native_roots(run, runtime_copy),
-                                        reviewed_paths=reviewed_paths,
-                                        legacy_policies={root: policy for root, policy in policies.items()
-                                                         if root == comparison["parent_root"]
-                                                         or any(row.get("filesystem") and row["root"] == root for row in baselines.values())})
+                                        observations=observations,
+                                        **source_check_policy(run, key, runtime_copy=runtime_copy,
+                                                              runtime_copy_target=runtime_copy_target, legacy_policies=legacy_policies))
         if (record_unchanged or observation["status"] != "unchanged" or
                 observation.get("cache_changes") and target["integrity"][-1:] != [observation]):
             run = append_record(directory, saved, run, key, "integrity", observation)
@@ -3185,7 +3230,7 @@ def main() -> int:
                         request = target["index_setup"]
                         if request is None:
                             request = preparation.setup_request(directory, run["run_id"], key, target["setup"], args.tools,
-                                                                baselines=target["baselines"], native_copies=runtime_copies(run))
+                                                                **source_check_policy(run, key))
                             run = append_record(directory, saved, run, key, "index-setup", request)
                         elif args.tools != request["tools"]:
                             raise ValueError("setup retry must retain its recorded tools and intent")
@@ -3198,7 +3243,7 @@ def main() -> int:
                         try:
                             frozen = preparation.finalize(directory, run["run_id"], key, target["setup"],
                                                           target["index_setup"], args.static_fallback, args.evidence,
-                                                          baselines=target["baselines"], native_copies=runtime_copies(run))
+                                                          **source_check_policy(run, key))
                         except NeedsDecision as error:
                             if error.observation is not None:
                                 append_record(directory, saved, run, key, "integrity", error.observation)
@@ -3212,11 +3257,13 @@ def main() -> int:
                         cache_recovery = ("project" in target and str(root) == target["frozen"]["parent_root"]
                                           and any(row["path"] in (".codegraph", ".codegraph/codegraph.db-shm")
                                                   for row in target["project"]["exclusions"]))
+                        reviewed = set(target["frozen"].get("manifest", {}).get("entries", target["frozen"].get("inventory", ())))
+                        reviewed.update(parent_reviewed_paths(run).get(str(root), ()))
                         data = preparation.capture_baseline(directory, args.id, root, runtime_copies(run),
                                                             filesystem="project" in target, cache_recovery=cache_recovery,
                                                             exclude=tuple(row["path"] for row in target.get("project", {}).get("exclusions", [])),
                                                             exclude_generated="project" in target,
-                                                            reviewed=tuple(target["frozen"].get("manifest", {}).get("entries", target["frozen"].get("inventory", ()))))
+                                                            reviewed=tuple(sorted(reviewed)))
                         run = append_record(directory, saved, run, key, "baseline", data)
                     elif args.command == "test-copy":
                         if target["frozen"] is None or target["resources_removed"]:

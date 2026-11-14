@@ -185,6 +185,75 @@ class PreparationTests(GitFixture):
             preparation.finalize(self.directory, "run-fixture", "later", staged, None, [], None,
                                  baselines=baselines, native_copies=copies)
 
+    def test_setup_and_finalize_skip_settled_copies_but_keep_durable_refs_and_live_source_strict(self):
+        first = self.prepare()
+        completed, store, pin = self.native_clone("completed")
+        first_proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", first, completed, ())
+        active, _, _ = self.native_clone("active")
+        second_proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", first, active, (first_proof,))
+        copies = (first_proof, second_proof)
+        staged = preparation.prepare(self.directory, "run-fixture", "later", self.local, self.parent, copies)
+        shutil.rmtree(completed)
+        shutil.rmtree(store)
+        self.indexes(("tgrep",))
+        options: dict = {"native_copies": copies, "active_native_roots": (str(active),)}
+        with self.assertRaises(preparation.NeedsDecision):
+            preparation.setup_request(self.directory, "run-fixture", "later", staged, ["tgrep"], native_copies=copies)
+        with self.assertRaises(preparation.NeedsDecision):
+            preparation.finalize(self.directory, "run-fixture", "later", staged, None, [], None, native_copies=copies)
+        self.assertEqual(preparation.setup_request(self.directory, "run-fixture", "later", staged,
+                                                   ["tgrep"], **options)["tools"], ["tgrep"])
+        final = preparation.finalize(self.directory, "run-fixture", "later", staged, None, [], None, **options)
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "later", final, {}, **options)["status"], "unchanged")
+        self.git("update-ref", "-d", pin)
+        with self.assertRaises(preparation.NeedsDecision) as caught:
+            preparation.finalize(self.directory, "run-fixture", "later", staged, None, [], None, **options)
+        assert caught.exception.observation is not None
+        self.assertIn("parent", caught.exception.observation["components"])
+        self.git("update-ref", pin, self.head)
+        for path, component in ((active / "feature.txt", "native:" + str(active)),
+                                (Path(staged["source_root"]) / "feature.txt", "source")):
+            with self.subTest(component=component):
+                original = path.read_bytes()
+                path.write_text("actual source edit\n")
+                with self.assertRaises(preparation.NeedsDecision):
+                    preparation.setup_request(self.directory, "run-fixture", "later", staged, ["tgrep"], **options)
+                with self.assertRaises(preparation.NeedsDecision) as caught:
+                    preparation.finalize(self.directory, "run-fixture", "later", staged, None, [], None, **options)
+                assert caught.exception.observation is not None
+                self.assertIn(component, caught.exception.observation["components"])
+                path.write_bytes(original)
+
+    def test_setup_and_finalize_keep_the_active_native_owners_reviewed_paths(self):
+        old_head = self.head
+        (self.parent / ".codegraph").mkdir()
+        (self.parent / ".codegraph/source.py").write_text("reviewed source\n")
+        self.commit("reviewed source in an index-looking directory")
+        self.head = self.git("rev-parse", "HEAD")
+        first = self.prepare()
+        child, _, _ = self.native_clone()
+        proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", first, child, ())
+        other = self.base / "other-parent"
+        self.git("clone", "-q", str(self.parent), str(other))
+        self.git("checkout", "-q", "--detach", old_head, root=other)
+        target = copy.deepcopy(self.local)
+        target["repository"] = str(other)
+        target["comparison"].update(left="HEAD", right="HEAD")
+        staged = preparation.prepare(self.directory, "run-fixture", "later", target, other, (proof,))
+        self.assertEqual(staged["inventory"], [])
+        self.indexes(("tgrep",))
+        options: dict = {"native_copies": (proof,), "active_native_roots": (str(child),),
+                         "reviewed_paths": {"native:" + str(child): tuple(first["inventory"])}}
+        preparation.setup_request(self.directory, "run-fixture", "later", staged, ["tgrep"], **options)
+        preparation.finalize(self.directory, "run-fixture", "later", staged, None, [], None, **options)
+        (child / ".codegraph/source.py").write_text("changed reviewed source\n")
+        with self.assertRaises(preparation.NeedsDecision):
+            preparation.setup_request(self.directory, "run-fixture", "later", staged, ["tgrep"], **options)
+        with self.assertRaises(preparation.NeedsDecision) as caught:
+            preparation.finalize(self.directory, "run-fixture", "later", staged, None, [], None, **options)
+        assert caught.exception.observation is not None
+        self.assertIn("native:" + str(child), caught.exception.observation["components"])
+
     def test_external_native_copy_requires_registered_store_and_worktree_binding(self):
         frozen = self.prepare()
         unrelated = self.base / "unrelated"

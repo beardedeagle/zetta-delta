@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -35,6 +36,98 @@ class RuntimeTests(unittest.TestCase):
 
     def install(self, **kwargs):
         return runtime.install(self.destination, self.backup, sources={p.name: p for p in self.source.iterdir()}, **kwargs)
+
+    def pending_helper_upgrade(self, *, legacy: bool = False) -> tuple:
+        """Retain an offline setup record while replacing its installed release.
+
+        Args:
+            legacy (bool): Exercise the first scripts-directory conversion.
+
+        Returns:
+            tuple: Git fixture, new preparation module, staged source and old setup.
+        """
+        with patch.object(sys, "path", [str(ROOT / "review/scripts"), *sys.path]):
+            specification = importlib.util.spec_from_file_location("helper_git_fixtures", ROOT / "tests/pr-review-preparation-test.py")
+            assert specification is not None and specification.loader is not None
+            fixtures = importlib.util.module_from_spec(specification)
+            specification.loader.exec_module(fixtures)
+        fixture = fixtures.GitFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.enterContext(patch.object(Path, "home", return_value=self.base / "isolated-home"))
+        self.enterContext(patch.object(shutil, "which", return_value=None))
+
+        def load(release):
+            specification = importlib.util.spec_from_file_location("installed_preparation", release / "preparation.py")
+            assert specification is not None and specification.loader is not None
+            module = importlib.util.module_from_spec(specification)
+            specification.loader.exec_module(module)
+            return module
+
+        if legacy:
+            old = self.destination / "scripts"
+            shutil.copytree(self.source, old)
+        else:
+            old = Path(self.install()["release"])
+        before = load(old)
+        staged = before.prepare(fixture.directory, "run-fixture", "local", fixture.local, fixture.parent)
+        request = before.setup_request(fixture.directory, "run-fixture", "local", staged, ["tgrep"])
+        if not legacy:
+            source = self.source / "workflow.py"
+            source.write_bytes(source.read_bytes() + b"\n# next repository release\n")
+        installed = self.install(force=True)
+        return fixture, load(Path(installed["release"])), staged, request
+
+    def assert_helper_upgrade_lifecycle(self, *, legacy: bool = False) -> None:
+        """Verify exact helper pins survive setup, sealing and owned cleanup.
+
+        Args:
+            legacy (bool): Exercise the first scripts-directory conversion.
+        """
+        fixture, preparation, staged, request = self.pending_helper_upgrade(legacy=legacy)
+        original_request = json.dumps(request, sort_keys=True)
+        resource = fixture.directory / staged["preparation"]["resource"]
+        originals = {name: (resource / name).read_bytes() for name in staged["preparation"]["artifacts"]}
+        preparation.run_setup(staged, request)
+        frozen = preparation.finalize(fixture.directory, "run-fixture", "local", staged, request, ["tgrep"],
+                                       "Offline fixture uses static evidence for the unavailable index.")
+        self.assertEqual(preparation.check(fixture.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
+        self.assertTrue(all((resource / name).read_bytes() == content for name, content in originals.items()))
+        self.assertEqual(json.dumps(request, sort_keys=True), original_request)
+        self.assertEqual(preparation.cleanup(fixture.directory, "run-fixture", "local", request, resource.name), [resource.name])
+        self.assertFalse(resource.exists())
+
+    def test_pending_setup_keeps_its_authenticated_helper_across_release_upgrade(self):
+        self.assert_helper_upgrade_lifecycle()
+
+    def test_pending_setup_keeps_its_trusted_helper_alias_after_legacy_conversion(self):
+        self.assert_helper_upgrade_lifecycle(legacy=True)
+
+    def test_pending_setup_rejects_untrusted_missing_and_changed_helper_pins(self):
+        fixture, preparation, staged, request = self.pending_helper_upgrade()
+        source = Path(staged["source_root"])
+        helper = Path(request["helper"])
+        arbitrary = self.base / "arbitrary-helper.py"
+        shutil.copy2(helper, arbitrary)
+        elsewhere = runtime.install(self.base / "other-installation", self.base / "other-backup",
+                                    sources={path.name: path for path in self.source.iterdir()})
+        for path in (arbitrary, Path(elsewhere["release"]) / helper.name):
+            with (self.subTest(path=path), self.assertRaises(preparation.NeedsDecision),
+                  preparation.idle_indexes(source, dict(request, helper=str(path)))):
+                pass
+        original = helper.read_bytes()
+        for missing in (False, True):
+            try:
+                if missing:
+                    helper.unlink()
+                else:
+                    helper.write_bytes(original + b"\n# changed retained helper\n")
+                with (self.subTest(missing=missing), self.assertRaises(preparation.NeedsDecision),
+                      preparation.idle_indexes(source, request)):
+                    pass
+            finally:
+                helper.write_bytes(original)
+        self.assertTrue((fixture.directory / staged["preparation"]["resource"]).is_dir())
 
     def legacy_scripts(self) -> Path:
         """Create legacy content with metadata and links that a backup must retain.

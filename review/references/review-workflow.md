@@ -318,7 +318,10 @@ New native-copy proofs record the same index exclusion. Legacy native proofs
 containing only a fingerprint retain their original scan policy because no
 authenticated file ledger exists to separate source from cache bytes. Completed
 workers still retain their Git-reference checks without scanning their temporary
-checkout or clone store.
+checkout or clone store. Later setup and finalization use the same recorded
+exclusion and owner policies, so retired checkout paths do not become required again.
+An artifact-backed shared baseline continues to protect its original owners'
+reviewed source paths after their prepared resources are removed.
 
 `source-search` journals a pending execution before running, retains full stdout
 and stderr with hashes, and returns previews of at most 8192 bytes each. Exit zero

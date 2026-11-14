@@ -16,6 +16,7 @@ from types import ModuleType
 from urllib.parse import urlsplit
 
 import intake
+import runtime
 
 INDEX_TOOLS = ("tgrep", "codegraph", "zg")
 DIFF_OPTIONS = ("--no-ext-diff", "--no-textconv", "--no-color", "--find-renames=50%", "-l1000",
@@ -1797,12 +1798,11 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                 **({"bookkeeping": bookkeeping} if bookkeeping else {})}
 
 
-def index_helper(*, bundled: bool = False) -> tuple[ModuleType, Path]:
-    """Load the existing trusted maintainer, never code from the reviewed repository.
+def load_index_helper(path: Path) -> tuple[ModuleType, Path]:
+    """Load a trusted helper selected or authenticated by the caller.
 
     Args:
-        bundled (bool): Use the shipped API for static preparation without requiring
-            a compatible machine installation.
+        path (Path): Canonical trusted maintainer file.
 
     Returns:
         tuple[ModuleType, Path]: Loaded maintainer and its canonical script path.
@@ -1811,14 +1811,6 @@ def index_helper(*, bundled: bool = False) -> tuple[ModuleType, Path]:
         NeedsDecision: The selected trusted maintainer has no compatible lifecycle
             and durable sealing API.
     """
-    installed = Path.home() / ".local/share/zetta-delta/ensure-context-indexes.py"
-    shipped = Path(__file__).with_name("ensure-context-indexes.py")
-    if not shipped.is_file():
-        shipped = Path(__file__).resolve().parents[2] / "stack/context-indexes/ensure-context-indexes.py"
-    path = installed if not bundled and installed.is_file() else shipped
-    if not path.is_file():
-        raise NeedsDecision("index_maintainer", "the trusted index maintainer API is unavailable; repair the project bundle separately")
-    path = path.resolve()
     spec = importlib.util.spec_from_file_location("review_index_maintainer", path)
     if spec is None or spec.loader is None:
         raise NeedsDecision("index_maintainer", "the trusted index maintainer cannot be loaded")
@@ -1831,8 +1823,73 @@ def index_helper(*, bundled: bool = False) -> tuple[ModuleType, Path]:
     return module, path
 
 
+def index_helper(*, bundled: bool = False) -> tuple[ModuleType, Path]:
+    """Load the current trusted maintainer, never code from the reviewed repository.
+
+    Args:
+        bundled (bool): Use the shipped API for static preparation.
+
+    Returns:
+        tuple[ModuleType, Path]: Loaded maintainer and its canonical script path.
+
+    Raises:
+        NeedsDecision: The trusted maintainer is unavailable or incompatible.
+    """
+    installed = Path.home() / ".local/share/zetta-delta/ensure-context-indexes.py"
+    shipped = Path(__file__).with_name("ensure-context-indexes.py")
+    if not shipped.is_file():
+        shipped = Path(__file__).resolve().parents[2] / "stack/context-indexes/ensure-context-indexes.py"
+    path = installed if not bundled and installed.is_file() else shipped
+    if not path.is_file():
+        raise NeedsDecision("index_maintainer", "the trusted index maintainer API is unavailable; repair the project bundle separately")
+    return load_index_helper(path.resolve())
+
+
+def recorded_index_helper(request: dict) -> tuple[ModuleType, Path]:
+    """Retain an exact helper pin across owned releases of the same installation.
+
+    Args:
+        request (dict): Original setup intent with its helper path and content hash.
+
+    Returns:
+        tuple[ModuleType, Path]: Authenticated maintainer and its canonical file.
+
+    Raises:
+        NeedsDecision: The pin is changed, unavailable, untrusted or incompatible.
+    """
+    recorded = Path(request["helper"])
+    scripts = Path(__file__).resolve().parent
+    releases = scripts.parent.parent
+    managed = scripts.name == "scripts" and releases.name == "releases"
+    if (managed and recorded.name == "ensure-context-indexes.py" and recorded.parent.name == "scripts"
+            and recorded.parent.parent.parent == releases):
+        try:
+            if not recorded.is_absolute() or recorded.resolve() != recorded:
+                raise ValueError("redirected retained helper")
+            for directory in (releases, recorded.parent.parent, recorded.parent):
+                runtime.owned_directory(directory)
+            runtime.read_installation_manifest(recorded.parent, runtime.code_identity(recorded.parent))
+            if runtime.file_hash(recorded) != request["helper_fingerprint"]:
+                raise ValueError("retained helper changed")
+        except (OSError, ValueError, RuntimeError) as error:
+            raise NeedsDecision("index_maintainer", "recorded index maintainer changed; preserve the snapshot") from error
+        return load_index_helper(recorded)
+    module, current = index_helper()
+    legacy = managed and recorded == releases.parent / "scripts/ensure-context-indexes.py"
+    try:
+        matches = recorded == current or legacy and recorded.resolve() == current
+    except (OSError, RuntimeError):
+        matches = False
+    if not matches or digest(current) != request["helper_fingerprint"]:
+        raise NeedsDecision("index_maintainer", "recorded index maintainer changed; preserve the snapshot")
+    return module, current
+
+
 def setup_request(directory: Path, run_id: str, key: str, staged: dict, tools: list[str], *,
-                  baselines: dict | None = None, native_copies: tuple[dict, ...] = ()) -> dict:
+                  baselines: dict | None = None, native_copies: tuple[dict, ...] = (),
+                  active_native_roots: tuple[str, ...] | None = None,
+                  reviewed_paths: dict[str, tuple[str, ...]] | None = None,
+                  legacy_policies: dict[str, dict] | None = None) -> dict:
     """Bind setup to the existing maintainer and caches before any job can start.
 
     Args:
@@ -1844,6 +1901,12 @@ def setup_request(directory: Path, run_id: str, key: str, staged: dict, tools: l
         baselines (dict | None): Recorded protected parent/participating-copy evidence.
         native_copies (tuple[dict, ...]): Registered native administrative changes;
             never applied to the frozen source.
+        active_native_roots (tuple[str, ...] | None): Copies still requiring filesystem
+            checks; None checks every copy while retaining all registered references.
+        reviewed_paths (dict[str, tuple[str, ...]] | None): Explicit source paths
+            keyed by baseline:<name> or native:<root> for each evidence owner.
+        legacy_policies (dict[str, dict] | None): Recorded protection policies
+            bound to original project ledgers and keyed by their roots.
 
     Returns:
         dict: Immutable setup intent, including actual executable availability.
@@ -1852,7 +1915,9 @@ def setup_request(directory: Path, run_id: str, key: str, staged: dict, tools: l
         ValueError: Tools or cache paths conflict with frozen source content.
         NeedsDecision: Source integrity or maintainer availability is unresolved.
     """
-    if check(directory, run_id, key, staged, baselines or {}, native_copies=native_copies)["status"] != "unchanged":
+    if check(directory, run_id, key, staged, baselines or {}, native_copies=native_copies,
+             active_native_roots=active_native_roots, reviewed_paths=reviewed_paths,
+             legacy_policies=legacy_policies)["status"] != "unchanged":
         raise NeedsDecision("source_integrity", "source changed before index setup; preserve evidence and create a new run")
     module, path = index_helper()
     resource = owned(directory, staged["preparation"]["resource"], run_id, key)
@@ -1877,9 +1942,7 @@ def run_setup(staged: dict, request: dict) -> None:
     Raises:
         NeedsDecision: The maintainer changed or its foreground setup failed.
     """
-    module, path = index_helper()
-    if str(path) != request["helper"] or digest(path) != request["helper_fingerprint"]:
-        raise NeedsDecision("index_maintainer", "index maintainer changed since setup intent; preserve the resource")
+    module, _ = recorded_index_helper(request)
     try:
         module.setup_indexes(Path(staged["source_root"]), request["available"])
     except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
@@ -1902,9 +1965,7 @@ def idle_indexes(source: Path, request: dict | None) -> Generator[ModuleType]:
         ValueError: A lifecycle file was redirected or corrupted.
         OSError: Lifecycle evidence is unreadable.
     """
-    module, path = index_helper(bundled=request is None)
-    if request and (str(path) != request["helper"] or digest(path) != request["helper_fingerprint"]):
-        raise NeedsDecision("index_maintainer", "index lifecycle owner changed; preserve the snapshot")
+    module, _ = recorded_index_helper(request) if request else index_helper(bundled=True)
     try:
         with module.idle_indexes(source, request["available"] if request else []):
             yield module
@@ -1918,7 +1979,9 @@ def idle_indexes(source: Path, request: dict | None) -> Generator[ModuleType]:
 
 def finalize(directory: Path, run_id: str, key: str, staged: dict, request: dict | None,
              fallback: list[str], evidence: str | None, *, baselines: dict | None = None,
-             native_copies: tuple[dict, ...] = ()) -> dict:
+             native_copies: tuple[dict, ...] = (), active_native_roots: tuple[str, ...] | None = None,
+             reviewed_paths: dict[str, tuple[str, ...]] | None = None,
+             legacy_policies: dict[str, dict] | None = None) -> dict:
     """Seal setup under lifecycle locks and bind the automatic-maintenance hold.
 
     Args:
@@ -1932,6 +1995,12 @@ def finalize(directory: Path, run_id: str, key: str, staged: dict, request: dict
         baselines (dict | None): Protected parent/participating-copy evidence.
         native_copies (tuple[dict, ...]): Registered native bookkeeping; source
             baselines always retain their full content and Git state.
+        active_native_roots (tuple[str, ...] | None): Copies still requiring filesystem
+            checks; None checks every copy while retaining all registered references.
+        reviewed_paths (dict[str, tuple[str, ...]] | None): Explicit source paths
+            keyed by baseline:<name> or native:<root> for each evidence owner.
+        legacy_policies (dict[str, dict] | None): Recorded protection policies
+            bound to original project ledgers and keyed by their roots.
 
     Returns:
         dict: Final frozen target, retaining original and final baseline artifacts.
@@ -1944,7 +2013,9 @@ def finalize(directory: Path, run_id: str, key: str, staged: dict, request: dict
     resource = owned(directory, staged["preparation"]["resource"], run_id, key)
     source = resource / "source"
     with idle_indexes(source, request) as module:
-        observation = check(directory, run_id, key, staged, baselines or {}, setup=request, native_copies=native_copies)
+        observation = check(directory, run_id, key, staged, baselines or {}, setup=request, native_copies=native_copies,
+                            active_native_roots=active_native_roots, reviewed_paths=reviewed_paths,
+                            legacy_policies=legacy_policies)
         if observation["status"] != "unchanged":
             raise NeedsDecision("source_integrity", "source/parent/artifacts changed during setup; preserve evidence and create a new run", observation)
         unavailable = []
@@ -1962,7 +2033,9 @@ def finalize(directory: Path, run_id: str, key: str, staged: dict, request: dict
         reviewed = tuple(staged.get("manifest", {}).get("entries", staged.get("inventory", ())))
         current = (project_baseline(source, exclude_indexes=True, reviewed=reviewed)
                    if staged["mode"] == "project" else baseline(source, exclude_indexes=True, reviewed=reviewed))
-        observation = check(directory, run_id, key, staged, baselines or {}, setup=request, native_copies=native_copies)
+        observation = check(directory, run_id, key, staged, baselines or {}, setup=request, native_copies=native_copies,
+                            active_native_roots=active_native_roots, reviewed_paths=reviewed_paths,
+                            legacy_policies=legacy_policies)
         original = json.loads((resource / "source-baseline.json").read_text())
         source_changed = setup_comparison(current, original, reviewed, request) != reviewed_ledger(original, reviewed)
         if source_changed:

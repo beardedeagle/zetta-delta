@@ -283,8 +283,10 @@ revision when available. The content fingerprint identifies the actual bytes,
 including uncommitted changes; a source revision alone is not proof of the
 installed code. Bundled identity and index helper bytes are checked against the
 installation receipt; their evidence remains separate from the aggregate module
-fingerprint. New runs record the runtime identity, and changing the runtime of an
-existing run requires an explicit adoption record. Existing findings stay
+fingerprint. Pending setups retain their original helper path and hash across
+upgrades, using the authenticated helper in the retained release or a byte-identical
+trusted legacy alias. New runs record the runtime identity. Changing the runtime of
+an existing run requires an explicit adoption record. Existing findings stay
 readable across runtime changes. Do not repair installed modules in place; change
 the repository, run its checks and install another complete release.
 
