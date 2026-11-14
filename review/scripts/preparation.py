@@ -227,6 +227,19 @@ def protection_exclusions(exclude: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(sorted(set(exclude)))
 
 
+def reviewed_path(path: str, reviewed: tuple[str, ...]) -> bool:
+    """Retain an explicit reviewed entry and its ancestor containers.
+
+    Args:
+        path (str): Relative inventory path.
+        reviewed (tuple[str, ...]): Explicit manifest/inventory source paths.
+
+    Returns:
+        bool: Whether automatic pruning would hide reviewed source or metadata.
+    """
+    return path in reviewed or any(name.startswith(path + "/") for name in reviewed)
+
+
 def disposable_index(path: str, directory: bool, reviewed: tuple[str, ...] = ()) -> bool:
     """Recognize index content while preserving paths in sealed review evidence.
 
@@ -240,7 +253,7 @@ def disposable_index(path: str, directory: bool, reviewed: tuple[str, ...] = ())
     """
     parts = path.split("/")
     inside = any(part in INDEX_DIRECTORIES for part in parts[:-1]) or directory and parts[-1] in INDEX_DIRECTORIES
-    return inside and path not in reviewed and not any(name.startswith(path + "/") for name in reviewed)
+    return inside and not reviewed_path(path, reviewed)
 
 
 def reviewed_ledger(ledger: dict, reviewed: tuple[str, ...]) -> dict:
@@ -289,7 +302,8 @@ def files(root: Path, exclude: tuple[str, ...] = (), *, nested_git: list[Path] |
         exclude_generated (bool): Prune generated directories under policy 1;
             false preserves existing full-content ledger semantics.
         exclude_indexes (bool): Prune disposable index content before hashing.
-        reviewed (tuple[str, ...]): Explicit source paths never hidden by index pruning.
+        reviewed (tuple[str, ...]): Explicit source paths and ancestors never
+            hidden by automatic index/generated-output pruning.
 
     Returns:
         dict: Sorted paths bound to kind, permissions and content digest/link target.
@@ -308,14 +322,15 @@ def files(root: Path, exclude: tuple[str, ...] = (), *, nested_git: list[Path] |
                 if nested_git is not None and path.parent != root:
                     nested_git.append(path.parent)
                 continue
-            if str(path.relative_to(root)) in exclude:
+            key = str(path.relative_to(root))
+            if key in exclude:
                 continue
             info = path.lstat()
-            if exclude_indexes and disposable_index(str(path.relative_to(root)), stat.S_ISDIR(info.st_mode), reviewed):
+            if exclude_indexes and disposable_index(key, stat.S_ISDIR(info.st_mode), reviewed):
                 continue
-            if exclude_generated and stat.S_ISDIR(info.st_mode) and generated_directory(path):
+            if (exclude_generated and stat.S_ISDIR(info.st_mode) and not reviewed_path(key, reviewed)
+                    and generated_directory(path)):
                 continue
-            key = str(path.relative_to(root))
             mode = stat.S_IMODE(info.st_mode)
             if stat.S_ISLNK(info.st_mode):
                 result[key] = ["link", mode, os.readlink(path)]
@@ -394,7 +409,8 @@ def project_inventory(root: Path, exclusions: dict[str, str] | None = None,
                          if relative == path or relative.startswith(path + "/")), None)
         if explicit is not None:
             return explicit
-        return GENERATED_REASON if exclude_generated and directory and generated_directory(root / relative) else None
+        return (GENERATED_REASON if exclude_generated and directory and not reviewed_path(relative, reviewed)
+                and generated_directory(root / relative) else None)
 
     def fail(error: OSError) -> None:
         raise error
@@ -1567,6 +1583,7 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
     """
     problems = []
     cache_changes = []
+    bookkeeping = {}
     scans = observations if observations is not None else {}
     reviewed = tuple(frozen.get("manifest", {}).get("entries", frozen.get("inventory", ())))
     def observe(root: str, exclude: tuple[str, ...] = (), *, native: bool = True, project: bool = False,
@@ -1635,8 +1652,32 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             current = {name: value for name, value in current.items() if name != "exclusion_policy"}
         if expected is not None:
             current = reviewed_ledger(current, strict_paths)
-            if current == reviewed_ledger(expected, strict_paths):
+            original = reviewed_ledger(expected, strict_paths)
+            if current == original:
                 return fingerprint(expected)
+            # Retain evidence from this incident, before a later clean scan can
+            # hide a real source edit. Only exact ref differences are recoverable.
+            metadata = current.get("git", {})
+            original_metadata = original.get("git", {})
+            if (native and expected is not None and "refs" in metadata and "refs" in original_metadata
+                    and "native_ref_failures" not in metadata
+                    and dict(current, git=dict(metadata, refs=original_metadata["refs"])) == original):
+                try:
+                    shared = common_dir(Path(root))
+                    pins = {os.fsencode(row["ref"]): os.fsencode(row["head"]) for row in copies
+                            if row["ref"] and row["common_dir"] == shared}
+                    pins.update({os.fsencode(row["clone_store"]["ref"]): os.fsencode(row["head"])
+                                 for row in copies if "clone_store" in row and row["clone_store"]["ref_store"] == shared})
+                    refs = b"".join(line for line in git(Path(root), "for-each-ref", "--format=%(refname)%00%(objectname)").splitlines(keepends=True)
+                                    if pins.get(line.partition(b"\0")[0]) != line.partition(b"\0")[2].rstrip(b"\n"))
+                    if hashlib.sha256(refs).hexdigest() == metadata["refs"]:
+                        bookkeeping[component] = {"kind": "git-refs", "root": root, "common_dir": shared,
+                                                   "baseline_fingerprint": fingerprint(expected),
+                                                   "baseline_refs_sha256": original_metadata["refs"],
+                                                   "refs_hex": refs.hex(), "refs_sha256": metadata["refs"],
+                                                   "native_copies_sha256": sorted(fingerprint(row) for row in copies)}
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass  # A raced or unreadable ref scan cannot attest bookkeeping.
         return fingerprint(current)
 
     component = "unreadable or unowned preparation evidence"
@@ -1706,9 +1747,20 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                 if scans[store_key] != record["clone_store"]["fingerprint"]:
                     problems.append(component)
         return {"status": "changed" if problems else "unchanged", "components": problems,
-                **({"cache_changes": cache_changes} if cache_changes else {})}
+                **({"cache_changes": cache_changes} if cache_changes else {}),
+                **({"bookkeeping": bookkeeping} if bookkeeping else {})}
     except (OSError, ValueError, KeyError, TypeError):
-        return {"status": "unknown", "components": list(dict.fromkeys(problems + [component]))}
+        for record in native_copies:
+            if component == "native:" + record["root"]:
+                try:
+                    Path(record["root"]).lstat()
+                except FileNotFoundError:
+                    bookkeeping[component] = {"kind": "missing-native-root", "root": record["root"],
+                                               "copy_sha256": fingerprint(record)}
+                except OSError:
+                    pass
+        return {"status": "unknown", "components": list(dict.fromkeys(problems + [component])),
+                **({"bookkeeping": bookkeeping} if bookkeeping else {})}
 
 
 def index_helper(*, bundled: bool = False) -> tuple[ModuleType, Path]:
@@ -1929,9 +1981,8 @@ def test_copy(directory: Path, run_id: str, key: str, frozen: dict) -> Path:
     try:
         if frozen["mode"] == "project":
             path.mkdir(mode=0o700)
-            setup = json.loads((resource / "index-result.json").read_text())["request"]
-            caches = dict.fromkeys((setup or {}).get("cache_paths", []), "owned index cache")
-            copied = project_inventory(resource / "source", caches, path)
+            copied = project_inventory(resource / "source", destination=path, exclude_indexes=True,
+                                       reviewed=tuple(frozen["manifest"]["entries"]))
             if copied["entries"] != frozen["manifest"]["entries"] or copied["gaps"]:
                 raise ValueError("project test copy differs from the frozen manifest")
             return path

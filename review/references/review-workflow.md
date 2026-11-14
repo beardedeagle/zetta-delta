@@ -1224,6 +1224,14 @@ match succeeds. Modern policy ledgers cannot use this migration. Original
 artifacts remain intact. Then resolve each bookkeeping incident separately with
 `resolve-integrity`; policy adoption alone never clears a historical incident.
 
+New integrity resolutions require evidence retained by the original check.
+Parent/copy reference incidents need matching source and other Git metadata,
+plus the original observed refs normalized against exact registered settled pins.
+A later clean scan or restored file cannot establish the original cause;
+ambiguous legacy incidents remain unresolved. Completed-checkout cleanup requires
+an original missing-root observation. Earlier accepted resolution records remain
+readable as historical evidence.
+
 New runs can record an explicit owner concurrency limit with `create
 --family-limit N`. Provider account limits still come from the identity registry;
 unissued queued work occupies neither provider nor family execution slots.

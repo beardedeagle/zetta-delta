@@ -143,11 +143,23 @@ class ProjectTests(unittest.TestCase):
 
     def test_index_reason_does_not_hide_explicit_source_omissions(self):
         (self.source / ".codegraph").write_text("ordinary source file\n")
-        for path in ("api.py", ".codegraph"):
-            with self.subTest(path=path):
-                run = self.prepared(exclusions=[[path, preparation.INDEX_REASON]])
+        for path, reason in ((path, reason) for path in ("api.py", ".codegraph")
+                             for reason in (preparation.INDEX_REASON, "Git metadata")):
+            with self.subTest(path=path, reason=reason):
+                run = self.prepared(exclusions=[[path, reason]])
                 target = next(iter(run["targets"].values()))
                 self.assertTrue(any(gap["material"] and gap["reason"].startswith(path + ":")
+                                    for gap in target["coverage_gaps"].values()))
+
+    def test_explicit_descendants_of_omitted_indexes_keep_material_coverage_gaps(self):
+        cache = self.source / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("explicitly omitted source\n")
+        for path in (".codegraph/source.py", ".codegraph/absent.py"):
+            with self.subTest(path=path):
+                run = self.prepared(exclusions=[[path, "owner excluded this source"]])
+                target = next(iter(run["targets"].values()))
+                self.assertTrue(any(gap["material"] and gap["reason"].startswith(".codegraph:")
                                     for gap in target["coverage_gaps"].values()))
 
     def test_old_hashed_unreviewed_indexes_preserve_artifacts_and_source_guards(self):
@@ -310,6 +322,41 @@ class ProjectTests(unittest.TestCase):
             (frozen_output / "late.py").write_text("unexpected frozen bytes\n")
             self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen,
                                               {"owner": record})["status"], "changed")
+
+    def test_generated_pruning_preserves_explicit_reviewed_paths_and_ancestors(self):
+        names = ("target/nested/source.py", "environment/nested/source.py")
+        for name in names:
+            path = self.source / name
+            path.parent.mkdir(parents=True)
+            path.write_text("reviewed source\n")
+        (self.source / "environment/pyvenv.cfg").write_text("fixture environment\n")
+        omitted = self.source / "node_modules"
+        omitted.mkdir()
+        (omitted / "output").write_text("disposable output\n")
+        reviewed = tuple(names)
+        destination = self.base / "copy"
+        destination.mkdir()
+        original_fwalk = preparation.os.fwalk
+
+        def guarded_walk(root, *args, **kwargs):
+            for row in original_fwalk(root, *args, **kwargs):
+                self.assertFalse(Path(row[0]).is_relative_to(omitted))
+                yield row
+
+        with patch.object(preparation.os, "fwalk", side_effect=guarded_walk):
+            inventory = preparation.project_inventory(self.source, destination=destination,
+                                                       exclude_generated=True, reviewed=reviewed)
+        ledger = preparation.files(self.source, exclude_generated=True, reviewed=reviewed)
+        for name in names:
+            self.assertIn(name, inventory["entries"])
+            self.assertIn(name, ledger)
+            self.assertEqual((destination / name).read_bytes(), (self.source / name).read_bytes())
+            for ancestor in Path(name).parents:
+                if ancestor != Path("."):
+                    self.assertIn(ancestor.as_posix(), inventory["entries"])
+                    self.assertIn(ancestor.as_posix(), ledger)
+        self.assertEqual(inventory["excluded"]["node_modules"], preparation.GENERATED_REASON)
+        self.assertNotIn("node_modules/output", ledger)
 
     def test_legacy_project_baselines_keep_generated_content_strict(self):
         output = self.source / "target"
@@ -867,6 +914,40 @@ class ProjectTests(unittest.TestCase):
                     self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
                     (Path(frozen["source_root"]) / "api.py").write_text("changed reviewed source\n")
                     self.assertIn("source", preparation.check(self.directory, run["run_id"], key, frozen, {})["components"])
+
+    def test_static_test_copy_ignores_late_indexes_but_preserves_legacy_reviewed_index_source(self):
+        cache = self.source / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("reviewed source\n")
+        original_inventory = preparation.project_inventory
+        original_baseline = preparation.project_baseline
+
+        def legacy_inventory(root, exclusions=None, destination=None, **kwargs):
+            kwargs["exclude_indexes"] = False
+            return original_inventory(root, exclusions, destination, **kwargs)
+
+        def legacy_baseline(root, exclude=(), **kwargs):
+            kwargs["exclude_indexes"] = False
+            return original_baseline(root, exclude, **kwargs)
+
+        with (patch.object(preparation, "project_inventory", side_effect=legacy_inventory),
+              patch.object(preparation, "project_baseline", side_effect=legacy_baseline)):
+            run = self.prepared()
+        key, target = next(iter(run["targets"].items()))
+        frozen = target["frozen"]
+        source = Path(frozen["source_root"])
+        (source / ".codegraph/index").write_text("late disposable index\n")
+        for name in (".tgrep", ".zvec-grep"):
+            (source / name).mkdir()
+            (source / name / "index").write_text("late disposable index\n")
+        copied = preparation.test_copy(self.directory, run["run_id"], key, frozen)
+        self.assertEqual((copied / ".codegraph/source.py").read_text(), "reviewed source\n")
+        self.assertFalse((copied / ".codegraph/index").exists())
+        self.assertFalse((copied / ".tgrep").exists())
+        self.assertFalse((copied / ".zvec-grep").exists())
+        (source / ".codegraph/source.py").write_text("changed reviewed source\n")
+        with self.assertRaisesRegex(ValueError, "differs from the frozen manifest"):
+            preparation.test_copy(self.directory, run["run_id"], key, frozen)
 
     def test_cli_cleanup_holds_before_removing_another_projects_evidence(self):
         other = self.base / "consumer"

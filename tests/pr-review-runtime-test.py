@@ -3,12 +3,14 @@
 
 import errno
 import importlib.util
+import io
 import json
 import os
 import shutil
 import stat
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -201,6 +203,39 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(list(self.destination.glob(".scripts-previous-*")), [])
         with patch.object(runtime, "__file__", str(scripts / "runtime.py")):
             self.assertEqual(runtime.identity(), result["runtime"])
+
+    def test_legacy_readonly_directory_cleanup_preserves_backup_metadata(self):
+        scripts = self.legacy_scripts()
+        (scripts / "nested").chmod(0o555)
+        external = self.base / "external"
+        external.mkdir(mode=0o555)
+        (scripts / "external-link").symlink_to(external, target_is_directory=True)
+        expected = self.legacy_record(scripts)
+        result = self.install(force=True)
+        self.assertTrue(scripts.is_symlink())
+        self.assertEqual(self.legacy_record(Path(result["backup"])), expected)
+        self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o555)
+        self.assertEqual(list(self.destination.glob(".scripts-previous-*")), [])
+        with patch.object(runtime, "__file__", str(scripts / "runtime.py")):
+            self.assertEqual(runtime.identity(), result["runtime"])
+
+    def test_command_reports_success_with_retained_copy_when_cleanup_fails(self):
+        scripts = self.legacy_scripts()
+        expected = self.legacy_record(scripts)
+        output = io.StringIO()
+        with (patch.object(runtime, "remove_retired_directory",
+                           side_effect=OSError(errno.EBUSY, "simulated retired runtime cleanup failure")),
+              patch.object(runtime, "install_sources", return_value={p.name: p for p in self.source.iterdir()}),
+              patch.object(runtime.sys, "argv", ["runtime.py", "install", "--destination", str(self.destination),
+                                                 "--backup-root", str(self.backup), "--force"]),
+              redirect_stdout(output)):
+            self.assertEqual(runtime.main(), 0)
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["changed"])
+        self.assertEqual(scripts.resolve(), Path(result["release"]))
+        self.assertEqual(self.legacy_record(Path(result["backup"])), expected)
+        self.assertTrue(Path(result["cleanup_pending"]["path"]).is_dir())
+        self.assertIn("simulated retired runtime cleanup failure", result["cleanup_pending"]["error"])
 
     def test_legacy_backup_copy_failure_leaves_original_active_and_no_partial_backup(self):
         scripts = self.legacy_scripts()

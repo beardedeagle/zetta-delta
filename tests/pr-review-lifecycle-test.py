@@ -38,7 +38,7 @@ class LifecycleTests(unittest.TestCase):
         run = FIXTURES.WorkflowTests().discovered(findings=[FIXTURES.raw()])
         row = run["targets"][FIXTURES.TARGET]["assignments"]["review"]
         row["runtime_copy"] = {"root": "/temporary/native", "git_dir": "/temporary/native/.git",
-                               "ref": "refs/heads/native", "head": "a" * 40}
+                               "ref": "refs/heads/native", "head": "a" * 40, "common_dir": "/parent/.git"}
         return run
 
     def resolution(self, run, index=0, cause="registered-native-administration"):
@@ -50,7 +50,15 @@ class LifecycleTests(unittest.TestCase):
 
     def test_bookkeeping_resolution_retains_incident_and_rejects_stale_or_source_bindings(self):
         run = self.discovered()
-        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "changed", "components": ["parent"]}))
+        frozen = run["targets"][FIXTURES.TARGET]["frozen"]
+        refs = b"refs/heads/native\0" + b"a" * 40 + b"\n"
+        proof = {"kind": "git-refs", "root": frozen["parent_root"], "common_dir": "/parent/.git",
+                 "baseline_fingerprint": frozen["parent_fingerprint"],
+                 "baseline_refs_sha256": workflow.hashlib.sha256(b"").hexdigest(),
+                 "refs_hex": refs.hex(), "refs_sha256": workflow.hashlib.sha256(refs).hexdigest(),
+                 "native_copies_sha256": []}
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "changed", "components": ["parent"],
+                                                                   "bookkeeping": {"parent": proof}}))
         run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "unchanged", "components": []}))
         original = copy.deepcopy(run)
         data = self.resolution(run)
@@ -58,6 +66,13 @@ class LifecycleTests(unittest.TestCase):
                              ("native_copies_sha256", "0" * 64), ("check", 0), ("observation", True)):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 workflow.apply_event(run, FIXTURES.event("integrity-resolution", dict(data, **{field: value})))
+        unrelated_refs = b"refs/heads/native\0" + b"b" * 40 + b"\n"
+        for changes in ({"common_dir": "/unrelated/.git"}, {"native_copies_sha256": ["0" * 64]},
+                        {"refs_hex": unrelated_refs.hex(), "refs_sha256": workflow.hashlib.sha256(unrelated_refs).hexdigest()}):
+            unsafe = copy.deepcopy(run)
+            unsafe["targets"][FIXTURES.TARGET]["integrity"][0]["bookkeeping"]["parent"].update(changes)
+            with self.subTest(original_proof=changes), self.assertRaises(ValueError):
+                workflow.apply_event(unsafe, FIXTURES.event("integrity-resolution", self.resolution(unsafe)))
         resolved = workflow.apply_event(run, FIXTURES.event("integrity-resolution", data))
         self.assertEqual(resolved["targets"][FIXTURES.TARGET]["integrity"], original["targets"][FIXTURES.TARGET]["integrity"])
         self.assertEqual(workflow.integrity_failures(resolved), ([], []))
@@ -71,6 +86,25 @@ class LifecycleTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     workflow.apply_event(unsafe, FIXTURES.event("integrity-resolution", self.resolution(unsafe)))
 
+    def test_legacy_incident_needs_original_proof_for_new_resolution_but_accepted_events_replay(self):
+        run = self.discovered()
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "changed", "components": ["parent"]}))
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "unchanged", "components": []}))
+        event = FIXTURES.event("integrity-resolution", self.resolution(run))
+        with self.assertRaisesRegex(ValueError, "original incident"):
+            workflow.apply_event(run, event)
+        replayed = workflow.apply_event(run, event, replay=True)
+        self.assertEqual(workflow.integrity_failures(replayed), ([], []))
+
+    def test_original_bookkeeping_evidence_rejects_malformed_bindings(self):
+        for value in (None, [], "relative", 42):
+            run = self.discovered()
+            proof = {"kind": "missing-native-root", "root": value, "copy_sha256": "a" * 64}
+            observation = {"status": "unknown", "components": ["native:/temporary/native"],
+                           "bookkeeping": {"native:/temporary/native": proof}}
+            with self.subTest(root=value), self.assertRaises(ValueError):
+                workflow.apply_event(run, FIXTURES.event("integrity", observation))
+
     def test_shared_checkout_stays_active_until_every_using_assignment_is_settled(self):
         run = self.discovered()
         target = run["targets"][FIXTURES.TARGET]
@@ -81,6 +115,23 @@ class LifecycleTests(unittest.TestCase):
         target["assignments"]["second"]["status"] = "failed"
         self.assertEqual(workflow.active_native_roots(run), ())
         self.assertEqual(workflow.runtime_copies(run), (proof,))
+
+    def test_unknown_native_outcome_remains_active_and_cannot_support_cleanup_resolution(self):
+        fixtures = FIXTURES.RecoveryTests()
+        run = fixtures.running()
+        proof = self.discovered()["targets"][FIXTURES.TARGET]["assignments"]["review"]["runtime_copy"]
+        run["targets"][FIXTURES.TARGET]["assignments"]["review"]["runtime_copy"] = proof
+        run = fixtures.outcome(run, status="unknown")
+        self.assertEqual(run["targets"][FIXTURES.TARGET]["assignments"]["review"]["status"], "running")
+        self.assertEqual(workflow.active_native_roots(run), (proof["root"],))
+        component = "native:" + proof["root"]
+        observation = {"status": "unknown", "components": [component], "bookkeeping": {
+            component: {"kind": "missing-native-root", "root": proof["root"],
+                        "copy_sha256": workflow.preparation.fingerprint(proof)}}}
+        run = workflow.apply_event(run, FIXTURES.event("integrity", observation))
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "unchanged", "components": []}))
+        with self.assertRaisesRegex(ValueError, "settled native administration"):
+            workflow.apply_event(run, FIXTURES.event("integrity-resolution", self.resolution(run, cause="completed-native-copy")))
 
     def test_export_survives_unreplayable_journal_and_bad_receipt_without_writes(self):
         finding = dict(FIXTURES.raw(), evidence="<script>untrusted</script>")

@@ -266,6 +266,10 @@ upgrades save a link to the previous release. Restore that backup as
 Let existing review CLI commands finish before that first directory-to-link
 conversion; subsequent release switches preserve already pinned commands.
 
+If removing the retired local directory fails after activation, installation
+still succeeds and returns `cleanup_pending` with the retained path and error.
+The verified release is active and its completed backup remains available.
+
 Each release has a `runtime-manifest.json` with its journal schema version, hashes
 of the owned review modules, their aggregate fingerprint and the source Git
 revision when available. The content fingerprint identifies the actual bytes,

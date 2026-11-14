@@ -161,7 +161,12 @@ class NativeLifecycleTests(GIT.GitFixture):
         self.assertEqual(code, 0, response)
         self.assertEqual(self.state()[1]["targets"][self.key]["assignments"][assignment_id]["status"], "done")
 
-    def test_completed_workers_survive_cleanup_retry_resolution_and_held_export(self):
+    def initialize_run(self) -> dict:
+        """Prepare seventeen physical slices and their native assignments.
+
+        Returns:
+            dict: Frozen project identity shared by the lifecycle regressions.
+        """
         for index in range(17):
             (self.parent / f"slice-{index:02}.py").write_text(f"VALUE = {index}\n")
         self.commit("seventeen source slices")
@@ -200,6 +205,86 @@ class NativeLifecycleTests(GIT.GitFixture):
             scope = sorted({path for unit in assigned for path in catalog["units"][unit]["paths"]})
             self.append("assignment", RECORDS.assignment(f"slice-{index:02}", scope=scope, units=assigned,
                                                           interactions=["lifecycle"] if index == 0 else []))
+        return frozen
+
+    def assert_restored_source_rejected(self, kind: str) -> None:
+        """Keep real source incidents blocking after their bytes are restored.
+
+        Args:
+            kind (str): Parent, artifact-backed copy or completed native source.
+        """
+        self.initialize_run()
+        child, _, _ = self.launch("slice-00")
+        self.inspect("slice-00")
+        self.receive("slice-00")
+        root, component = self.parent, "parent"
+        if kind == "copy":
+            root = self.base / "extra-copy"
+            self.git("clone", "-q", str(self.parent), str(root))
+            _, run = self.state()
+            record = preparation.capture_baseline(self.directory, "extra", root, workflow.runtime_copies(run))
+            self.append("baseline", record)
+            component = "copy:" + self.key + "/extra"
+        elif kind == "native":
+            root, component = child, "native:" + str(child)
+        path = root / "feature.txt"
+        original = path.read_bytes()
+        path.write_text("actual source edit before restoration\n")
+        _, run = self.state()
+        target = run["targets"][self.key]
+        observation = preparation.check(self.directory, run["run_id"], self.key, target["frozen"],
+                                        {self.key + "/" + name: row for name, row in target["baselines"].items()},
+                                        native_copies=workflow.runtime_copies(run))
+        self.assertEqual(observation["status"], "changed", observation)
+        self.assertEqual(observation["components"], [component], observation)
+        incident = len(target["integrity"])
+        self.append("integrity", observation)
+        path.write_bytes(original)
+        run = self.check(stop=False)
+        self.assertEqual(run["targets"][self.key]["integrity"][-1]["status"], "unchanged")
+        code, result = self.cli("resolve-integrity", "--target", self.key, "--observation", str(incident),
+                                "--cause", "completed-native-copy" if kind == "native" else "registered-native-administration",
+                                "--evidence", "source was actually changed and restored; this is not bookkeeping",
+                                "--revision", str(run["revision"]))
+        self.assertEqual(code, 1, {"response_code": result.get("code"),
+                                   "resolutions": self.state()[1]["targets"][self.key]["integrity_resolutions"]})
+        self.assertIn("original incident", result["reason"])
+        self.assertEqual(workflow.integrity_failures(self.state()[1])[0], [self.key])
+
+    def test_restored_parent_edit_cannot_be_resolved_as_bookkeeping(self):
+        self.assert_restored_source_rejected("parent")
+
+    def test_restored_copy_edit_cannot_be_resolved_as_bookkeeping(self):
+        self.assert_restored_source_rejected("copy")
+
+    def test_restored_native_edit_cannot_be_resolved_as_completed_cleanup(self):
+        self.assert_restored_source_rejected("native")
+
+    def test_original_ref_only_incident_uses_exact_settled_native_registration(self):
+        frozen = self.initialize_run()
+        self.launch("slice-00")
+        self.inspect("slice-00")
+        self.receive("slice-00")
+        _, run = self.state()
+        # Reproduce an observation that lacked exact native normalization while
+        # retaining the original ref bytes, as older bookkeeping checks did.
+        observation = preparation.check(self.directory, run["run_id"], self.key, frozen, {})
+        self.assertEqual(observation["status"], "changed", observation)
+        self.assertEqual(observation["components"], ["parent"], observation)
+        self.assertEqual(observation["bookkeeping"]["parent"]["native_copies_sha256"], [])
+        incident = len(run["targets"][self.key]["integrity"])
+        self.append("integrity", observation)
+        run = self.check(stop=False)
+        self.assertEqual(run["targets"][self.key]["integrity"][-1]["status"], "unchanged")
+        code, result = self.cli("resolve-integrity", "--target", self.key, "--observation", str(incident),
+                                "--cause", "registered-native-administration",
+                                "--evidence", "retained original ref is now bound to the exact settled native copy",
+                                "--revision", str(run["revision"]))
+        self.assertEqual(code, 0, result)
+        self.assertEqual(workflow.integrity_failures(self.state()[1]), ([], []))
+
+    def test_completed_workers_survive_cleanup_retry_resolution_and_held_export(self):
+        frozen = self.initialize_run()
         first, first_store, pin = self.launch("slice-00")
         self.launch("slice-01")
         self.inspect("slice-00")

@@ -390,13 +390,15 @@ def integrity_failures(run: dict) -> tuple[list[str], list[str]]:
     return targets, assignments
 
 
-def validate_integrity_resolution(run: dict, key: str, data: dict) -> None:
+def validate_integrity_resolution(run: dict, key: str, data: dict, *, replay: bool = False) -> None:
     """Bind a bookkeeping resolution to original and fresh engine observations.
 
     Args:
         run (dict): Replayed journal with a fresh, successful complete check.
         key (str): Target that owns the historical incident.
         data (dict): Exact incident, snapshot, administration and check bindings.
+        replay (bool): Retain resolutions already accepted by older runtimes;
+            new resolutions require evidence from the original observation.
 
     Raises:
         ValueError: Evidence is stale, duplicated, unbound or not bookkeeping.
@@ -437,6 +439,35 @@ def validate_integrity_resolution(run: dict, key: str, data: dict) -> None:
                        for name in item["baselines"])
     if not set(original["components"]) <= allowed:
         raise ValueError("source, artifact and unrelated failures cannot use bookkeeping recovery")
+    if replay and "bookkeeping" not in original:
+        return
+    originals = {"parent": (frozen["parent_root"], frozen["parent_fingerprint"])}
+    originals.update({"copy:" + owner + "/" + name: (record["root"], record["fingerprint"])
+                      for owner, item in run["targets"].items() for name, record in item["baselines"].items()})
+    copies = {preparation.fingerprint(row) for row in runtime_copies(run)}
+    for component in original["components"]:
+        proof = original.get("bookkeeping", {}).get(component)
+        if proof is None:
+            raise ValueError("original incident does not prove recoverable bookkeeping")
+        if proof["kind"] == "missing-native-root":
+            if (component != "native:" + proof["root"] or proof["root"] not in settled
+                    or proof["copy_sha256"] != preparation.fingerprint(settled[proof["root"]])):
+                raise ValueError("original missing checkout does not match settled administration")
+        elif proof["kind"] == "git-refs" and data["cause"] == "registered-native-administration":
+            if (originals.get(component) != (proof["root"], proof["baseline_fingerprint"])
+                    or not set(proof["native_copies_sha256"]) <= copies):
+                raise ValueError("original ref evidence differs from its baseline or registered copies")
+            pins = {os.fsencode(row["ref"]): os.fsencode(row["head"]) for row in settled.values()
+                    if row["ref"] and row["common_dir"] == proof["common_dir"]}
+            pins.update({os.fsencode(row["clone_store"]["ref"]): os.fsencode(row["head"])
+                         for row in settled.values() if "clone_store" in row and row["clone_store"]["ref_store"] == proof["common_dir"]})
+            refs = bytes.fromhex(proof["refs_hex"])
+            normalized = b"".join(line for line in refs.splitlines(keepends=True)
+                                  if pins.get(line.partition(b"\0")[0]) != line.partition(b"\0")[2].rstrip(b"\n"))
+            if hashlib.sha256(normalized).hexdigest() != proof["baseline_refs_sha256"]:
+                raise ValueError("original ref changes are not exact settled native references")
+        else:
+            raise ValueError("original incident does not prove the selected bookkeeping cause")
 
 
 def pending_launches(run: dict) -> list[tuple[str, str]]:
@@ -902,10 +933,11 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             explicit = tuple(row["path"] for row in target["project"]["exclusions"])
             omissions = dict(data["manifest"]["gaps"])
             for path, reason in data["manifest"]["excluded"].items():
-                if reason == "Git metadata":
+                if reason == "Git metadata" and any(part.casefold() == ".git" for part in path.split("/")):
                     continue
                 if (reason == preparation.INDEX_REASON and preparation.disposable_index(path, True)
-                        and not any(path == name or path.startswith(name + "/") for name in explicit)):
+                        and not any(path == name or path.startswith(name + "/") or name.startswith(path + "/")
+                                    for name in explicit)):
                     continue
                 omissions[path] = {"reason": reason}
             for path, row in omissions.items():
@@ -998,7 +1030,7 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
                 raise ValueError("source search requires its execution receipt")
             search.update(copy.deepcopy(data), status="success" if data["exit_code"] in (0, 1) else "error")
     elif operation == "integrity":
-        fields(data, ("status", "components"), ("cache_changes",))
+        fields(data, ("status", "components"), ("cache_changes", "bookkeeping"))
         choice(data["status"], ("unchanged", "changed", "unknown"), "integrity status")
         strings(data["components"], "integrity component", empty=True)
         if (target["frozen"] is None and target["setup"] is None) or (data["status"] == "unchanged" and data["components"]):
@@ -1012,9 +1044,43 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
                     or any(not isinstance(change[name], str) or not re.fullmatch(r"[0-9a-f]{64}", change[name])
                            for name in ("before", "after"))):
                 raise ValueError("invalid generated-cache change")
+        if not isinstance(data.get("bookkeeping", {}), dict) or not set(data.get("bookkeeping", {})) <= set(data["components"]):
+            raise ValueError("bookkeeping evidence must name original failed components")
+        for component, proof in data.get("bookkeeping", {}).items():
+            if not isinstance(proof, dict):
+                raise ValueError("invalid original bookkeeping evidence")  # noqa: TRY004 - retain the validation error contract.
+            if proof.get("kind") == "missing-native-root":
+                fields(proof, ("kind", "root", "copy_sha256"))
+                hashes = ("copy_sha256",)
+            elif proof.get("kind") == "git-refs":
+                fields(proof, ("kind", "root", "common_dir", "baseline_fingerprint", "baseline_refs_sha256",
+                               "refs_hex", "refs_sha256", "native_copies_sha256"))
+                hashes = ("baseline_fingerprint", "baseline_refs_sha256", "refs_sha256")
+            else:
+                raise ValueError("unsupported original bookkeeping evidence")
+            if (not isinstance(proof["root"], str) or not Path(proof["root"]).is_absolute()
+                    or any(not isinstance(proof[name], str) or not re.fullmatch(r"[0-9a-f]{64}", proof[name]) for name in hashes)):
+                raise ValueError("invalid original bookkeeping binding")
+            if proof["kind"] == "missing-native-root":
+                if data["status"] != "unknown" or component != "native:" + proof["root"]:
+                    raise ValueError("missing-checkout evidence requires the original unreadable native root")
+            else:
+                if (component != "parent" and not component.startswith("copy:")
+                        or not isinstance(proof["common_dir"], str) or not Path(proof["common_dir"]).is_absolute()
+                        or not isinstance(proof["refs_hex"], str) or not re.fullmatch(r"(?:[0-9a-f]{2})*", proof["refs_hex"])
+                        or not isinstance(proof["native_copies_sha256"], list)
+                        or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                               for value in proof["native_copies_sha256"])):
+                    raise ValueError("invalid original Git reference evidence")
+                refs = bytes.fromhex(proof["refs_hex"])
+                if (hashlib.sha256(refs).hexdigest() != proof["refs_sha256"]
+                        or proof["refs_sha256"] == proof["baseline_refs_sha256"]
+                        or any(not re.fullmatch(rb"refs/[^\x00\n]+\x00(?:[0-9a-f]{40}|[0-9a-f]{64})\n", line)
+                               for line in refs.splitlines(keepends=True))):
+                    raise ValueError("original Git references do not match their observation")
         target["integrity"].append(copy.deepcopy(data))
     elif operation == "integrity-resolution":
-        validate_integrity_resolution(result, event["target"], data)
+        validate_integrity_resolution(result, event["target"], data, replay=replay)
         target["integrity_resolutions"][str(data["observation"])] = copy.deepcopy(data)
     elif operation == "stage-waiver":
         fields(data, ("stage", "evidence", "snapshot_fingerprint"))
@@ -2525,35 +2591,41 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
         run (dict): Replayed source and participating-copy records.
 
     Returns:
-        dict[str, dict]: Canonical roots mapped to original validated ledgers.
+        dict[str, dict]: Canonical roots mapped to their first authenticated ledger,
+            agreeing on all source paths reviewed by any owner of that root.
 
     Raises:
         ValueError: Parent evidence changed or two records disagree.
         OSError: A private ledger cannot be read.
     """
-    parents = {}
+    records: dict[str, list[dict]] = {}
+    reviewed: dict[str, set[str]] = {}
     for key, target in run["targets"].items():
         frozen = target["frozen"] or target["setup"]
+        paths = tuple((frozen or {}).get("manifest", {}).get("entries", (frozen or {}).get("inventory", ())))
         if frozen and not target["resources_removed"] and "preparation" in frozen:
             root = frozen["parent_root"]
-            if root in parents:
-                if preparation.fingerprint(parents[root]) != frozen["parent_fingerprint"]:
-                    raise ValueError("protected parent records disagree")
-            else:
-                resource = preparation.owned(directory, frozen["preparation"]["resource"], run["run_id"], key)
-                path = resource / "parent-baseline.json"
-                if path.is_symlink() or preparation.digest(path) != frozen["preparation"]["artifacts"][path.name]:
-                    raise ValueError("parent baseline evidence changed")
-                ledger = json.loads(path.read_text())
-                if preparation.fingerprint(ledger) != frozen["parent_fingerprint"]:
-                    raise ValueError("parent ledger disagrees with frozen fingerprint")
-                parents[frozen["parent_root"]] = ledger
+            resource = preparation.owned(directory, frozen["preparation"]["resource"], run["run_id"], key)
+            path = resource / "parent-baseline.json"
+            if path.is_symlink() or preparation.digest(path) != frozen["preparation"]["artifacts"][path.name]:
+                raise ValueError("parent baseline evidence changed")
+            ledger = json.loads(path.read_text())
+            if preparation.fingerprint(ledger) != frozen["parent_fingerprint"]:
+                raise ValueError("parent ledger disagrees with frozen fingerprint")
+            records.setdefault(root, []).append(ledger)
+            reviewed.setdefault(root, set()).update(paths)
         for record in target["baselines"].values():
             if "artifact" in record:
                 ledger = preparation.read_baseline(directory, record)
-                if record["root"] in parents and parents[record["root"]] != ledger:
-                    raise ValueError("protected parent records disagree")
-                parents[record["root"]] = ledger
+                records.setdefault(record["root"], []).append(ledger)
+                reviewed.setdefault(record["root"], set()).update(paths)
+    parents = {}
+    for root, ledgers in records.items():
+        paths = tuple(sorted(reviewed[root]))
+        original = preparation.reviewed_ledger(ledgers[0], paths)
+        if any(preparation.reviewed_ledger(ledger, paths) != original for ledger in ledgers[1:]):
+            raise ValueError("protected parent records disagree")
+        parents[root] = ledgers[0]
     return parents
 
 

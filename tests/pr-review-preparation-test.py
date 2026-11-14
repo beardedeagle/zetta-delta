@@ -466,6 +466,33 @@ class PreparationTests(GitFixture):
         (child / ".codegraph/source.py").write_text("changed reviewed source\n")
         self.assertIn("native:" + str(child), check()["components"])
 
+    def test_generated_native_policy_retains_reviewed_source_and_ancestor_metadata(self):
+        names = ("target/nested/source.py", "environment/nested/source.py")
+        for name in names:
+            path = self.parent / name
+            path.parent.mkdir(parents=True)
+            path.write_text("reviewed source\n")
+        (self.parent / "environment/pyvenv.cfg").write_text("fixture environment\n")
+        self.commit("source in generated-looking directories")
+        self.head = self.git("rev-parse", "HEAD")
+        frozen = self.prepare()
+        child, _, _ = self.native_clone()
+        proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", frozen, child, ())
+        check = lambda: preparation.check(self.directory, "run-fixture", "local", frozen, {}, native_copies=(proof,))
+        self.assertEqual(check()["status"], "unchanged")
+        for name in names:
+            with self.subTest(name=name):
+                path = child / name
+                original = path.read_bytes()
+                path.write_text("changed reviewed source\n")
+                self.assertIn("native:" + str(child), check()["components"])
+                path.write_bytes(original)
+                ancestor = path.parent
+                mode = ancestor.stat().st_mode & 0o777
+                ancestor.chmod(mode ^ 0o100)
+                self.assertIn("native:" + str(child), check()["components"])
+                ancestor.chmod(mode)
+
     def test_opaque_legacy_native_proofs_remain_strict_without_index_policy_flag(self):
         frozen = self.prepare()
         child, _, _ = self.native_clone()
@@ -1101,6 +1128,71 @@ class PreparationTests(GitFixture):
         with self.assertRaisesRegex(preparation.NeedsDecision, "unmerged index"):
             self.prepare("working", left=None, right="HEAD")
         self.assertEqual(preparation.baseline(self.parent), before)
+
+
+    def parent_ledger_run(self, snapshots: dict[str, dict]) -> dict:
+        """Bind actual snapshot receipts to the state consumed during registration.
+
+        Args:
+            snapshots (dict[str, dict]): Target IDs and their captured evidence.
+
+        Returns:
+            dict: Minimal run retaining each target's original parent artifacts.
+        """
+        return {"run_id": "run-fixture", "targets": {
+            key: {"frozen": frozen, "setup": None, "resources_removed": False, "baselines": {}}
+            for key, frozen in snapshots.items()}}
+
+    def test_parent_ledgers_reconcile_cache_churn_without_replacing_original_evidence(self):
+        cache = self.parent / ".tgrep"
+        cache.mkdir()
+        (cache / "index").write_text("first index\n")
+        first = self.prepare()
+        (cache / "index").write_text("second index\n")
+        second = preparation.prepare(self.directory, "run-fixture", "later", self.local, self.parent)
+        self.assertNotEqual(first["parent_fingerprint"], second["parent_fingerprint"])
+        paths = [self.resource(snapshot) / "parent-baseline.json" for snapshot in (first, second)]
+        originals = [path.read_bytes() for path in paths]
+        run = self.parent_ledger_run({"local": first, "later": second})
+        parents = workflow.parent_ledgers(self.directory, run)
+        self.assertEqual(parents[str(self.parent)], json.loads(originals[0]))
+        child, _, _ = self.native_clone()
+        proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", first, child, (), parents)
+        self.assertEqual(proof["parent_root"], str(self.parent))
+        self.assertEqual([path.read_bytes() for path in paths], originals)
+
+    def test_parent_ledger_reconciliation_keeps_reviewed_source_and_outer_git_strict(self):
+        cache = self.parent / ".codegraph"
+        cache.mkdir()
+        source = cache / "source.py"
+        source.write_text("reviewed source\n")
+        self.commit("source with an index-looking path")
+        self.head = self.git("rev-parse", "HEAD")
+        for kind in ("reviewed", "ordinary", "ref"):
+            with self.subTest(kind=kind):
+                first = self.prepare(left="HEAD", right="HEAD")
+                path = source if kind == "reviewed" else self.parent / "original.txt"
+                original = path.read_bytes()
+                if kind == "ref":
+                    self.git("update-ref", "refs/test/unrelated", self.head)
+                else:
+                    path.write_bytes(original + b"changed source\n")
+                second = preparation.prepare(self.directory, "run-fixture", "later", self.local, self.parent)
+                self.assertIn(".codegraph/source.py", second["inventory"])
+                with self.assertRaisesRegex(ValueError, "protected parent records disagree"):
+                    workflow.parent_ledgers(self.directory, self.parent_ledger_run({"local": first, "later": second}))
+                if kind == "ref":
+                    self.git("update-ref", "-d", "refs/test/unrelated")
+                else:
+                    path.write_bytes(original)
+
+    def test_parent_ledgers_authenticate_every_same_root_snapshot(self):
+        first = self.prepare()
+        second = preparation.prepare(self.directory, "run-fixture", "later", self.local, self.parent)
+        self.assertEqual(first["parent_fingerprint"], second["parent_fingerprint"])
+        (self.resource(second) / "parent-baseline.json").write_text("{}")
+        with self.assertRaisesRegex(ValueError, "parent baseline evidence changed"):
+            workflow.parent_ledgers(self.directory, self.parent_ledger_run({"local": first, "later": second}))
 
 
 class SealedSnapshotTests(GitFixture):

@@ -172,6 +172,29 @@ def source_revision(sources: dict[str, Path]) -> str | None:
         return None
 
 
+def remove_retired_directory(path: Path) -> None:
+    """Remove an owned legacy copy after its backup and replacement are active.
+
+    Args:
+        path (Path): Retired local scripts directory, never the completed backup.
+
+    Raises:
+        OSError: Directory access, permission repair or removal fails.
+        PermissionError: A read-only directory is owned by another user.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        for _, _, _, directory in os.fwalk(".", dir_fd=descriptor, follow_symlinks=False):
+            info = os.fstat(directory)
+            if not info.st_mode & stat.S_IWUSR:
+                if info.st_uid != os.getuid():
+                    raise PermissionError("cannot make a foreign-owned retired runtime directory writable")
+                os.fchmod(directory, stat.S_IMODE(info.st_mode) | stat.S_IWUSR)
+    finally:
+        os.close(descriptor)
+    shutil.rmtree(path)
+
+
 def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | None = None,
             force: bool = False, dry_run: bool = False) -> dict:
     """Stage a verified release and switch future commands without mixing files.
@@ -184,7 +207,8 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
         dry_run (bool): Validate and describe the operation without writes.
 
     Returns:
-        dict: Runtime identity, changed status, release and optional backup path.
+        dict: Runtime identity, changed status, release, optional backup path and
+            cleanup_pending details if the activated install retains an old copy.
 
     Raises:
         OSError: Source, staging, backup or replacement fails.
@@ -286,10 +310,14 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
             raise
         finally:
             replacement.unlink(missing_ok=True)
+        result = {"runtime": expected, "changed": True, "release": str(release / "scripts"),
+                  "backup": str(backup) if backup is not None else None}
         if previous is not None:
-            shutil.rmtree(previous)
-        return {"runtime": expected, "changed": True, "release": str(release / "scripts"),
-                "backup": str(backup) if backup is not None else None}
+            try:
+                remove_retired_directory(previous)
+            except OSError as error:
+                result["cleanup_pending"] = {"path": str(previous), "error": str(error)}
+        return result
 
 
 def main() -> int:
