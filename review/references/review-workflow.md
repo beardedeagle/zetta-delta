@@ -280,7 +280,7 @@ baselines. Choose useful indexes with optional `setup --tools ...`; omit setup
 for static inspection. `setup` records intent before invoking the existing
 bounded index maintainer, reusing its cache, embedding and build limits.
 `finalize` is required in both cases before planning or assignments.
-Finalization seals the source, including prepared caches. Native reviewers must
+Finalization seals the source. Native reviewers must
 not run `SessionStart` maintenance, create caches or refresh indexes there afterward.
 Use the emitted `source_git_prefix` (`GIT_OPTIONAL_LOCKS=0`) for Git reads and
 `source_search_command` for static searches. Append `--pattern='<literal>'`,
@@ -293,20 +293,26 @@ Within roots authorized by `~/.config/context-roots`, static search uses
 it routes directly to `rg --no-config`; no cache-capable tool is invoked there.
 Missing/unreadable policy fails closed to that route. Both routes include hidden
 and ignored source, exclude Git administration, and preserve literal/regex search.
-Prepared indexes
-are usable only through a read-only route that cannot start a writer; otherwise
-inspect statically. Preserve unexpected changes and prepare a new run rather
-than cleaning or replacing its baseline. A clean Git status does not establish
-full integrity: ignored caches and index metadata are checked too.
-For new project captures explicitly excluding `.codegraph` or its
-`codegraph.db-shm`, an existing regular SHM file may change content while retaining
-its recorded identity, size, owner and permissions. The cache directory and SQLite
-database identities must also remain unchanged and safely owned. Each observation
-retains original/current SHM hashes as `cache_changes`; original baselines remain
-immutable. Database/WAL changes, additions, removals, replacements, symlinks,
-ownership/permission changes and all other source/Git changes still hold the run.
-Reviewed caches and legacy baselines without recorded recovery identities stay
-strict; this is not a blanket cache exclusion or a cache repair.
+Prepared indexes are usable only through a read-only route that cannot start a
+writer; otherwise inspect statically. Preserve unexpected source changes and
+prepare a new run rather than cleaning or replacing its baseline. A clean Git
+status does not establish full integrity: included ignored and untracked source,
+Git administration, retained reports and runtime code remain protected.
+
+Disposable `.codegraph`, `.tgrep` and `.zvec-grep` index contents outside the
+frozen review manifest do not participate in source-integrity comparisons. New
+project captures omit these index directories before traversal or hashing. Old
+ledger artifacts and their fingerprints remain intact and are authenticated
+before comparing their non-index entries; no cache hashes are backfilled. Paths
+already listed in a frozen project manifest or PR/range inventory remain sealed
+review evidence. This policy never exempts reviewed source, report artifacts,
+Git references or runtime identity from their existing checks.
+
+New native-copy proofs record the same index exclusion. Legacy native proofs
+containing only a fingerprint retain their original scan policy because no
+authenticated file ledger exists to separate source from cache bytes. Completed
+workers still retain their Git-reference checks without scanning their temporary
+checkout or clone store.
 
 `source-search` journals a pending execution before running, retains full stdout
 and stderr with hashes, and returns previews of at most 8192 bytes each. Exit zero
@@ -1146,8 +1152,10 @@ unchanged. `baseline` protects plain native-parent directories as filesystem
 ledgers for project runs, and still protects existing Git administration.
 
 Preparation records a provisional material `capture-...` gap for each explicit
-nonmetadata omission or unsupported entry. Assess those records, preserve actual
-material gaps, and use the existing `resolve-gap` evidence path only when there is
+source omission or unsupported entry. Automatic disposable index exclusions stay
+visible in the manifest without creating material source-coverage gaps. Assess the gap
+records, preserve actual material gaps, and use the existing `resolve-gap`
+evidence path only when there is
 a supported disposition. Neither an excluded path nor a skipped special entry
 silently counts as reviewed. Original-source movement and manifest/copy tampering
 hold further work; a later clean observation cannot erase the failure history.
@@ -1197,6 +1205,12 @@ PR/range journals and existing PR publication safeguards keep their behavior.
 
 
 ### Explicit migration of legacy project baseline policies
+
+Settle any issued launch with `started` or verified non-launch withdrawal before
+runtime adoption, stage waivers, policy migration or integrity resolution. These
+mutations must not advance the journal while a worker is awaiting registration.
+Use the release that issued the approval to settle it before adopting a new
+runtime. Read-only status, report and findings export remain available.
 
 Old hand-patched runs may omit review paths from parent ledgers without storing
 that policy in the ledger. Do not infer or replace those original fingerprints.

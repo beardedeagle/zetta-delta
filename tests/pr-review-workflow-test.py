@@ -21,7 +21,7 @@ import workflow
 
 REPO = "fixture/project"
 TARGET = REPO + "#12"
-REGISTRY = {"version": 1, "thread_limit": 15, "metered_max_spawns": 2,
+REGISTRY: dict = {"version": 1, "thread_limit": 15, "metered_max_spawns": 2,
             "providers": [{"provider_id": "provider-a", "lane": "lane-a", "billing": "flat", "limit": 3},
                           {"provider_id": "provider-b", "lane": "lane-b", "billing": "flat", "limit": 2},
                           {"provider_id": "provider-c", "lane": "lane-c", "billing": "flat", "limit": 2}],
@@ -779,8 +779,16 @@ class DispatchGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "approved native parent"):
             workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"], runtime_copy=proof)))
         proof["parent_root"] = "/native/project"
-        started = workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"], runtime_copy=proof)))
-        self.assertEqual(started["targets"][TARGET]["assignments"]["review"]["status"], "running")
+        for candidate in (proof, dict(proof, exclude_indexes=True), dict(proof, exclude_indexes=False)):
+            with self.subTest(proof=candidate):
+                started = workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"], runtime_copy=candidate)))
+                row = started["targets"][TARGET]["assignments"]["review"]
+                self.assertEqual(row["status"], "running")
+                self.assertEqual(row["runtime_copy"], candidate)
+        for invalid in (None, 0, 1, "true", [], {}):
+            with self.subTest(exclude_indexes=invalid), self.assertRaises(ValueError):
+                workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"],
+                    runtime_copy=dict(proof, exclude_indexes=invalid))))
 
     def test_legacy_task_approval_replays_without_certifying_new_dispatch(self):
         run = self.queued()
@@ -2266,6 +2274,86 @@ class RecoveryTests(unittest.TestCase):
     stand_in_ready = FamilyRoutingTests.stand_in_ready
     judge_report = FamilyRoutingTests.judge_report
     judge_running = FamilyRoutingTests.judge_running
+
+    def metered_running(self, allowance: int = 1, provider_limit: int = 3) -> dict:
+        """Start a metered finder with explicit target and run allowances.
+
+        Args:
+            allowance (int): Authorized target and configured run spawn count.
+            provider_limit (int): Concurrent finder-provider allowance.
+
+        Returns:
+            dict: Valid run with one served metered handle.
+        """
+        registry = copy.deepcopy(REGISTRY)
+        registry["metered_max_spawns"] = allowance
+        registry["providers"][0].update(billing="metered", limit=provider_limit)
+        registry["providers"][1]["billing"] = "metered"
+        catalog = copy.deepcopy(CATALOG)
+        for row in catalog["profiles"].values():
+            person = row["identity"]
+            row["identity"] = workflow.model_record({key: person[key] for key in ("provider_id", "model_id")}, registry)
+        run = workflow.new_run("pr-review", COLLECTION, registry, MODEL_C, "thread-fixture")
+        for operation, data in (("freeze", FROZEN), ("catalog", catalog), ("plan", plan()),
+                                ("authorization", {"submission": False, "test_execution": False,
+                                    "metered_spawns": allowance, "evidence": "owner authorizes the bounded metered participants"}),
+                                ("assignment", assignment()), ("started", start())):
+            run = workflow.apply_event(run, event(operation, data))
+        return run
+
+    def test_metered_report_correction_reuses_served_handle_at_spent_spawn_limit(self):
+        run = self.metered_running()
+        person = run["targets"][TARGET]["assignments"]["review"]["actual_identity"]
+        run = self.receive(run, dict(report(status="partial"), reviewer=person))
+        run = workflow.apply_event(run, event("recover", self.request(run, "correction", key="correct")))
+        task = workflow.contract.dispatch_task(run, TARGET, "correct", DispatchGateTests().capacity())
+        self.assertEqual(task["dispatch"]["action"], "follow-up")
+        self.assertEqual(task["runtime_handle"], "review-handle")
+        run = workflow.apply_event(run, event("started", dict(start("correct"), runtime_handle="review-handle")))
+        handles = {row["runtime_handle"] for row in run["targets"][TARGET]["assignments"].values()
+                   if row.get("actual_identity")}
+        self.assertEqual(handles, {"review-handle"})
+
+    def test_metered_focused_follow_up_reuses_vetter_at_spent_spawn_limit(self):
+        run = self.metered_running(allowance=2)
+        person = run["targets"][TARGET]["assignments"]["review"]["actual_identity"]
+        finding = dict(raw(), finder=person)
+        run = self.receive(run, dict(report(findings=[finding]), reviewer=person))
+        run = workflow.apply_event(run, event("assignment", assignment("vet", MODEL_B, "vet", finding_ids=[finding["id"]])))
+        run = workflow.apply_event(run, event("started", start("vet", MODEL_B)))
+        vetter = run["targets"][TARGET]["assignments"]["vet"]["actual_identity"]
+        run = self.receive(run, dict(report("vet", verdicts=[vet(verdict="UNVERIFIABLE")]), reviewer=vetter), "vet")
+        run = workflow.apply_event(run, event("recover", self.request(run, "follow-up", "vet", "focused")))
+        task = workflow.contract.dispatch_task(run, TARGET, "focused", DispatchGateTests().capacity())
+        self.assertEqual(task["dispatch"]["action"], "follow-up")
+        self.assertEqual(task["runtime_handle"], "vet-handle")
+        run = workflow.apply_event(run, event("started", dict(start("focused", MODEL_B), runtime_handle="vet-handle")))
+        self.assertEqual(run["targets"][TARGET]["findings"][finding["id"]], finding)
+
+    def test_metered_recovery_keeps_fresh_spawn_unknown_outcome_and_live_caps(self):
+        run = self.outcome(self.metered_running(), status="unknown")
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            workflow.apply_event(run, event("recover", self.request(run, "correction", key="correct")))
+        self.assertEqual(caught.exception.code, "runtime_reconciliation")
+        failed = self.outcome(run)
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            workflow.apply_event(failed, event("recover", self.request(failed)))
+        self.assertEqual(caught.exception.code, "metered_authorization")
+        for cap in ("provider", "family"):
+            with self.subTest(cap=cap):
+                run = self.metered_running(provider_limit=1 if cap == "provider" else 3)
+                person = run["targets"][TARGET]["assignments"]["review"]["actual_identity"]
+                run = self.receive(run, dict(report(status="partial"), reviewer=person))
+                other = copy.deepcopy(run["targets"][TARGET])
+                other["assignments"] = {"busy": dict(other["assignments"]["review"], id="busy", status="running",
+                    runtime_handle="busy-handle", report=None)}
+                run["targets"]["other"] = other
+                if cap == "family":
+                    run["family_limit"] = 1
+                request = self.request(run, "correction", key="correct", capacity=DispatchGateTests().capacity(1, 1))
+                with self.assertRaises(workflow.NeedsDecision) as caught:
+                    workflow.apply_event(run, event("recover", request))
+                self.assertEqual(caught.exception.code, cap + "_capacity")
 
     def test_unvetted_orchestrator_assessment_preserves_missing_independent_stage(self):
         run = self.discovered(findings=[raw()])

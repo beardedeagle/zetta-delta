@@ -261,7 +261,7 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
         replacement = destination / (".scripts-" + uuid.uuid4().hex)
         replacement.symlink_to(release / "scripts", target_is_directory=True)
         backup = None
-        moved = False
+        previous = None
         try:
             if scripts.exists() or scripts.is_symlink():
                 backup = backup_root / str(scripts).lstrip(os.sep)
@@ -271,15 +271,23 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
                 if scripts.is_symlink():
                     backup.symlink_to(scripts.resolve(), target_is_directory=True)
                 else:
-                    scripts.rename(backup)
-                    moved = True
+                    # The configured backup root may be on another filesystem.
+                    # Complete its copy before moving the active local directory.
+                    with tempfile.TemporaryDirectory(prefix=".scripts-backup-", dir=backup.parent) as temporary:
+                        copied = Path(temporary) / "scripts"
+                        shutil.copytree(scripts, copied, symlinks=True)
+                        copied.rename(backup)
+                    previous = destination / (".scripts-previous-" + uuid.uuid4().hex)
+                    scripts.rename(previous)
             replacement.replace(scripts)
         except BaseException:
-            if moved and backup is not None and not scripts.exists():
-                backup.rename(scripts)
+            if previous is not None and previous.exists() and not scripts.exists():
+                previous.rename(scripts)
             raise
         finally:
             replacement.unlink(missing_ok=True)
+        if previous is not None:
+            shutil.rmtree(previous)
         return {"runtime": expected, "changed": True, "release": str(release / "scripts"),
                 "backup": str(backup) if backup is not None else None}
 

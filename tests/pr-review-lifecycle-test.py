@@ -161,6 +161,49 @@ class LifecycleTests(unittest.TestCase):
         exported = workflow.export_findings(self.directory, {"events": [source]})
         self.assertEqual(exported["findings"][0]["finding"], raw)
 
+    def test_pending_launch_blocks_new_mutations_without_invalidating_started(self):
+        run = FIXTURES.WorkflowTests().prepared()
+        run = workflow.apply_event(run, FIXTURES.event("assignment", FIXTURES.assignment()))
+        capacity = {"parent_active": 0, "process_active": 0, "evidence": "Fresh native counts for the issued launch.",
+                    "runtime_parent_root": FIXTURES.FROZEN["parent_root"]}
+        run = workflow.apply_event(run, FIXTURES.event("task-ready", {"assignment_id": "review", "capacity": capacity}))
+        initial = {"method": "pr-review", "intake": FIXTURES.COLLECTION, "registry": FIXTURES.REGISTRY,
+                   "orchestrator": FIXTURES.MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"],
+                   "runtime": workflow.runtime.identity()}
+        path = self.directory / "run.json"
+        workflow.write_json(path, {"version": 1, "initial": initial, "events": run["events"]})
+        original = path.read_bytes()
+        revision = str(run["revision"])
+        commands = [
+            ["runtime-adopt", "--evidence", "Owner approved adoption."],
+            ["waive-stage", "--target", FIXTURES.TARGET, "--stage", "vetting", "--evidence", "Owner waived vetting."],
+            ["resolve-integrity", "--target", FIXTURES.TARGET, "--observation", "0", "--cause", "completed-native-copy", "--evidence", "Inspect bookkeeping."],
+            ["adopt-baseline-policy", "--target", FIXTURES.TARGET, "--root", FIXTURES.FROZEN["parent_root"], "--evidence", "Inspect original policy."],
+        ]
+        for operation in ("runtime-adopt", "stage-waiver", "integrity-resolution", "baseline-policy"):
+            with self.subTest(operation=operation), self.assertRaises(workflow.NeedsDecision) as caught:
+                workflow.apply_event(run, FIXTURES.event(operation, {}))
+            self.assertEqual(caught.exception.code, "runtime_registration")
+        for command in commands:
+            path.write_bytes(original)
+            with self.subTest(command=command[0]), patch.object(workflow, "check_sources", side_effect=AssertionError("pending launch must block before source checks")):
+                code, output, errors = self.cli(*command, "--revision", revision)
+                self.assertEqual((code, errors), (2, ""))
+                self.assertEqual(json.loads(output)["code"], "runtime_registration")
+                self.assertEqual(path.read_bytes(), original)
+        path.write_bytes(original)
+        self.assertEqual(self.cli("status")[0], 0)
+        self.assertEqual(self.cli("export")[0], 0)
+        started = dict(FIXTURES.start(), runtime_root="/native")
+        event = self.directory / "started.json"
+        workflow.write_json(event, FIXTURES.event("started", started))
+        proof = {"root": "/native", "parent_root": FIXTURES.FROZEN["parent_root"], "common_dir": "/native/.git",
+                 "git_dir": "/native/.git", "mode": 493, "ref": None, "head": "a" * 40, "created_dirs": {}, "fingerprint": "b" * 64}
+        with patch.object(workflow.preparation, "capture_runtime_copy", return_value=proof), patch.object(workflow, "check_sources", side_effect=lambda directory, saved, state, **kwargs: state):
+            code, output, errors = self.cli("record", "--event", str(event), "--revision", revision)
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertEqual(workflow.load_run(path)[1]["targets"][FIXTURES.TARGET]["assignments"]["review"]["status"], "running")
+
 
 if __name__ == "__main__":
     unittest.main()

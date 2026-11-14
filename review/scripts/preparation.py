@@ -25,6 +25,8 @@ GIT_METADATA = ("index", "HEAD", "FETCH_HEAD", "config", "config.worktree", "pac
 GENERATED_DIRECTORIES = frozenset({"target", "node_modules", ".venv", "venv", "__pypackages__", ".tox", ".nox",
                                    "__pycache__", ".gradle", "Pods", ".dart_tool"})
 GENERATED_REASON = "build/dependency output (exclusion policy 1)"
+INDEX_DIRECTORIES = frozenset({".codegraph", ".tgrep", ".zvec-grep"})
+INDEX_REASON = "disposable tool index; not reviewed source"
 
 
 class NeedsDecision(ValueError):
@@ -193,24 +195,26 @@ def exclusion_options(ledger: dict) -> tuple[tuple[str, ...], bool]:
     policy = ledger.get("exclusion_policy")
     if policy is None:
         return (), False
-    if (not isinstance(policy, dict) or set(policy) != {"version", "exclude", "generated"}
-            or type(policy["version"]) is not int or policy["version"] != 1 or policy["generated"] is not True
+    if (not isinstance(policy, dict) or not {"version", "exclude", "generated"} <= set(policy)
+            or set(policy) - {"version", "exclude", "generated", "indexes"}
+            or type(policy["version"]) is not int or policy["version"] != 1
+            or type(policy["generated"]) is not bool
+            or "indexes" in policy and policy["indexes"] is not True
+            or not policy["generated"] and policy.get("indexes") is not True
             or not isinstance(policy["exclude"], list)
             or any(not isinstance(path, str) for path in policy["exclude"])
             or policy["exclude"] != sorted(set(policy["exclude"]))):
         raise ValueError("invalid or unsupported baseline exclusion policy")
     for path in policy["exclude"]:
         relative_path(path)
-    return tuple(policy["exclude"]), True
+    return tuple(policy["exclude"]), policy["generated"]
 
 
-def protection_exclusions(exclude: tuple[str, ...], cache_recovery: bool) -> tuple[str, ...]:
-    """Normalize scan exclusions while retaining the owned cache's integrity guard.
+def protection_exclusions(exclude: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate and canonicalize recorded review/output exclusions.
 
     Args:
         exclude (tuple[str, ...]): Requested review/output exclusions.
-        cache_recovery (bool): Retain CodeGraph database/WAL protection and its
-            existing identity-checked shared-memory recovery exception.
 
     Returns:
         tuple[str, ...]: Canonical actual protection exclusions.
@@ -220,12 +224,61 @@ def protection_exclusions(exclude: tuple[str, ...], cache_recovery: bool) -> tup
     """
     for path in exclude:
         relative_path(path)
-    return tuple(sorted(path for path in set(exclude)
-                        if not cache_recovery or path != ".codegraph" and not path.startswith(".codegraph/")))
+    return tuple(sorted(set(exclude)))
+
+
+def disposable_index(path: str, directory: bool, reviewed: tuple[str, ...] = ()) -> bool:
+    """Recognize index content while preserving paths in sealed review evidence.
+
+    Args:
+        path (str): Relative inventory path.
+        directory (bool): Whether the entry is a real directory, not a link.
+        reviewed (tuple[str, ...]): Explicit manifest/inventory paths that remain strict.
+
+    Returns:
+        bool: Whether this entry belongs only to a disposable index.
+    """
+    parts = path.split("/")
+    inside = any(part in INDEX_DIRECTORIES for part in parts[:-1]) or directory and parts[-1] in INDEX_DIRECTORIES
+    return inside and path not in reviewed and not any(name.startswith(path + "/") for name in reviewed)
+
+
+def reviewed_ledger(ledger: dict, reviewed: tuple[str, ...]) -> dict:
+    """Compare authenticated evidence without treating disposable indexes as source.
+
+    Args:
+        ledger (dict): Original or current full ledger, authenticated separately.
+        reviewed (tuple[str, ...]): Explicit sealed source paths that must remain strict.
+
+    Returns:
+        dict: Source, root and Git evidence with only unreviewed index content removed.
+    """
+    result = dict(ledger, files={path: row for path, row in ledger["files"].items()
+                                if not disposable_index(path, row[0] == "directory", reviewed)})
+    result.pop("cache_identity", None)
+    if "nested" in result.get("git", {}):
+        metadata = dict(result["git"])
+        nested = {path: row for path, row in metadata["nested"].items()
+                  if not disposable_index(path, True, reviewed)}
+        if nested:
+            metadata["nested"] = nested
+        else:
+            metadata.pop("nested")
+        result["git"] = metadata
+    if "exclusion_policy" in result:
+        policy = dict(result["exclusion_policy"])
+        policy.pop("indexes", None)
+        policy["exclude"] = [path for path in policy["exclude"] if not disposable_index(path, True, reviewed)]
+        if not policy["generated"] and not policy["exclude"]:
+            result.pop("exclusion_policy")
+        else:
+            result["exclusion_policy"] = policy
+    return result
 
 
 def files(root: Path, exclude: tuple[str, ...] = (), *, nested_git: list[Path] | None = None,
-          exclude_generated: bool = False) -> dict:
+          exclude_generated: bool = False, exclude_indexes: bool = False,
+          reviewed: tuple[str, ...] = ()) -> dict:
     """Inventory all content, including ignored files, without following symlinks.
 
     Args:
@@ -235,6 +288,8 @@ def files(root: Path, exclude: tuple[str, ...] = (), *, nested_git: list[Path] |
             the Git metadata owner; never traverse their administrative stores.
         exclude_generated (bool): Prune generated directories under policy 1;
             false preserves existing full-content ledger semantics.
+        exclude_indexes (bool): Prune disposable index content before hashing.
+        reviewed (tuple[str, ...]): Explicit source paths never hidden by index pruning.
 
     Returns:
         dict: Sorted paths bound to kind, permissions and content digest/link target.
@@ -256,6 +311,8 @@ def files(root: Path, exclude: tuple[str, ...] = (), *, nested_git: list[Path] |
             if str(path.relative_to(root)) in exclude:
                 continue
             info = path.lstat()
+            if exclude_indexes and disposable_index(str(path.relative_to(root)), stat.S_ISDIR(info.st_mode), reviewed):
+                continue
             if exclude_generated and stat.S_ISDIR(info.st_mode) and generated_directory(path):
                 continue
             key = str(path.relative_to(root))
@@ -301,7 +358,8 @@ def fingerprint(value: dict) -> str:
 
 
 def project_inventory(root: Path, exclusions: dict[str, str] | None = None,
-                      destination: Path | None = None, *, exclude_generated: bool = False) -> dict:
+                      destination: Path | None = None, *, exclude_generated: bool = False,
+                      exclude_indexes: bool = False, reviewed: tuple[str, ...] = ()) -> dict:
     """Inventory current bytes without following links or opening special files.
 
     Args:
@@ -310,6 +368,8 @@ def project_inventory(root: Path, exclusions: dict[str, str] | None = None,
         destination (Path | None): New private copy root, or None for observation.
         exclude_generated (bool): Prune generated directories before traversal;
             false preserves legacy manifests and frozen source checks.
+        exclude_indexes (bool): Prune disposable index entries before copying or hashing.
+        reviewed (tuple[str, ...]): Explicit sealed paths that remain source evidence.
 
     Returns:
         dict: Included entries, explicit exclusions and unsupported-entry gaps.
@@ -328,6 +388,8 @@ def project_inventory(root: Path, exclusions: dict[str, str] | None = None,
     def excluded(relative: str, directory: bool = False) -> str | None:
         if any(part.casefold() == ".git" for part in relative.split("/")):
             return "Git metadata"
+        if exclude_indexes and disposable_index(relative, directory, reviewed):
+            return INDEX_REASON
         explicit = next((reason for path, reason in exclusions.items()
                          if relative == path or relative.startswith(path + "/")), None)
         if explicit is not None:
@@ -464,7 +526,8 @@ def recover_cache(before: dict, current: dict, root: str) -> tuple[dict, list[di
 
 
 def project_baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies: tuple[dict, ...] = (),
-                     cache_recovery: bool = False, exclude_generated: bool = False) -> dict:
+                     cache_recovery: bool = False, exclude_generated: bool = False,
+                     exclude_indexes: bool = False, reviewed: tuple[str, ...] = ()) -> dict:
     """Protect filesystem content and any existing Git administration separately.
 
     Args:
@@ -475,6 +538,8 @@ def project_baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies
             SHM metadata; default keeps legacy and reviewed-cache baselines strict.
         exclude_generated (bool): Apply and record policy 1. Legacy ledgers and
             frozen sources retain full-content semantics when false.
+        exclude_indexes (bool): Prune disposable indexes independently of cache recovery.
+        reviewed (tuple[str, ...]): Explicit sealed paths that remain strictly checked.
 
     Returns:
         dict: Baseline with the existing file/Git ledger shape and root identity.
@@ -483,13 +548,13 @@ def project_baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies
         OSError: Source content or administration is unreadable.
         ValueError: Source or nested Git ownership is invalid.
     """
-    exclude = protection_exclusions(exclude, cache_recovery)
+    exclude = protection_exclusions(exclude)
     copies = [row for row in native_copies if Path(row["root"]).is_relative_to(root)]
     native_roots = [str(Path(row["root"]).relative_to(root)) for row in copies]
     native_roots += [str(Path(row["git_dir"]).relative_to(root)) for row in native_copies
                      if "clone_store" in row and Path(row["git_dir"]).is_relative_to(root)]
     inventory = project_inventory(root, dict.fromkeys((*exclude, *native_roots), "owned runtime/cache path"),
-                                  exclude_generated=exclude_generated)
+                                  exclude_generated=exclude_generated, exclude_indexes=exclude_indexes, reviewed=reviewed)
     ledger = {}
     for name, row in {**inventory["entries"], **inventory["gaps"]}.items():
         kind, mode = row["kind"], row["mode"]
@@ -517,9 +582,10 @@ def project_baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies
     info = root.stat()
     result = {"files": dict(sorted(ledger.items())), "git": metadata,
               "root_identity": [info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)]}
-    if exclude_generated:
-        result["exclusion_policy"] = {"version": 1, "exclude": sorted(set(exclude)), "generated": True}
-    if cache_recovery and (identities := cache_identity(root)):
+    if exclude_generated or exclude_indexes:
+        result["exclusion_policy"] = {"version": 1, "exclude": sorted(set(exclude)), "generated": exclude_generated,
+                                      **({"indexes": True} if exclude_indexes else {})}
+    if cache_recovery and not exclude_indexes and (identities := cache_identity(root)):
         result["cache_identity"] = identities
     return result
 
@@ -551,18 +617,18 @@ def prepare_project(directory: Path, run_id: str, key: str, target: dict, parent
     exclusions = {row["path"]: row["reason"] for row in target["project"]["exclusions"]}
     cache_recovery = any(name in exclusions for name in (".codegraph", ".codegraph/codegraph.db-shm"))
     before = project_baseline(parent, tuple(exclusions), native_copies=native_copies,
-                              cache_recovery=cache_recovery, exclude_generated=True)
+                              cache_recovery=cache_recovery, exclude_generated=True, exclude_indexes=True)
     resource = directory / ("snapshot-" + uuid.uuid4().hex)
     resource.mkdir(mode=0o700)
     save(resource / "owner.json", {"run_id": run_id, "target": key, "resource": resource.name})
     try:
         source = resource / "source"
         source.mkdir(mode=0o700)
-        manifest = project_inventory(parent, exclusions, source, exclude_generated=True)
+        manifest = project_inventory(parent, exclusions, source, exclude_generated=True, exclude_indexes=True)
         after = project_baseline(parent, tuple(exclusions), native_copies=native_copies,
-                                 cache_recovery=cache_recovery, exclude_generated=True)
+                                 cache_recovery=cache_recovery, exclude_generated=True, exclude_indexes=True)
         if (before != recover_cache(before, after, str(parent))[0]
-                or manifest != project_inventory(parent, exclusions, exclude_generated=True)):
+                or manifest != project_inventory(parent, exclusions, exclude_generated=True, exclude_indexes=True)):
             raise NeedsDecision("source_integrity", "project changed during capture; preserve it and create a new run")
         copied = project_inventory(source)
         if copied["entries"] != manifest["entries"] or copied["gaps"] or copied["excluded"]:
@@ -735,6 +801,12 @@ def git_metadata(root: Path, native_copies: tuple[dict, ...] = (), *, allow_unbo
                    if copy["ref"] and copy["common_dir"] == shared}
     native_refs.update({os.fsencode(copy["clone_store"]["ref"]): os.fsencode(copy["head"])
                         for copy in native_copies if "clone_store" in copy and copy["clone_store"]["ref_store"] == shared})
+    native_ref_failures = {}
+    if native_refs:
+        actual_refs = {name: value.rstrip(b"\n") for line in refs.splitlines(keepends=True)
+                       for name, _, value in (line.partition(b"\0"),)}
+        native_ref_failures = {os.fsdecode(name): os.fsdecode(actual_refs[name]) if name in actual_refs else None
+                               for name, expected in native_refs.items() if actual_refs.get(name) != expected}
     refs = b"".join(line for line in refs.splitlines(keepends=True)
                     if native_refs.get(line.partition(b"\0")[0]) != line.partition(b"\0")[2].rstrip(b"\n"))
     try:
@@ -747,6 +819,9 @@ def git_metadata(root: Path, native_copies: tuple[dict, ...] = (), *, allow_unbo
             raise ValueError("project HEAD is neither a commit nor an unborn branch") from None
         head = None
     metadata = {"head": head, "refs": hashlib.sha256(refs).hexdigest()}
+    if native_ref_failures:
+        # A missing pin otherwise hashes like the pre-launch ref set after normalization.
+        metadata["native_ref_failures"] = native_ref_failures
     if any(copy["root"] == str(root) for copy in native_copies):
         metadata["native_root"] = [stat.S_IMODE(root.stat().st_mode), shared or common_dir(root),
                                    str(Path(os.fsdecode(git(root, "rev-parse", "--absolute-git-dir").rstrip(b"\n"))).resolve()),
@@ -827,7 +902,8 @@ def nested_git_metadata(root: Path, stores: set[Path], projects: list[Path], nat
 
 
 def baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies: tuple[dict, ...] = (),
-             exclude_generated: bool = False) -> dict:
+             exclude_generated: bool = False, exclude_indexes: bool = False,
+             reviewed: tuple[str, ...] = ()) -> dict:
     """Capture work content and Git state without refreshing the source index.
 
     Args:
@@ -837,6 +913,8 @@ def baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies: tuple[
             only exact new checkout roots, containers and pinned refs are normalized.
         exclude_generated (bool): Apply and record generated-output policy 1;
             false preserves legacy full-content fingerprint semantics.
+        exclude_indexes (bool): Prune disposable tool indexes before hashing.
+        reviewed (tuple[str, ...]): Explicit source paths retained under index pruning.
 
     Returns:
         dict: File ledger and hashed index/config/ref metadata.
@@ -857,7 +935,8 @@ def baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies: tuple[
     native_roots += tuple(str(Path(copy["git_dir"]).relative_to(root)) for copy in native_copies
                           if "clone_store" in copy and Path(copy["git_dir"]).is_relative_to(root))
     nested = []
-    ledger = files(root, exclude + native_roots, nested_git=nested, exclude_generated=exclude_generated)
+    ledger = files(root, exclude + native_roots, nested_git=nested, exclude_generated=exclude_generated,
+                   exclude_indexes=exclude_indexes, reviewed=reviewed)
     for copy in copies:
         for path, expected in copy["created_dirs"].items():
             absolute = Path(copy.get("project_root", copy["parent_root"])) / path
@@ -875,8 +954,9 @@ def baseline(root: Path, exclude: tuple[str, ...] = (), *, native_copies: tuple[
             stores.add(Path(captured["common_dir"]))
             projects.append(checkout)
     result = {"files": ledger, "git": metadata}
-    if exclude_generated:
-        result["exclusion_policy"] = {"version": 1, "exclude": sorted(set(exclude)), "generated": True}
+    if exclude_generated or exclude_indexes:
+        result["exclusion_policy"] = {"version": 1, "exclude": sorted(set(exclude)), "generated": exclude_generated,
+                                      **({"indexes": True} if exclude_indexes else {})}
     return result
 
 
@@ -975,7 +1055,9 @@ def capture_runtime_copy(directory: Path, run_id: str, key: str, frozen: dict, r
             raise NeedsDecision("runtime_copy", "native parent pin does not match the checkout commit")
         copy["clone_store"]["fingerprint"] = fingerprint(captured_store)
     copy["exclude_generated"] = True
-    captured = baseline(root, native_copies=(*native_copies, copy), exclude_generated=True)
+    copy["exclude_indexes"] = True
+    captured = baseline(root, native_copies=(*native_copies, copy), exclude_generated=True, exclude_indexes=True,
+                        reviewed=tuple(frozen.get("manifest", {}).get("entries", frozen.get("inventory", ()))))
     if (captured["git"]["head"] != copy["head"]
             or captured["git"]["native_root"] != [copy["mode"], store, copy["git_dir"], False]):
         raise NeedsDecision("runtime_copy", "native checkout changed while its ownership evidence was captured")
@@ -984,7 +1066,8 @@ def capture_runtime_copy(directory: Path, run_id: str, key: str, frozen: dict, r
 
 
 def capture_baseline(directory: Path, key: str, root: Path, native_copies: tuple[dict, ...], *, filesystem: bool = False,
-                     cache_recovery: bool = False, exclude: tuple[str, ...] = (), exclude_generated: bool = False) -> dict:
+                     cache_recovery: bool = False, exclude: tuple[str, ...] = (), exclude_generated: bool = False,
+                     reviewed: tuple[str, ...] = ()) -> dict:
     """Keep a compact baseline reference and private ledger for native bookkeeping.
 
     Args:
@@ -996,6 +1079,7 @@ def capture_baseline(directory: Path, key: str, root: Path, native_copies: tuple
         cache_recovery (bool): Retain identities for an explicitly excluded SHM file.
         exclude (tuple[str, ...]): Explicit paths retained in the baseline record.
         exclude_generated (bool): Apply policy 1 and retain that choice for rechecks.
+        reviewed (tuple[str, ...]): Explicit source paths retained under index pruning.
 
     Returns:
         dict: Root/fingerprint and generated ledger filename/checksum.
@@ -1007,10 +1091,11 @@ def capture_baseline(directory: Path, key: str, root: Path, native_copies: tuple
     """
     if directory == root or root in directory.parents:
         raise ValueError("run and baseline checkout must be separate")
-    exclude = protection_exclusions(exclude, cache_recovery if filesystem else False)
+    exclude = protection_exclusions(exclude)
     ledger = (project_baseline(root, exclude, native_copies=native_copies, cache_recovery=cache_recovery,
-                               exclude_generated=exclude_generated) if filesystem
-              else baseline(root, exclude, native_copies=native_copies, exclude_generated=exclude_generated))
+                               exclude_generated=exclude_generated, exclude_indexes=True, reviewed=reviewed) if filesystem
+              else baseline(root, exclude, native_copies=native_copies, exclude_generated=exclude_generated,
+                            exclude_indexes=True, reviewed=reviewed))
     path = directory / ("baseline-" + uuid.uuid4().hex + ".json")
     save(path, ledger)
     result = {"id": key, "root": str(root), "fingerprint": fingerprint(ledger),
@@ -1428,7 +1513,9 @@ def prepare(directory: Path, run_id: str, key: str, target: dict, parent: Path,
             raise ValueError("snapshot does not match the frozen commit")
         inventory = artifacts(resource, source, diff_base, right, staged)
         after = baseline(parent, native_copies=native_copies)
-        if before != after or (not live and resolve(parent, right_ref) != baseline_head):
+        reviewed = tuple(inventory)
+        if (reviewed_ledger(before, reviewed) != reviewed_ledger(after, reviewed)
+                or (not live and resolve(parent, right_ref) != baseline_head)):
             raise NeedsDecision("source_integrity", "source changed during preparation; preserve user work and create a new run")
         source_baseline = baseline(source)
         save(resource / "parent-baseline.json", before)
@@ -1451,7 +1538,8 @@ def prepare(directory: Path, run_id: str, key: str, target: dict, parent: Path,
 def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
           setup: dict | None = None, observations: dict | None = None,
           native_copies: tuple[dict, ...] = (), active_native_roots: tuple[str, ...] | None = None,
-          legacy_policies: dict[str, dict] | None = None) -> dict:
+          legacy_policies: dict[str, dict] | None = None,
+          reviewed_paths: dict[str, tuple[str, ...]] | None = None) -> dict:
     """Compare source, parent, artifacts and participating-copy baselines.
 
     Args:
@@ -1471,6 +1559,8 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
         legacy_policies (dict[str, dict] | None): Explicitly adopted protection
             policies keyed by root and bound to an immutable original fingerprint.
             They may reproduce an old unversioned parent/copy ledger, never replace it.
+        reviewed_paths (dict[str, tuple[str, ...]] | None): Explicit source paths
+            keyed by baseline:<name> or native:<root> for each evidence owner.
 
     Returns:
         dict: Actual integrity status and changed/unreadable components.
@@ -1478,8 +1568,10 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
     problems = []
     cache_changes = []
     scans = observations if observations is not None else {}
+    reviewed = tuple(frozen.get("manifest", {}).get("entries", frozen.get("inventory", ())))
     def observe(root: str, exclude: tuple[str, ...] = (), *, native: bool = True, project: bool = False,
-                expected: dict | None = None, exclude_generated: bool = False) -> str:
+                expected: dict | None = None, exclude_generated: bool = False,
+                exclude_indexes: bool = False, strict_paths: tuple[str, ...] | None = None) -> str:
         """Reuse a full-content scan within this observation command.
 
         Args:
@@ -1488,9 +1580,14 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             native (bool): Normalize validated parent/copy bookkeeping; frozen
                 source observations always disable these exceptions.
             project (bool): Use a filesystem baseline without requiring Git.
-            expected (dict | None): Verified original ledger for audited SHM recovery.
+            expected (dict | None): Authenticated original ledger for comparison
+                of source evidence while ignoring disposable index content.
             exclude_generated (bool): Recorded generated-output semantics for a
                 native copy without a separately stored baseline ledger.
+            exclude_indexes (bool): Recorded index policy for an opaque native copy;
+                original artifact-backed ledgers compare their actual reviewed paths.
+            strict_paths (tuple[str, ...] | None): Owning target's explicit source
+                paths; None uses this check's frozen target.
 
         Returns:
             str: Content and Git metadata fingerprint.
@@ -1518,12 +1615,17 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             exclude_generated = legacy["exclude_generated"]
         if expected is not None and "exclusion_policy" in expected:
             exclude, exclude_generated = exclusion_options(expected)
-        key = (root, exclude, fingerprint({"native_copies": copies}), project, recover, exclude_generated, legacy is not None)
+        exclude_indexes = exclude_indexes or expected is not None
+        strict_paths = reviewed if strict_paths is None else strict_paths
+        key = (root, exclude, fingerprint({"native_copies": copies}), project, recover,
+               exclude_generated, exclude_indexes, strict_paths, legacy is not None)
         if key not in scans:
             try:
                 scans[key] = (project_baseline(Path(root), exclude, native_copies=copies, cache_recovery=recover,
-                                             exclude_generated=exclude_generated) if project
-                              else baseline(Path(root), exclude, native_copies=copies, exclude_generated=exclude_generated))
+                                             exclude_generated=exclude_generated,
+                                             exclude_indexes=exclude_indexes, reviewed=strict_paths) if project
+                              else baseline(Path(root), exclude, native_copies=copies, exclude_generated=exclude_generated,
+                                            exclude_indexes=exclude_indexes, reviewed=strict_paths))
             except (OSError, ValueError, KeyError, TypeError):
                 scans[key] = None
         if scans[key] is None:
@@ -1531,11 +1633,10 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
         current = scans[key]
         if legacy is not None:
             current = {name: value for name, value in current.items() if name != "exclusion_policy"}
-        if recover and expected is not None:
-            current, changes = recover_cache(expected, current, root)
-            for change in changes:
-                if change not in cache_changes:
-                    cache_changes.append(change)
+        if expected is not None:
+            current = reviewed_ledger(current, strict_paths)
+            if current == reviewed_ledger(expected, strict_paths):
+                return fingerprint(expected)
         return fingerprint(current)
 
     component = "unreadable or unowned preparation evidence"
@@ -1569,10 +1670,15 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                 for cache in setup["cache_paths"]:
                     if (source / cache).is_symlink():
                         raise ValueError("index cache was redirected")
+            baseline_name = ("final-source-baseline.json" if name == "source" and
+                             "final-source-baseline.json" in proof["artifacts"] else name + "-baseline.json")
+            expected = json.loads((resource / baseline_name).read_text())
+            if fingerprint(expected) != frozen[name + "_fingerprint"]:
+                raise ValueError("original baseline differs from its recorded fingerprint")
             current = observe(frozen[name + "_root"],
                               tuple(setup["cache_paths"]) if name == "source" and setup else (),
                               native=name != "source", project=project,
-                              expected=json.loads((resource / (name + "-baseline.json")).read_text()) if project else None)
+                              expected=expected)
             if current != frozen[name + "_fingerprint"]:
                 problems.append(name)
         for name, record in baselines.items():
@@ -1581,13 +1687,16 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             if "artifact" in record:
                 expected = read_baseline(directory, record)
             if observe(record["root"], tuple(record.get("exclude", ())), project=record.get("filesystem", False),
-                       expected=expected, exclude_generated=record.get("exclude_generated", False)) != record["fingerprint"]:
+                       expected=expected, exclude_generated=record.get("exclude_generated", False),
+                       strict_paths=(reviewed_paths or {}).get("baseline:" + name, reviewed)) != record["fingerprint"]:
                 problems.append("copy:" + name)
         for record in native_copies:
             if active_native_roots is not None and record["root"] not in active_native_roots:
                 continue
             component = "native:" + record["root"]
-            if observe(record["root"], exclude_generated=record.get("exclude_generated", False)) != record["fingerprint"]:
+            if observe(record["root"], exclude_generated=record.get("exclude_generated", False),
+                       exclude_indexes=record.get("exclude_indexes", False),
+                       strict_paths=(reviewed_paths or {}).get("native:" + record["root"], reviewed)) != record["fingerprint"]:
                 problems.append(component)
             if "clone_store" in record:
                 component = "native-store:" + record["git_dir"]
@@ -1763,12 +1872,13 @@ def finalize(directory: Path, run_id: str, key: str, staged: dict, request: dict
             raise NeedsDecision("index_fallback", "choose static evidence for failed/unavailable indexes: " + ", ".join(unavailable))
         if fallback and (not isinstance(evidence, str) or not evidence.strip() or "\0" in evidence):
             raise ValueError("static fallback requires evidence of adequate source inspection")
-        current = project_baseline(source) if staged["mode"] == "project" else baseline(source)
-        original_content = dict(current, files={
-            path: value for path, value in current["files"].items()
-            if not any(path == cache or path.startswith(cache + "/") for cache in (request or {}).get("cache_paths", []))})
+        reviewed = tuple(staged.get("manifest", {}).get("entries", staged.get("inventory", ())))
+        current = (project_baseline(source, exclude_indexes=True, reviewed=reviewed)
+                   if staged["mode"] == "project" else baseline(source, exclude_indexes=True, reviewed=reviewed))
         observation = check(directory, run_id, key, staged, baselines or {}, setup=request, native_copies=native_copies)
-        if fingerprint(original_content) != staged["source_fingerprint"]:
+        original = json.loads((resource / "source-baseline.json").read_text())
+        source_changed = reviewed_ledger(current, reviewed) != reviewed_ledger(original, reviewed)
+        if source_changed:
             observation = {"status": "changed", "components": list(dict.fromkeys(observation["components"] + ["source"]))}
         if observation["status"] != "unchanged":
             raise NeedsDecision("source_integrity", "source/parent/artifacts changed while sealing setup; preserve evidence and create a new run", observation)

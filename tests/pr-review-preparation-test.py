@@ -135,6 +135,29 @@ class GitFixture(unittest.TestCase):
 
 
 class PreparationTests(GitFixture):
+    def test_capture_ignores_disposable_index_churn_but_retains_reviewed_index_paths(self):
+        cache = self.parent / ".codegraph"
+        cache.mkdir()
+        reviewed = cache / "source.py"
+        reviewed.write_text("reviewed source\n")
+        self.commit("review source under index-looking path")
+        capture = preparation.artifacts
+        def index_churn(*args, **kwargs):
+            inventory = capture(*args, **kwargs)
+            (cache / "index").write_text("rebuilt index\n")
+            return inventory
+        with patch.object(preparation, "artifacts", side_effect=index_churn):
+            frozen = self.prepare()
+        self.assertIn(".codegraph/source.py", frozen["inventory"])
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
+        def source_churn(*args, **kwargs):
+            inventory = capture(*args, **kwargs)
+            reviewed.write_text("changed reviewed source\n")
+            return inventory
+        with patch.object(preparation, "artifacts", side_effect=source_churn), self.assertRaises(preparation.NeedsDecision) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.code, "source_integrity")
+
     def test_setup_and_finalize_keep_registered_native_administration_and_copy_guards(self):
         first = self.prepare()
         child, _, _ = self.native_clone()
@@ -248,7 +271,7 @@ class PreparationTests(GitFixture):
         with patch.object(preparation, "git", side_effect=guarded), self.assertRaises(preparation.NeedsDecision):
             preparation.baseline(self.parent)
 
-    def test_known_codegraph_socket_is_fingerprinted_without_cache_exemptions(self):
+    def test_raw_socket_ledger_stays_strict_while_disposable_index_checks_ignore_churn(self):
         temporary = tempfile.TemporaryDirectory(prefix="review-socket-", dir="/tmp")
         self.addCleanup(temporary.cleanup)
         short = Path(temporary.name).resolve() / "checkout"
@@ -277,7 +300,7 @@ class PreparationTests(GitFixture):
         frozen = self.prepare()
         self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
         (cache / "unexpected-index-write").write_text("unexpected writer\n")
-        self.assertIn("parent", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
         (cache / "unexpected-index-write").unlink()
         with patch.object(preparation.os, "getuid", return_value=os.getuid() + 1), self.assertRaises(preparation.NeedsDecision):
             preparation.baseline(short)
@@ -292,7 +315,7 @@ class PreparationTests(GitFixture):
         replacement.bind(str(path))
         path.chmod(0o600)
         self.assertNotEqual(preparation.baseline(short), before)
-        self.assertIn("parent", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
         path.rename(cache / "unknown-socket")
         with self.assertRaises(preparation.NeedsDecision):
             preparation.baseline(short)
@@ -388,6 +411,10 @@ class PreparationTests(GitFixture):
         self.assertEqual(check()["status"], "unchanged")
         self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {},
                                           native_copies=copies)["status"], "unknown")
+        self.git("update-ref", "-d", completed_pin)
+        self.assertNotEqual(check()["status"], "unchanged")
+        self.git("update-ref", completed_pin, self.head)
+        self.assertEqual(check()["status"], "unchanged")
         self.git("update-ref", completed_pin, self.left)
         self.assertNotEqual(check()["status"], "unchanged")
         self.git("update-ref", completed_pin, self.head)
@@ -416,6 +443,44 @@ class PreparationTests(GitFixture):
                                               native_copies=(proof,))["status"], "unchanged")
         self.assertIn("nested/target/artifact", preparation.files(child))
 
+    def test_native_index_policy_preserves_reviewed_paths_and_foreign_owner_bindings(self):
+        cache = self.parent / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("reviewed source\n")
+        self.commit("explicit cache-looking source")
+        self.head = self.git("rev-parse", "HEAD")
+        frozen = self.prepare()
+        self.assertIn(".codegraph/source.py", frozen["inventory"])
+        child, _, _ = self.native_clone()
+        proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", frozen, child, ())
+        self.assertTrue(proof["exclude_indexes"])
+        (child / ".tgrep").mkdir()
+        (child / ".tgrep/index").write_text("disposable index\n")
+        other = dict(frozen, inventory=[name for name in frozen["inventory"] if name != ".codegraph/source.py"])
+        owners = {"native:" + str(child): tuple(frozen["inventory"])}
+        check = lambda: preparation.check(self.directory, "run-fixture", "local", other, {},
+                                         native_copies=(proof,), reviewed_paths=owners)
+        self.assertEqual(check()["status"], "unchanged")
+        (child / ".tgrep/index").write_text("rebuilt disposable index\n")
+        self.assertEqual(check()["status"], "unchanged")
+        (child / ".codegraph/source.py").write_text("changed reviewed source\n")
+        self.assertIn("native:" + str(child), check()["components"])
+
+    def test_opaque_legacy_native_proofs_remain_strict_without_index_policy_flag(self):
+        frozen = self.prepare()
+        child, _, _ = self.native_clone()
+        cache = child / ".tgrep"
+        cache.mkdir()
+        (cache / "index").write_text("old captured index\n")
+        proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", frozen, child, ())
+        proof.pop("exclude_indexes")
+        proof["fingerprint"] = preparation.fingerprint(preparation.baseline(
+            child, native_copies=(proof,), exclude_generated=True))
+        check = lambda: preparation.check(self.directory, "run-fixture", "local", frozen, {}, native_copies=(proof,))
+        self.assertEqual(check()["status"], "unchanged")
+        (cache / "index").write_text("changed opaque legacy index\n")
+        self.assertIn("native:" + str(child), check()["components"])
+
     def test_native_clone_cannot_exempt_a_preexisting_git_store(self):
         child, store, _ = self.native_clone()
         shutil.rmtree(child)
@@ -439,6 +504,8 @@ class PreparationTests(GitFixture):
         cache = source / ".tgrep"
         cache.mkdir()
         (cache / "index.bin").write_bytes(b"late startup cache")
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
+        (source / "feature.txt").write_text("changed reviewed source\n")
         self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
 
     def test_native_bookkeeping_is_exact_and_keeps_parent_source_and_copy_guards(self):
@@ -970,7 +1037,8 @@ class PreparationTests(GitFixture):
     def test_command_local_scans_reuse_content_and_detect_changes_on_the_next_command(self):
         frozen = self.prepare()
         observations = {}
-        copies = {"parent-copy": {"root": str(self.parent), "fingerprint": frozen["parent_fingerprint"]}}
+        copies = {"parent-copy": preparation.capture_baseline(self.directory, "parent-copy", self.parent, (),
+                                                              reviewed=tuple(frozen["inventory"]))}
         with patch.object(preparation, "baseline", wraps=preparation.baseline) as baseline:
             for _ in range(2):
                 self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, copies,
@@ -1051,6 +1119,21 @@ class SealedSnapshotTests(GitFixture):
     def finalize(self, request=None, fallback=(), evidence=None):
         return preparation.finalize(self.directory, "run-fixture", "local", self.staged, request, list(fallback), evidence)
 
+    def test_sealing_retains_explicit_inventory_paths_under_index_directories(self):
+        cache = self.parent / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("reviewed source\n")
+        self.commit("review source under index-looking path")
+        self.staged = self.prepare()
+        self.source = Path(self.staged["source_root"])
+        (self.source / ".codegraph/index").write_text("disposable index\n")
+        frozen = self.finalize()
+        ledger = json.loads((self.resource(frozen) / "final-source-baseline.json").read_text())
+        self.assertIn(".codegraph/source.py", ledger["files"])
+        self.assertNotIn(".codegraph/index", ledger["files"])
+        (self.source / ".codegraph/source.py").write_text("changed reviewed source\n")
+        self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
+
     def test_sealing_suppresses_native_hook_writers_and_preserves_setup_and_test_copies(self):
         session = {"cwd": str(self.source), "hook_event_name": "SessionStart"}
         self.assertEqual(self.helper.selection(session), (self.source, list(self.helper.TOOLS)))
@@ -1078,6 +1161,8 @@ class SealedSnapshotTests(GitFixture):
         test_root = preparation.test_copy(self.directory, "run-fixture", "local", frozen)
         self.assertEqual(self.helper.selection(dict(session, cwd=str(test_root))), (test_root, list(self.helper.TOOLS)))
         (self.source / ".tgrep/index").write_text("unexpected writer\n")
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
+        (self.source / "feature.txt").write_text("changed reviewed source\n")
         self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
 
     def test_finalization_wins_a_hook_waiting_for_the_foreground_lock(self):
@@ -1229,7 +1314,7 @@ class IndexPreparationTests(GitFixture):
             self.assertEqual(caught.exception.code, "index_setup_pending")
         self.assertTrue(self.source.exists())
 
-    def test_completed_setup_retains_original_evidence_and_seals_cache_baseline(self):
+    def test_completed_setup_retains_original_evidence_and_seals_reviewed_source(self):
         original = (self.resource(self.staged) / "source-baseline.json").read_bytes()
         preparation.run_setup(self.staged, self.request)
         frozen = self.finalize()
@@ -1237,9 +1322,11 @@ class IndexPreparationTests(GitFixture):
         self.assertEqual((self.resource(self.staged) / "source-baseline.json").read_bytes(), original)
         self.assertEqual(frozen["head_sha"], self.staged["head_sha"])
         final = json.loads((self.resource(frozen) / "final-source-baseline.json").read_text())
-        self.assertIn(".zvec-grep/index", final["files"])
+        self.assertNotIn(".zvec-grep/index", final["files"])
         self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
         (self.source / ".zvec-grep/index").write_text("late index write\n")
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {})["status"], "unchanged")
+        (self.source / "feature.txt").write_text("changed reviewed source\n")
         self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
 
     def test_setup_never_accepts_code_parent_or_patch_changes(self):

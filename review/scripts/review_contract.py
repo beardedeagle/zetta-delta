@@ -1066,10 +1066,10 @@ def recovery(run: dict, target: dict, data: dict, *, replay: bool = False) -> di
             request["unit_id"] = key
     if row["identity"]["lane"] in run["unavailable_lanes"]:
         raise NeedsDecision("unavailable_lane", "this effective lane is unavailable for the run; use a verified same-model retry route or retain incomplete work")
+    row["recovery"] = request
     native_capacity(run, data["capacity"], reserve_queued=False)
     if not replay:
         provider_capacity(run, target, row)
-    row["recovery"] = request
     return row
 
 

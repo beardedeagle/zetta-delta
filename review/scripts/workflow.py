@@ -788,6 +788,8 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         NeedsDecision: Required evidence, authorization or integrity is missing.
     """
     fields(event, ("target", "operation", "data"))
+    if not replay and event["operation"] in ("runtime-adopt", "stage-waiver", "integrity-resolution", "baseline-policy"):
+        require_registered_launch(run)
     result = copy.deepcopy(run)
     if event["operation"] == "runtime-adopt":
         data = fields(event["data"], ("before", "after", "evidence"))
@@ -897,7 +899,15 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         target["setup" if operation == "prepare" else "frozen"] = copy.deepcopy(data)
         target["phase"] = "setup" if operation == "prepare" else "prepared"
         if operation == "prepare" and "project" in target:
-            omissions = {**data["manifest"]["gaps"], **{path: {"reason": reason} for path, reason in data["manifest"]["excluded"].items() if reason != "Git metadata"}}
+            explicit = tuple(row["path"] for row in target["project"]["exclusions"])
+            omissions = dict(data["manifest"]["gaps"])
+            for path, reason in data["manifest"]["excluded"].items():
+                if reason == "Git metadata":
+                    continue
+                if (reason == preparation.INDEX_REASON and preparation.disposable_index(path, True)
+                        and not any(path == name or path.startswith(name + "/") for name in explicit)):
+                    continue
+                omissions[path] = {"reason": reason}
             for path, row in omissions.items():
                 gap_id = "capture-" + hashlib.sha256(os.fsencode(path)).hexdigest()[:24]
                 target["coverage_gaps"][gap_id] = {"reason": path + ": " + row["reason"], "material": True, "resolution": None}
@@ -1234,9 +1244,11 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         if "runtime_parent_root" in data and "runtime_root" not in data:
             raise ValueError("native parent declaration requires an actual runtime root")
         if "runtime_copy" in data:
-            proof = fields(data["runtime_copy"], ("root", "parent_root", "common_dir", "git_dir", "mode", "ref", "head", "created_dirs", "fingerprint"), ("clone_store", "project_root", "exclude_generated"))
+            proof = fields(data["runtime_copy"], ("root", "parent_root", "common_dir", "git_dir", "mode", "ref", "head", "created_dirs", "fingerprint"), ("clone_store", "project_root", "exclude_generated", "exclude_indexes"))
             if "exclude_generated" in proof and type(proof["exclude_generated"]) is not bool:
                 raise ValueError("native generated-output exclusion must be boolean")
+            if "exclude_indexes" in proof and type(proof["exclude_indexes"]) is not bool:
+                raise ValueError("native index exclusion must be boolean")
             parents = {unit["parent_root"] for item in result["targets"].values()
                        for unit in [item["frozen"] or item["setup"]] if unit is not None}
             parents.update(record["root"] for item in result["targets"].values() for record in item["baselines"].values())
@@ -2547,7 +2559,7 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
 
 def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
                   record_unchanged: bool = True, runtime_copy: dict | None = None,
-                  legacy_policies: dict | None = None) -> dict:
+                  legacy_policies: dict | None = None, runtime_copy_target: str | None = None) -> dict:
     """Persist actual baseline observations before accepting dependent records.
 
     Args:
@@ -2559,6 +2571,7 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
             skips these so it preserves the issued launch approval.
         runtime_copy (dict | None): Validated native-start copy awaiting persistence.
         legacy_policies (dict | None): Explicit migration policies checked before recording.
+        runtime_copy_target (str | None): Owning target of a copy awaiting registration.
 
     Returns:
         dict: State with original integrity observations retained.
@@ -2569,6 +2582,17 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
         OSError: Journal persistence failed.
     """
     observations: dict = {}
+    reviewed_paths: dict[str, tuple[str, ...]] = {}
+    for key, target in run["targets"].items():
+        frozen = target["frozen"] or target["setup"] or {}
+        paths = tuple(frozen.get("manifest", {}).get("entries", frozen.get("inventory", ())))
+        for name in target["baselines"]:
+            reviewed_paths["baseline:" + key + "/" + name] = paths
+        for row in target["assignments"].values():
+            if "runtime_copy" in row:
+                reviewed_paths["native:" + row["runtime_copy"]["root"]] = paths
+        if runtime_copy is not None and key == runtime_copy_target:
+            reviewed_paths["native:" + runtime_copy["root"]] = paths
     baselines = {key + "/" + name: record for key, target in run["targets"].items()
                  for name, record in target["baselines"].items()}
     policies = {root: policy for target in run["targets"].values()
@@ -2584,6 +2608,7 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
                                         setup=target["index_setup"] if target["frozen"] is None else None,
                                         observations=observations, native_copies=runtime_copies(run, runtime_copy),
                                         active_native_roots=active_native_roots(run, runtime_copy),
+                                        reviewed_paths=reviewed_paths,
                                         legacy_policies={root: policy for root, policy in policies.items()
                                                          if root == comparison["parent_root"]
                                                          or any(row.get("filesystem") and row["root"] == root for row in baselines.values())})
@@ -2887,7 +2912,7 @@ def main() -> int:
                         runtime.verify_recorded(run["runtime"])
                     except ValueError as error:
                         raise NeedsDecision("runtime_identity", "runtime differs from the run; inspect changes and explicitly runtime-adopt") from error
-                if args.command not in ("status", "report", "runtime-adopt", "resolve-integrity", "waive-stage", "adopt-baseline-policy"):
+                if args.command not in ("status", "report"):
                     settling = ((event["target"], event["data"].get("assignment_id")) if event is not None
                                 and event["operation"] in ("started", "withdraw") and isinstance(event["data"], dict) else None)
                     require_registered_launch(run, settling)
@@ -2957,7 +2982,7 @@ def main() -> int:
                         apply_event(run, event)
                     if event["operation"] in ("batch-wave", "assignment", "recover", "started", "withdraw", "runtime-outcome", "report-input", "report", "adjudication-report", "orchestrator-finding", "complete", "publication-intent"):
                         report_operation = event["operation"] in ("report-input", "report", "adjudication-report")
-                        options = {"runtime_copy": event["data"]["runtime_copy"]} if event["operation"] == "started" and "runtime_copy" in event["data"] else {}
+                        options = {"runtime_copy": event["data"]["runtime_copy"], "runtime_copy_target": event["target"]} if event["operation"] == "started" and "runtime_copy" in event["data"] else {}
                         run = check_sources(directory, saved, run, stop=not (report_operation or event["operation"] in ("runtime-outcome", "withdraw")), **options)
                         if report_operation:
                             target = run["targets"][event["target"]]
@@ -3115,7 +3140,8 @@ def main() -> int:
                         data = preparation.capture_baseline(directory, args.id, root, runtime_copies(run),
                                                             filesystem="project" in target, cache_recovery=cache_recovery,
                                                             exclude=tuple(row["path"] for row in target.get("project", {}).get("exclusions", [])),
-                                                            exclude_generated="project" in target)
+                                                            exclude_generated="project" in target,
+                                                            reviewed=tuple(target["frozen"].get("manifest", {}).get("entries", target["frozen"].get("inventory", ()))))
                         run = append_record(directory, saved, run, key, "baseline", data)
                     elif args.command == "test-copy":
                         if target["frozen"] is None or target["resources_removed"]:

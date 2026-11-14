@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Exercise portable runtime identities and atomic release installation offline."""
 
+import errno
 import importlib.util
 import json
+import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +33,62 @@ class RuntimeTests(unittest.TestCase):
 
     def install(self, **kwargs):
         return runtime.install(self.destination, self.backup, sources={p.name: p for p in self.source.iterdir()}, **kwargs)
+
+    def legacy_scripts(self) -> Path:
+        """Create legacy content with metadata and links that a backup must retain.
+
+        Returns:
+            Path: Existing scripts directory with representative user-owned files.
+        """
+        scripts = self.destination / "scripts"
+        nested = scripts / "nested"
+        nested.mkdir(parents=True)
+        payload = nested / "old.bin"
+        payload.write_bytes(b"legacy runtime\x00\xff\n")
+        payload.chmod(0o640)
+        (scripts / "relative-link").symlink_to("nested/old.bin")
+        os.utime(payload, ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000))
+        nested.chmod(0o750)
+        os.utime(nested, ns=(1_700_000_002_000_000_000, 1_700_000_003_000_000_000))
+        return scripts
+
+    def legacy_record(self, root: Path) -> dict:
+        """Capture retained content, permissions, timestamps and link targets.
+
+        Args:
+            root (Path): Legacy scripts or its completed backup copy.
+
+        Returns:
+            dict: Comparable records for the directory and all its entries.
+        """
+        result = {}
+        for path in (root, *sorted(root.rglob("*"))):
+            info = path.lstat()
+            value = {"mode": stat.S_IMODE(info.st_mode), "mtime_ns": info.st_mtime_ns}
+            if path.is_symlink():
+                value["link"] = os.readlink(path)
+            elif path.is_file():
+                value["bytes"] = path.read_bytes()
+            result[str(path.relative_to(root))] = value
+        return result
+
+    def cross_filesystem_rename(self, source: Path, target: Path) -> Path:
+        """Model an EXDEV boundary between runtime storage and its backup root.
+
+        Args:
+            source (Path): Rename source selected by the installer.
+            target (Path): Requested rename destination.
+
+        Returns:
+            Path: Renamed path for a same-filesystem operation.
+
+        Raises:
+            OSError: The operation crosses the simulated filesystem boundary.
+        """
+        if ((source.is_relative_to(self.destination) and Path(target).is_relative_to(self.backup))
+                or (source.is_relative_to(self.backup) and Path(target).is_relative_to(self.destination))):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(source), str(target))
+        return self.rename(source, target)
 
     def test_identity_is_portable_and_detects_owned_code_and_schema_drift(self):
         original = runtime.identity()
@@ -127,6 +186,61 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((old / "runtime-manifest.json").read_text(), "broken receipt\n")
         with patch.object(runtime, "__file__", str(self.destination / "scripts/runtime.py")):
             self.assertEqual(runtime.identity(), result["runtime"])
+
+    def test_legacy_backup_on_another_filesystem_preserves_content_and_metadata(self):
+        scripts = self.legacy_scripts()
+        expected = self.legacy_record(scripts)
+        self.rename = Path.rename
+        with patch.object(Path, "rename", autospec=True, side_effect=self.cross_filesystem_rename):
+            result = self.install(force=True)
+        self.assertTrue(scripts.is_symlink())
+        backup = Path(result["backup"])
+        self.assertTrue(backup.is_dir())
+        self.assertFalse(backup.is_symlink())
+        self.assertEqual(self.legacy_record(backup), expected)
+        self.assertEqual(list(self.destination.glob(".scripts-previous-*")), [])
+        with patch.object(runtime, "__file__", str(scripts / "runtime.py")):
+            self.assertEqual(runtime.identity(), result["runtime"])
+
+    def test_legacy_backup_copy_failure_leaves_original_active_and_no_partial_backup(self):
+        scripts = self.legacy_scripts()
+        expected = self.legacy_record(scripts)
+        copytree = shutil.copytree
+
+        def incomplete_backup(source, target, *args, **kwargs):
+            result = copytree(source, target, *args, **kwargs)
+            if Path(source) == scripts:
+                raise OSError(errno.ENOSPC, "simulated incomplete backup")
+            return result
+
+        with (patch.object(runtime.shutil, "copytree", side_effect=incomplete_backup),
+              self.assertRaisesRegex(OSError, "incomplete backup")):
+            self.install(force=True)
+        self.assertFalse(scripts.is_symlink())
+        self.assertEqual(self.legacy_record(scripts), expected)
+        self.assertFalse((self.backup / str(scripts).lstrip(os.sep)).exists())
+        self.assertEqual(list(self.backup.rglob(".scripts-backup-*")), [])
+        self.assertEqual(list(self.destination.glob(".scripts-previous-*")), [])
+
+    def test_legacy_switch_failure_restores_local_original_with_cross_filesystem_backup(self):
+        scripts = self.legacy_scripts()
+        expected = self.legacy_record(scripts)
+        self.rename = Path.rename
+        replace = Path.replace
+
+        def failed_switch(source, target):
+            if source.name.startswith(".scripts-") and Path(target) == scripts:
+                raise OSError(errno.EACCES, "simulated runtime switch failure")
+            return replace(source, target)
+
+        with (patch.object(Path, "rename", autospec=True, side_effect=self.cross_filesystem_rename),
+              patch.object(Path, "replace", autospec=True, side_effect=failed_switch),
+              self.assertRaisesRegex(OSError, "switch failure")):
+            self.install(force=True)
+        self.assertFalse(scripts.is_symlink())
+        self.assertEqual(self.legacy_record(scripts), expected)
+        self.assertEqual(self.legacy_record(self.backup / str(scripts).lstrip(os.sep)), expected)
+        self.assertEqual(list(self.destination.glob(".scripts-previous-*")), [])
 
 
 if __name__ == "__main__":
