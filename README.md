@@ -266,6 +266,11 @@ upgrades save a link to the previous release. Restore that backup as
 Let existing review CLI commands finish before that first directory-to-link
 conversion; subsequent release switches preserve already pinned commands.
 
+New managed directories are private regardless of caller umask. Existing
+externally writable storage, including individual release parents, is rejected
+without changing its permissions. Storage and replacement authorization are
+checked again under the installation lock before using an existing release.
+
 If removing the retired local directory fails after activation, installation
 still succeeds and returns `cleanup_pending` with the retained path and error.
 The verified release is active and its completed backup remains available.
@@ -274,8 +279,9 @@ Each release has a `runtime-manifest.json` with its journal schema version, hash
 of the owned review modules, their aggregate fingerprint and the source Git
 revision when available. The content fingerprint identifies the actual bytes,
 including uncommitted changes; a source revision alone is not proof of the
-installed code. Identity and index helpers retain their separate per-run evidence
-bindings. New runs record the runtime identity, and changing the runtime of an
+installed code. Bundled identity and index helper bytes are checked against the
+installation receipt; their evidence remains separate from the aggregate module
+fingerprint. New runs record the runtime identity, and changing the runtime of an
 existing run requires an explicit adoption record. Existing findings stay
 readable across runtime changes. Do not repair installed modules in place; change
 the repository, run its checks and install another complete release.

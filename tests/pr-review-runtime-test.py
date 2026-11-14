@@ -112,6 +112,94 @@ class RuntimeTests(unittest.TestCase):
             (self.source / "ensure-context-indexes.py").write_text("# independent index helper\n")
             self.assertEqual(runtime.identity(), expected)
 
+    def test_installed_helpers_must_match_the_installation_receipt(self):
+        installed = self.install()
+        release = Path(installed["release"])
+        with patch.object(runtime, "__file__", str(release / "runtime.py")):
+            self.assertEqual(runtime.identity(), installed["runtime"])
+            runtime.verify_recorded(installed["runtime"])
+            for name in runtime.HELPERS:
+                helper = release / name
+                original = helper.read_bytes()
+                try:
+                    helper.write_bytes(original + b"\n# changed installed helper\n")
+                    with self.subTest(helper=name), self.assertRaisesRegex(ValueError, "manifest"):
+                        runtime.verify_recorded(installed["runtime"])
+                finally:
+                    helper.write_bytes(original)
+
+    def test_installed_receipt_requires_complete_consistent_file_hashes(self):
+        installed = self.install()
+        release = Path(installed["release"])
+        manifest = release / runtime.MANIFEST
+        original = json.loads(manifest.read_text())
+        missing = {name: value for name, value in original.items() if name != "installed_files"}
+        cases = [missing, dict(original, version=True), dict(original, version=2)]
+        for installed_files in (None, [], {},
+                                {name: digest for name, digest in original["installed_files"].items() if name != "identity.py"},
+                                dict(original["installed_files"], **{"identity.py": True}),
+                                dict(original["installed_files"], **{"identity.py": "0" * 64}),
+                                dict(original["installed_files"], **{"workflow.py": "0" * 64}),
+                                dict(original["installed_files"], unexpected="0" * 64)):
+            cases.append(dict(original, installed_files=installed_files))
+        with patch.object(runtime, "__file__", str(release / "runtime.py")):
+            for index, value in enumerate(cases):
+                manifest.write_text(json.dumps(value))
+                with self.subTest(case=index), self.assertRaisesRegex(ValueError, "manifest"):
+                    runtime.identity()
+
+    def test_legitimate_helper_only_release_preserves_aggregate_runtime_identity(self):
+        first = self.install()
+        for name in runtime.HELPERS:
+            path = self.source / name
+            path.write_bytes(path.read_bytes() + b"\n# independent helper release\n")
+        second = self.install(force=True)
+        self.assertTrue(second["changed"])
+        self.assertNotEqual(second["release"], first["release"])
+        self.assertEqual(second["runtime"], first["runtime"])
+        for installed in (first, second):
+            with patch.object(runtime, "__file__", str(Path(installed["release"]) / "runtime.py")):
+                runtime.verify_recorded(first["runtime"])
+
+    def test_force_install_repairs_invalid_receipts_instead_of_reporting_idempotence(self):
+        installed = self.install()
+        for index, kind in enumerate(("helper-hash", "missing-files", "version")):
+            with self.subTest(receipt=kind):
+                release = Path(installed["release"])
+                manifest = release / runtime.MANIFEST
+                data = json.loads(manifest.read_text())
+                if kind == "helper-hash":
+                    data["installed_files"]["identity.py"] = "0" * 64
+                elif kind == "missing-files":
+                    data.pop("installed_files")
+                else:
+                    data["version"] = True
+                manifest.write_text(json.dumps(data))
+                original = manifest.read_bytes()
+                self.backup = self.base / f"receipt-backup-{index}"
+                repaired = self.install(force=True)
+                self.assertTrue(repaired["changed"])
+                self.assertNotEqual(repaired["release"], installed["release"])
+                self.assertEqual(manifest.read_bytes(), original)
+                with patch.object(runtime, "__file__", str(Path(repaired["release"]) / "runtime.py")):
+                    runtime.verify_recorded(installed["runtime"])
+                self.assertFalse(self.install(force=True)["changed"])
+                installed = repaired
+
+    def test_versioned_releases_require_receipts_without_disabling_legacy_source_use(self):
+        installed = self.install()
+        release = Path(installed["release"])
+        (release / runtime.MANIFEST).unlink()
+        helper = release / "identity.py"
+        helper.write_bytes(helper.read_bytes() + b"\n# unrecorded helper drift\n")
+        with (patch.object(runtime, "__file__", str(release / "runtime.py")),
+              self.assertRaises((OSError, ValueError))):
+            runtime.verify_recorded(installed["runtime"])
+        legacy = self.base / "legacy/scripts"
+        shutil.copytree(self.source, legacy)
+        with patch.object(runtime, "__file__", str(legacy / "runtime.py")):
+            runtime.verify_recorded(installed["runtime"])
+
     def test_group_writable_umask_keeps_new_runtime_and_backup_directories_private(self):
         existing = self.base / "existing"
         existing.mkdir(mode=0o750)
@@ -189,6 +277,65 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual(first["runtime"], second["runtime"])
         self.assertTrue(Path(second["backup"]).is_symlink())
         self.assertEqual(Path(second["backup"]).resolve(), old)
+
+    def test_competing_install_cannot_be_replaced_without_force_after_preflight(self):
+        other = self.base / "competing-source"
+        shutil.copytree(self.source, other)
+        (other / "workflow.py").write_text("# competing complete release\n")
+        flock = runtime.fcntl.flock
+        competitor = {}
+        injected = False
+
+        def complete_before_lock(descriptor, operation):
+            nonlocal injected
+            if not injected:
+                injected = True
+                competitor.update(runtime.install(self.destination, self.base / "competing-backup",
+                                  sources={path.name: path for path in other.iterdir()}))
+            return flock(descriptor, operation)
+
+        with (patch.object(runtime.fcntl, "flock", side_effect=complete_before_lock),
+              self.assertRaisesRegex(ValueError, "force")):
+            self.install()
+        self.assertEqual((self.destination / "scripts").resolve(), Path(competitor["release"]))
+        self.assertEqual((Path(competitor["release"]) / "workflow.py").read_bytes(),
+                         (other / "workflow.py").read_bytes())
+        self.assertEqual(list((self.destination / "releases").iterdir()), [Path(competitor["release"]).parent])
+        self.assertFalse(self.backup.exists())
+
+    def test_idempotence_cannot_accept_an_external_target_swapped_before_lock(self):
+        first = self.install()
+        scripts = self.destination / "scripts"
+        external = self.base / "external"
+        shutil.copytree(Path(first["release"]), external)
+        external.chmod(0o775)
+        before = self.legacy_record(external)
+        flock = runtime.fcntl.flock
+
+        def redirect_before_lock(descriptor, operation):
+            scripts.unlink()
+            scripts.symlink_to(external, target_is_directory=True)
+            return flock(descriptor, operation)
+
+        with (patch.object(runtime.fcntl, "flock", side_effect=redirect_before_lock),
+              self.assertRaisesRegex(ValueError, "owned release")):
+            self.install(force=True)
+        self.assertEqual(scripts.resolve(), external)
+        self.assertEqual(self.legacy_record(external), before)
+        self.assertEqual(list((self.destination / "releases").iterdir()), [Path(first["release"]).parent])
+        self.assertFalse(self.backup.exists())
+
+    def test_existing_externally_writable_release_parent_is_rejected_without_changes(self):
+        first = self.install()
+        parent = Path(first["release"]).parent
+        for mode in (0o775, 0o777):
+            with self.subTest(mode=mode):
+                parent.chmod(mode)
+                before = self.legacy_record(self.destination)
+                with self.assertRaisesRegex(ValueError, "external write access"):
+                    self.install(force=True)
+                self.assertEqual(self.legacy_record(self.destination), before)
+                self.assertFalse(self.backup.exists())
 
     def test_dry_run_and_source_race_leave_the_active_release_unchanged(self):
         self.install()

@@ -78,29 +78,62 @@ def validate_identity(value: dict) -> None:
         raise ValueError("review runtime identity fingerprint is inconsistent")
 
 
+def read_installation_manifest(directory: Path, current: dict) -> dict:
+    """Read a required installation receipt and verify its complete installed bytes.
+
+    Args:
+        directory (Path): Release scripts directory containing the receipt.
+        current (dict): Identity freshly computed from that directory's modules.
+
+    Returns:
+        dict: Installation manifest authenticated against all modules and helpers.
+
+    Raises:
+        OSError: The manifest or an installed helper cannot be read.
+        ValueError: The manifest is invalid or differs from the installed bytes.
+    """
+    receipt = directory / MANIFEST
+    try:
+        if receipt.is_symlink():
+            raise ValueError("redirected manifest")
+        with os.fdopen(os.open(receipt, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "r") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("manifest must be a regular file")
+            manifest = json.load(source)
+        if (not isinstance(manifest, dict) or type(manifest.get("version")) is not int
+                or manifest["version"] != 1):
+            raise ValueError("unsupported installation manifest")
+        recorded = manifest["runtime"]
+        validate_identity(recorded)
+        installed = manifest["installed_files"]
+        if (not isinstance(installed, dict) or set(installed) != {*MODULES, *HELPERS}
+                or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                       for value in installed.values())):
+            raise ValueError("invalid installed file receipt")
+        actual = {**current["files"], **{name: file_hash(directory / name) for name in HELPERS}}
+        if recorded != current or installed != actual:
+            raise ValueError("code differs")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("installed review runtime manifest does not match its code") from error
+    return manifest
+
+
 def identity() -> dict:
-    """Return this release's identity, checking its installation receipt if present.
+    """Return this release's identity and verify its installed modules and helpers.
 
     Returns:
         dict: Portable identity of the current review code and journal schema.
 
     Raises:
-        OSError: Code or an installed manifest cannot be read.
-        ValueError: The installed manifest does not bind the current code.
+        OSError: Code or a required installation manifest cannot be read.
+        ValueError: The installed manifest does not bind the current code/helpers.
     """
     directory = Path(__file__).resolve().parent
     current = code_identity(directory)
     receipt = directory / MANIFEST
-    if receipt.exists() or receipt.is_symlink():
-        try:
-            if receipt.is_symlink():
-                raise ValueError("redirected manifest")
-            recorded = json.loads(receipt.read_text())["runtime"]
-            validate_identity(recorded)
-            if recorded != current:
-                raise ValueError("code differs")
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("installed review runtime manifest does not match its code") from error
+    managed = directory.name == "scripts" and directory.parent.parent.name == "releases"
+    if managed or receipt.exists() or receipt.is_symlink():
+        read_installation_manifest(directory, current)
     return current
 
 
@@ -170,6 +203,42 @@ def make_owned_directory(path: Path) -> None:
     for directory in reversed(missing):
         directory.mkdir(mode=0o700, exist_ok=True)
         owned_directory(directory)
+
+
+def validate_installation_storage(destination: Path, backup_root: Path, *, force: bool) -> None:
+    """Validate current storage and replacement authorization before using it.
+
+    Args:
+        destination (Path): Absolute shared review directory, containing runs.
+        backup_root (Path): Absolute backup root for the replaced scripts entry.
+        force (bool): Whether an existing scripts entry may be replaced.
+
+    Raises:
+        OSError: Existing storage metadata cannot be read.
+        ValueError: Ownership, redirection, overlap or replacement checks fail.
+    """
+    for path in (destination, backup_root):
+        if not path.is_absolute() or path.resolve() != path:
+            raise ValueError("runtime and backup directories must be absolute and nonredirected")
+        existing = next(parent for parent in (path, *path.parents) if parent.exists())
+        owned_directory(existing)
+    if destination.is_relative_to(backup_root) or backup_root.is_relative_to(destination):
+        raise ValueError("runtime and backup directories must not overlap")
+    scripts = destination / "scripts"
+    releases = destination / "releases"
+    if releases.exists() or releases.is_symlink():
+        owned_directory(releases)
+    if scripts.is_symlink():
+        target = scripts.resolve()
+        if (scripts.lstat().st_uid != os.getuid() or not target.is_relative_to(releases)
+                or len(target.relative_to(releases).parts) != 2 or target.name != "scripts"):
+            raise ValueError("runtime scripts link must name an owned release")
+        owned_directory(target.parent)
+        owned_directory(target)
+    elif scripts.exists():
+        owned_directory(scripts)
+    if (scripts.exists() or scripts.is_symlink()) and not force:
+        raise ValueError("runtime scripts already exist; rerun with --force to preserve and replace them")
 
 
 def source_revision(sources: dict[str, Path]) -> str | None:
@@ -243,28 +312,9 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
     expected = code_identity(sources["runtime.py"].parent)
     if any(expected["files"][name] != expected_files[name] for name in MODULES):
         raise ValueError("runtime source changed during installation preflight")
-    for path in (destination, backup_root):
-        if not path.is_absolute() or path.resolve() != path:
-            raise ValueError("runtime and backup directories must be absolute and nonredirected")
-        existing = next(parent for parent in (path, *path.parents) if parent.exists())
-        owned_directory(existing)
-    if destination.is_relative_to(backup_root) or backup_root.is_relative_to(destination):
-        raise ValueError("runtime and backup directories must not overlap")
+    validate_installation_storage(destination, backup_root, force=force)
     scripts = destination / "scripts"
     releases = destination / "releases"
-    if releases.exists() or releases.is_symlink():
-        owned_directory(releases)
-    if scripts.is_symlink():
-        target = scripts.resolve()
-        if (scripts.lstat().st_uid != os.getuid() or not target.is_relative_to(releases)
-                or len(target.relative_to(releases).parts) != 2 or target.name != "scripts"):
-            raise ValueError("runtime scripts link must name an owned release")
-        owned_directory(target)
-    elif scripts.exists():
-        owned_directory(scripts)
-    present = scripts.exists() or scripts.is_symlink()
-    if present and not force:
-        raise ValueError("runtime scripts already exist; rerun with --force to preserve and replace them")
     if dry_run:
         return {"runtime": expected, "changed": True, "dry_run": True, "destination": str(scripts)}
     make_owned_directory(destination)
@@ -273,15 +323,14 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
         if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode) or os.fstat(lock.fileno()).st_uid != os.getuid():
             raise ValueError("runtime installation lock is not owned")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        validate_installation_storage(destination, backup_root, force=force)
         if scripts.is_symlink():
             current = scripts.resolve()
-            receipt = current / MANIFEST
             try:
-                if (receipt.is_file() and not receipt.is_symlink()
-                        and json.loads(receipt.read_text()).get("runtime") == expected
-                        and all(file_hash(current / name) == digest for name, digest in expected_files.items())):
+                manifest = read_installation_manifest(current, code_identity(current))
+                if manifest["runtime"] == expected and manifest["installed_files"] == expected_files:
                     return {"runtime": expected, "changed": False, "release": str(current), "backup": None}
-            except (OSError, ValueError, AttributeError):
+            except (OSError, ValueError):
                 # A broken old receipt must not prevent an explicitly forced repair.
                 pass
         make_owned_directory(releases)
