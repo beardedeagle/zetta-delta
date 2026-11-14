@@ -168,17 +168,18 @@ def install_sources() -> dict[str, Path]:
     return sources
 
 
-def validate_storage_ancestors(path: Path) -> None:
+def validate_storage_ancestors(path: Path, *, include_self: bool = False) -> None:
     """Reject ancestor directories that permit another user to replace storage.
 
     Args:
-        path (Path): Canonical managed storage directory with a validated owner.
+        path (Path): Canonical managed directory or existing creation parent.
+        include_self (bool): Also validate an existing parent of new storage.
 
     Raises:
         OSError: An ancestor's metadata cannot be read.
         ValueError: An ancestor is foreign-owned or writable without sticky protection.
     """
-    for ancestor in path.parents:
+    for ancestor in (path, *path.parents) if include_self else path.parents:
         info = ancestor.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
                 or info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
@@ -217,7 +218,10 @@ def make_owned_directory(path: Path) -> None:
     while not existing.exists():
         missing.append(existing)
         existing = existing.parent
-    owned_directory(existing)
+    if missing:
+        validate_storage_ancestors(existing, include_self=True)
+    else:
+        owned_directory(existing)
     for directory in reversed(missing):
         directory.mkdir(mode=0o700, exist_ok=True)
         owned_directory(directory)
@@ -239,7 +243,10 @@ def validate_installation_storage(destination: Path, backup_root: Path, *, force
         if not path.is_absolute() or path.resolve() != path:
             raise ValueError("runtime and backup directories must be absolute and nonredirected")
         existing = next(parent for parent in (path, *path.parents) if parent.exists())
-        owned_directory(existing)
+        if existing == path:
+            owned_directory(existing)
+        else:
+            validate_storage_ancestors(existing, include_self=True)
     if destination.is_relative_to(backup_root) or backup_root.is_relative_to(destination):
         raise ValueError("runtime and backup directories must not overlap")
     scripts = destination / "scripts"

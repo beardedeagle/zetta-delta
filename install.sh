@@ -144,12 +144,43 @@ fi
 readonly SCRIPT_DIR SELF
 if ((HELP)); then usage; exit 0; fi
 
+# Resolve installation roots component by component before .. so a symlinked
+# parent keeps its filesystem meaning. Destinations below them are never resolved:
+# dangling profile/rule links remain entries for preflight and link backups.
+canonical_dir() {
+  local path="$1" label="$2" resolved="" rest part candidate
+  if [[ $path =~ ^[A-Za-z]:[\\/] || $path == \\\\* ]]; then
+    command -v cygpath >/dev/null 2>&1 || die "Windows $label paths need cygpath; use an absolute POSIX path"
+    path="$(cygpath -u -- "$path")" || die "could not convert $label directory"
+  fi
+  [[ $path == /* ]] || path="$PWD/$path"
+  [[ $path != //* ]] || resolved=/
+  rest="$path"
+  while [[ -n $rest ]]; do
+    rest="${rest#/}"; part="${rest%%/*}"
+    if [[ $rest == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    case $part in
+      ""|.) ;;
+      ..) resolved="${resolved%/*}" ;;
+      *)
+        candidate="$resolved/$part"
+        if [[ -d $candidate ]]; then resolved="$(cd -- "$candidate" && pwd -P)"
+        elif [[ -e $candidate || -L $candidate ]]; then die "$label path component is not a directory: $candidate"
+        else resolved="$candidate"
+        fi ;;
+    esac
+  done
+  printf '%s\n' "${resolved:-/}"
+}
+
 # Runtime-only upgrades use complete releases and leave profiles/settings alone.
 # Existing commands pin their resolved release; new commands see the new link.
 if ((REVIEW_RUNTIME_ONLY)); then
   command -v python3 >/dev/null 2>&1 || die "python3 not found"
   python3 -c 'import tomllib' 2>/dev/null || die "Python 3.11 or later is required"
-  runtime_args=(install --destination "$HOME/.local/share/zetta-delta/review" --backup-root "$BACKUP_DIR")
+  runtime_destination="$(canonical_dir "$HOME/.local/share/zetta-delta/review" "review runtime")"
+  runtime_backup="$(canonical_dir "$BACKUP_DIR" "review backup")"
+  runtime_args=(install --destination "$runtime_destination" --backup-root "$runtime_backup")
   ((!FORCE)) || runtime_args+=(--force)
   ((!DRY_RUN)) || runtime_args+=(--dry-run)
   python3 "$SCRIPT_DIR/review/scripts/runtime.py" "${runtime_args[@]}"
@@ -368,34 +399,6 @@ delta_config_dir() {
                           printf '%s\n' "$APPDATA/delta" ;;
     *)                    die "unsupported OS; set DELTA_CONFIG_DIR" ;;
   esac
-}
-# Resolve installation roots component by component before .. so a symlinked
-# parent keeps its filesystem meaning. Destinations below them are never resolved:
-# dangling profile/rule links remain entries for preflight and link backups.
-canonical_dir() {
-  local path="$1" label="$2" resolved="" rest part candidate
-  if [[ $path =~ ^[A-Za-z]:[\\/] || $path == \\\\* ]]; then
-    command -v cygpath >/dev/null 2>&1 || die "Windows $label paths need cygpath; use an absolute POSIX path"
-    path="$(cygpath -u -- "$path")" || die "could not convert $label directory"
-  fi
-  [[ $path == /* ]] || path="$PWD/$path"
-  [[ $path != //* ]] || resolved=/
-  rest="$path"
-  while [[ -n $rest ]]; do
-    rest="${rest#/}"; part="${rest%%/*}"
-    if [[ $rest == */* ]]; then rest="${rest#*/}"; else rest=""; fi
-    case $part in
-      ""|.) ;;
-      ..) resolved="${resolved%/*}" ;;
-      *)
-        candidate="$resolved/$part"
-        if [[ -d $candidate ]]; then resolved="$(cd -- "$candidate" && pwd -P)"
-        elif [[ -e $candidate || -L $candidate ]]; then die "$label path component is not a directory: $candidate"
-        else resolved="$candidate"
-        fi ;;
-    esac
-  done
-  printf '%s\n' "${resolved:-/}"
 }
 CONFIG_DIR="$(canonical_dir "$(delta_config_dir)" "Delta config")"
 SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"

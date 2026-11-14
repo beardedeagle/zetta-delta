@@ -375,6 +375,53 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(runtime, "__file__", str(Path(installed["release"]) / "runtime.py")):
             self.assertEqual(runtime.identity(), installed["runtime"])
 
+    def test_private_storage_can_be_created_directly_beneath_trusted_sticky_temp(self):
+        for owner in ("runtime", "backup"):
+            with self.subTest(storage=owner):
+                temporary = tempfile.TemporaryDirectory(prefix="review-direct-storage-", dir=Path("/tmp").resolve())
+                self.addCleanup(temporary.cleanup)
+                missing = Path(temporary.name).resolve()
+                missing.rmdir()
+                parent = missing.parent
+                before = parent.stat()
+                self.destination = self.base / ("review-" + owner)
+                self.backup = self.base / ("backup-" + owner)
+                expected = None
+                if owner == "runtime":
+                    self.destination = missing
+                else:
+                    self.backup = missing
+                    expected = self.legacy_record(self.legacy_scripts())
+                installed = self.install(force=owner == "backup")
+                self.assertTrue(installed["changed"])
+                self.assertEqual(stat.S_IMODE(missing.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(parent.stat().st_mode), stat.S_IMODE(before.st_mode))
+                self.assertEqual(parent.stat().st_uid, before.st_uid)
+                if expected is not None:
+                    self.assertEqual(self.legacy_record(Path(installed["backup"])), expected)
+                with patch.object(runtime, "__file__", str(Path(installed["release"]) / "runtime.py")):
+                    self.assertEqual(runtime.identity(), installed["runtime"])
+
+    def test_existing_sticky_managed_storage_remains_rejected_without_changes(self):
+        self.destination.mkdir()
+        self.destination.chmod(0o1777)
+        before = self.legacy_record(self.destination)
+        with self.assertRaisesRegex(ValueError, "external write access"):
+            self.install()
+        self.assertEqual(self.legacy_record(self.destination), before)
+        self.assertFalse(self.backup.exists())
+
+    def test_new_storage_refuses_a_nonsticky_writable_creation_parent(self):
+        parent = self.base / "writable-parent"
+        parent.mkdir()
+        parent.chmod(0o777)
+        self.destination = parent / "review"
+        before = self.legacy_record(parent)
+        with self.assertRaisesRegex(ValueError, "ancestor"):
+            self.install()
+        self.assertEqual(self.legacy_record(parent), before)
+        self.assertFalse(self.backup.exists())
+
     def test_foreign_owned_ancestor_is_rejected_without_changing_storage(self):
         ancestor = self.base / "foreign"
         ancestor.mkdir(mode=0o755)
