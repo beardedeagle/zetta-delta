@@ -175,6 +175,10 @@ canonical_dir() {
 RUNTIME_BACKUP_DIR="$(canonical_dir "$BACKUP_DIR" "review backup")"
 readonly RUNTIME_BACKUP_DIR
 
+# The same PATH prefix travels in the generated rules to Delta's POSIX shell.
+TOOL_BIN="${PREFIX:-$HOME/.local}/bin"
+export PATH="$TOOL_BIN:$PATH"
+
 # Runtime-only upgrades use complete releases and leave profiles/settings alone.
 # Existing commands pin their resolved release; new commands see the new link.
 if ((REVIEW_RUNTIME_ONLY)); then
@@ -190,9 +194,6 @@ fi
 
 # ---------------------------------------------------------------- inputs ---
 
-# The same PATH prefix travels in the generated rules to Delta's POSIX shell.
-TOOL_BIN="${PREFIX:-$HOME/.local}/bin"
-export PATH="$TOOL_BIN:$PATH"
 REQUIRED_TOOLS=(python3 git gh rg rtk tgrep semble codegraph zg ctx7 githits caveman node)
 for tool in "${REQUIRED_TOOLS[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found; run bootstrap.sh from a clone first"

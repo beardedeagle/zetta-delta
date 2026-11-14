@@ -180,6 +180,69 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.config / "profiles").exists())
         self.assertFalse((self.home / ".agents/skills").exists())
 
+    def assert_runtime_only_prefers_tool_python(self, prefix: Path | None = None) -> None:
+        """Retain the full installer's interpreter preference for runtime upgrades.
+
+        Args:
+            prefix (Path | None): Custom tool prefix, or the default local prefix.
+        """
+        if prefix is not None:
+            self.env["PREFIX"] = str(prefix)
+        tools = (prefix or self.home / ".local") / "bin"
+        tools.mkdir(parents=True)
+        preferred = tools / "python3"
+        preferred.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        preferred.chmod(0o755)
+        (self.base / "bin/python3").write_text("#!/bin/sh\nexit 73\n")
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        scripts = self.home / ".local/share/zetta-delta/review/scripts"
+        pinned = scripts.resolve()
+        receipt = (pinned / "runtime-manifest.json").read_bytes()
+        settings = self.config / "settings.json"
+        settings.write_text("malformed settings must stay opaque to runtime upgrades\n")
+        original = {str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}
+        for name in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER"):
+            self.env.pop(name)
+        (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
+        source = self.bundle / "review/scripts/workflow.py"
+        source.write_bytes(source.read_bytes() + b"\n# runtime upgrade using the preferred interpreter\n")
+        preview = self.install("--review-runtime-only", "--force", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertEqual(scripts.resolve(), pinned)
+        upgraded = self.install("--review-runtime-only", "--force")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        self.assertNotEqual(scripts.resolve(), pinned)
+        self.assertEqual((pinned / "runtime-manifest.json").read_bytes(), receipt)
+        self.assertEqual(Path(json.loads(upgraded.stdout)["backup"]).resolve(), pinned)
+        identity = subprocess.run([sys.executable, str(scripts / "runtime.py"), "identity"],
+                                  text=True, capture_output=True, check=False)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(json.loads(identity.stdout), json.loads((scripts / "runtime-manifest.json").read_text())["runtime"])
+        self.assertEqual({str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}, original)
+
+    def test_runtime_only_prefers_default_tool_python_over_unsupported_ambient_python(self):
+        self.assert_runtime_only_prefers_tool_python()
+
+    def test_runtime_only_prefers_custom_prefix_python_over_unsupported_ambient_python(self):
+        self.assert_runtime_only_prefers_tool_python(self.base / "preferred tools")
+
+    def test_runtime_only_rejects_unsuitable_preferred_or_fallback_python_without_writes(self):
+        tools = self.home / ".local/bin"
+        tools.mkdir(parents=True)
+        preferred = tools / "python3"
+        preferred.write_text("#!/bin/sh\nexit 73\n")
+        preferred.chmod(0o755)
+        for selected in ("preferred", "fallback"):
+            with self.subTest(selected=selected):
+                if selected == "fallback":
+                    preferred.unlink()
+                    (self.base / "bin/python3").write_text("#!/bin/sh\nexit 73\n")
+                result = self.install("--review-runtime-only", "--dry-run")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("Python 3.11 or later", result.stderr)
+                self.assertNoWrites()
+
     def test_runtime_only_dry_run_refuses_conflicting_flags_and_never_writes(self):
         result = self.install("--review-runtime-only", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
