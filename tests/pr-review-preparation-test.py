@@ -1226,6 +1226,69 @@ class SealedSnapshotTests(GitFixture):
         (self.source / ".codegraph/source.py").write_text("changed reviewed source\n")
         self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
 
+    def test_authorized_setup_ignore_is_temporary_during_comparison_and_strict_after_sealing(self):
+        (self.parent / ".delta").mkdir()
+        (self.parent / ".delta/source.txt").write_text("reviewed delta configuration\n")
+        self.commit("delta configuration without a Semble ignore file")
+        self.staged = self.prepare()
+        self.source = Path(self.staged["source_root"])
+        original = (self.resource(self.staged) / "source-baseline.json").read_bytes()
+        request = preparation.setup_request(self.directory, "run-fixture", "local", self.staged, ["tgrep"])
+        self.assertIn(".sembleignore", request["cache_paths"])
+        with (patch.object(self.helper, "maintain_tgrep"),
+              patch.object(self.helper, "semble_clear_orphans")):
+            preparation.run_setup(self.staged, request)
+        ignore = self.source / ".sembleignore"
+        self.assertEqual(ignore.read_text(), ".delta/\n")
+        with self.subTest(stage="pre-setup comparison"):
+            self.assertEqual(preparation.check(self.directory, "run-fixture", "local", self.staged, {},
+                                               setup=request)["status"], "unchanged")
+        frozen = self.finalize(request)
+        self.assertEqual((self.resource(self.staged) / "source-baseline.json").read_bytes(), original)
+        ledger = json.loads((self.resource(frozen) / "final-source-baseline.json").read_text())
+        self.assertEqual(ledger["files"][".sembleignore"][2], preparation.digest(ignore))
+        self.assertEqual(self.finalize(request), frozen)
+        ignore.write_text("changed sealed configuration\n")
+        self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", frozen, {})["components"])
+
+    def test_setup_never_exempts_existing_ignore_source_or_unrequested_files(self):
+        (self.parent / ".delta").mkdir()
+        (self.parent / ".delta/source.txt").write_text("reviewed delta configuration\n")
+        (self.parent / ".sembleignore").write_text("reviewed ignore configuration\n")
+        self.commit("existing ignore source")
+        self.staged = self.prepare()
+        self.source = Path(self.staged["source_root"])
+        request = preparation.setup_request(self.directory, "run-fixture", "local", self.staged, ["tgrep"])
+        self.assertNotIn(".sembleignore", request["cache_paths"])
+        request = dict(request, cache_paths=[*request["cache_paths"], ".sembleignore"])
+        ignore = self.source / ".sembleignore"
+        original = ignore.read_bytes()
+        ignore.write_text("changed reviewed configuration\n")
+        self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", self.staged, {},
+                                                  setup=request)["components"])
+        ignore.write_bytes(original)
+        (self.source / "unrequested.txt").write_text("unexpected source\n")
+        self.assertIn("source", preparation.check(self.directory, "run-fixture", "local", self.staged, {},
+                                                  setup=request)["components"])
+
+    def test_setup_cannot_recreate_a_reviewed_ignore_deletion(self):
+        (self.parent / ".delta").mkdir()
+        (self.parent / ".delta/source.txt").write_text("reviewed delta configuration\n")
+        (self.parent / ".sembleignore").write_text("old ignore configuration\n")
+        self.commit("ignore configuration before review")
+        left = self.git("rev-parse", "HEAD")
+        (self.parent / ".sembleignore").unlink()
+        self.commit("remove ignore configuration")
+        self.staged = self.prepare(left=left, right="HEAD")
+        self.source = Path(self.staged["source_root"])
+        self.assertIn(".sembleignore", self.staged["inventory"])
+        with self.assertRaisesRegex(ValueError, "overlap frozen source"):
+            preparation.setup_request(self.directory, "run-fixture", "local", self.staged, ["tgrep"])
+        (self.source / ".sembleignore").write_text(".delta/\n")
+        observation = preparation.check(self.directory, "run-fixture", "local", self.staged, {},
+                                         setup={"cache_paths": [".sembleignore"]})
+        self.assertIn("source", observation["components"])
+
     def test_sealing_suppresses_native_hook_writers_and_preserves_setup_and_test_copies(self):
         session = {"cwd": str(self.source), "hook_event_name": "SessionStart"}
         self.assertEqual(self.helper.selection(session), (self.source, list(self.helper.TOOLS)))

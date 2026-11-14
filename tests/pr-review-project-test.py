@@ -949,6 +949,42 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs from the frozen manifest"):
             preparation.test_copy(self.directory, run["run_id"], key, frozen)
 
+    def test_project_test_copy_omits_authenticated_new_setup_files_but_keeps_source_strict(self):
+        (self.source / ".delta").mkdir()
+        (self.source / ".delta/source.txt").write_text("reviewed delta configuration\n")
+        run = self.run_record()
+        key, target = next(iter(run["targets"].items()))
+        staged = preparation.prepare(self.directory, run["run_id"], key, target, self.source)
+        module, helper_path = preparation.index_helper(bundled=True)
+        with (patch.object(preparation, "index_helper", return_value=(module, helper_path)),
+              patch.object(module.shutil, "which", side_effect=lambda name: "/fixture/tgrep" if name == "tgrep" else None),
+              patch.object(module, "unavailable_indexes", return_value=[])):
+            request = preparation.setup_request(self.directory, run["run_id"], key, staged, ["tgrep"])
+            self.assertIn(".sembleignore", request["cache_paths"])
+            source = Path(staged["source_root"])
+            ignore = source / ".sembleignore"
+            ignore.write_text(".delta/\n")
+            frozen = preparation.finalize(self.directory, run["run_id"], key, staged, request, [], None)
+        self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+        copied = preparation.test_copy(self.directory, run["run_id"], key, frozen)
+        self.assertFalse((copied / ".sembleignore").exists())
+        self.assertEqual((copied / ".delta/source.txt").read_text(), "reviewed delta configuration\n")
+        ignore.write_text("changed sealed configuration\n")
+        self.assertIn("source", preparation.check(self.directory, run["run_id"], key, frozen, {})["components"])
+        ignore.write_text(".delta/\n")
+        unrequested = source / "unrequested.txt"
+        unrequested.write_text("unexpected source\n")
+        with self.assertRaisesRegex(ValueError, "differs from the frozen manifest"):
+            preparation.test_copy(self.directory, run["run_id"], key, frozen)
+        unrequested.unlink()
+        for name in ("source-baseline.json", "index-result.json"):
+            artifact = source.parent / name
+            original = artifact.read_bytes()
+            artifact.write_bytes(original + b" ")
+            with self.subTest(artifact=name), self.assertRaisesRegex(ValueError, "evidence changed"):
+                preparation.test_copy(self.directory, run["run_id"], key, frozen)
+            artifact.write_bytes(original)
+
     def test_cli_cleanup_holds_before_removing_another_projects_evidence(self):
         other = self.base / "consumer"
         other.mkdir()

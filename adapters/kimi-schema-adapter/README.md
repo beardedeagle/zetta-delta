@@ -5,11 +5,14 @@ Delta tool-schema incompatibility. In `delta_settings`, an array branch exactly
 equal to `{"type":"array","items":true}` becomes
 `{"type":"array","items":{}}`. Other schemas and accepted JSON values are
 unchanged. Requests requiring no correction retain their original JSON bytes.
+When correction is required, every numeric literal retains its original value
+and representation, including precise decimals, exponents and signed zero.
 
 The source and its original regression tests were brought into this repository
 from the locally installed adapter. Private state, settings, credentials, logs
 and launchd files are not part of this directory. The repository copy adds
-request timing diagnostics; importing it does not change the running service.
+request timing diagnostics and lossless numeric serialization; importing it does
+not change the running service.
 
 ## Transport and access
 

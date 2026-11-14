@@ -288,6 +288,12 @@ optional `--regex`, and repeated `--path '<relative-path>'` to narrow the frozen
 source scope. The engine supplies the search executable, argument separator and
 the source root; do not append raw search flags, another root or a trailing `--`.
 
+Setup may create recorded new support files such as `.sembleignore`. Comparison
+with pre-setup evidence omits only authorized paths absent from that evidence and
+the reviewed inventory. Finalization seals the full resulting files; later edits
+remain integrity failures. Project test copies retain the original review manifest
+and omit those generated support files alongside disposable indexes.
+
 Within roots authorized by `~/.config/context-roots`, static search uses
 `tgrep --no-index`. Everywhere else, including default private run snapshots,
 it routes directly to `rg --no-config`; no cache-capable tool is invoked there.
@@ -665,6 +671,9 @@ deliverable separately; strict review completion and publication remain blocked
 without the independent vet. Keep missing discovery coverage visible. A waiver
 does not erase unsafe source evidence or turn a skipped stage into completed
 independent scrutiny.
+Settled vet failures covered by the waiver do not require recovery before that
+local assessment can finish. Source-related failures and active or unknown
+attempts retain their existing holds.
 
 ## Assignment and report commands
 

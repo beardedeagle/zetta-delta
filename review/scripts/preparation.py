@@ -289,6 +289,42 @@ def reviewed_ledger(ledger: dict, reviewed: tuple[str, ...]) -> dict:
     return result
 
 
+def setup_paths(original: dict, reviewed: tuple[str, ...], request: dict | None) -> tuple[str, ...]:
+    """Select authorized setup additions without excluding original or reviewed source.
+
+    Args:
+        original (dict): Authenticated source ledger captured before setup.
+        reviewed (tuple[str, ...]): Explicit source paths, including reviewed deletions.
+        request (dict | None): Recorded lifecycle setup plan authorizing new paths.
+
+    Returns:
+        tuple[str, ...]: Authorized paths absent from original and reviewed source.
+    """
+    return tuple(path for path in (request or {}).get("cache_paths", ())
+                 if not reviewed_path(path, reviewed)
+                 and not any(name == path or name.startswith(path + "/") for name in original["files"]))
+
+
+def setup_comparison(ledger: dict, original: dict, reviewed: tuple[str, ...], request: dict | None) -> dict:
+    """Compare setup against original source while retaining its new files for sealing.
+
+    Args:
+        ledger (dict): Current complete source ledger.
+        original (dict): Authenticated source ledger captured before setup.
+        reviewed (tuple[str, ...]): Explicit source paths, including reviewed deletions.
+        request (dict | None): Recorded lifecycle setup plan authorizing new paths.
+
+    Returns:
+        dict: Reviewed source view omitting only authorized, previously absent setup paths.
+    """
+    temporary = setup_paths(original, reviewed, request)
+    result = reviewed_ledger(ledger, reviewed)
+    if temporary:
+        result["files"] = {name: row for name, row in result["files"].items()
+                           if not any(name == path or name.startswith(path + "/") for path in temporary)}
+    return result
+
+
 def files(root: Path, exclude: tuple[str, ...] = (), *, nested_git: list[Path] | None = None,
           exclude_generated: bool = False, exclude_indexes: bool = False,
           reviewed: tuple[str, ...] = ()) -> dict:
@@ -1651,7 +1687,7 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
         if legacy is not None:
             current = {name: value for name, value in current.items() if name != "exclusion_policy"}
         if expected is not None:
-            current = reviewed_ledger(current, strict_paths)
+            current = setup_comparison(current, expected, strict_paths, setup if not native else None)
             original = reviewed_ledger(expected, strict_paths)
             if current == original:
                 return fingerprint(expected)
@@ -1716,9 +1752,7 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             expected = json.loads((resource / baseline_name).read_text())
             if fingerprint(expected) != frozen[name + "_fingerprint"]:
                 raise ValueError("original baseline differs from its recorded fingerprint")
-            current = observe(frozen[name + "_root"],
-                              tuple(setup["cache_paths"]) if name == "source" and setup else (),
-                              native=name != "source", project=project,
+            current = observe(frozen[name + "_root"], native=name != "source", project=project,
                               expected=expected)
             if current != frozen[name + "_fingerprint"]:
                 problems.append(name)
@@ -1826,7 +1860,8 @@ def setup_request(directory: Path, run_id: str, key: str, staged: dict, tools: l
         original = json.load(source)["files"]
     plan = module.plan_indexes(Path(staged["source_root"]), tools)
     cache_paths = [relative_path(name) for name in plan["cache_paths"]]
-    if any(path == cache or path.startswith(cache + "/") for path in original for cache in cache_paths):
+    reviewed = tuple(staged.get("manifest", {}).get("entries", staged.get("inventory", ())))
+    if any(path == cache or path.startswith(cache + "/") for path in (*original, *reviewed) for cache in cache_paths):
         raise ValueError("index cache paths overlap frozen source content; use static review")
     return {"tools": plan["tools"], "available": plan["available"],
             "helper": str(path), "helper_fingerprint": digest(path), "cache_paths": cache_paths}
@@ -1929,7 +1964,7 @@ def finalize(directory: Path, run_id: str, key: str, staged: dict, request: dict
                    if staged["mode"] == "project" else baseline(source, exclude_indexes=True, reviewed=reviewed))
         observation = check(directory, run_id, key, staged, baselines or {}, setup=request, native_copies=native_copies)
         original = json.loads((resource / "source-baseline.json").read_text())
-        source_changed = reviewed_ledger(current, reviewed) != reviewed_ledger(original, reviewed)
+        source_changed = setup_comparison(current, original, reviewed, request) != reviewed_ledger(original, reviewed)
         if source_changed:
             observation = {"status": "changed", "components": list(dict.fromkeys(observation["components"] + ["source"]))}
         if observation["status"] != "unchanged":
@@ -1981,8 +2016,18 @@ def test_copy(directory: Path, run_id: str, key: str, frozen: dict) -> Path:
     try:
         if frozen["mode"] == "project":
             path.mkdir(mode=0o700)
-            copied = project_inventory(resource / "source", destination=path, exclude_indexes=True,
-                                       reviewed=tuple(frozen["manifest"]["entries"]))
+            evidence = {}
+            for name in ("source-baseline.json", "index-result.json"):
+                artifact = resource / name
+                if (artifact.is_symlink() or not artifact.is_file()
+                        or digest(artifact) != frozen["preparation"]["artifacts"].get(name)):
+                    raise ValueError("project setup evidence changed")
+                evidence[name] = json.loads(artifact.read_text())
+            reviewed = tuple(frozen["manifest"]["entries"])
+            exclusions = dict.fromkeys(setup_paths(evidence["source-baseline.json"], reviewed,
+                                                   evidence["index-result.json"]["request"]), "owned setup path")
+            copied = project_inventory(resource / "source", exclusions, destination=path,
+                                       exclude_indexes=True, reviewed=reviewed)
             if copied["entries"] != frozen["manifest"]["entries"] or copied["gaps"]:
                 raise ValueError("project test copy differs from the frozen manifest")
             return path

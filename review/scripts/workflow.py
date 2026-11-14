@@ -2055,9 +2055,12 @@ def next_decision(run: dict, target: dict) -> dict:
     for key, row in target["assignments"].items():
         if row["status"] == "done" or row.get("superseded_by"):
             continue
+        outcome = row.get("runtime_outcome") or row.get("withdrawal")
+        if (row["kind"] == "vet" and target.get("stage_waivers", {}).get("vetting")
+                and (outcome or {}).get("cause") != "source"):
+            continue
         root = contract.unit_root(target, row)
         used = {item["recovery"]["kind"] for item in target["assignments"].values() if item.get("recovery", {}).get("unit_id") == root["id"]}
-        outcome = row.get("runtime_outcome") or row.get("withdrawal")
         if (outcome or {}).get("cause", "incomplete-report") in ("incomplete-report", "evidence-gap") and (row.get("rejected_report") or row["status"] in ("partial", "blocked")):
             if "correction" in used:
                 return needs("recovery_exhausted", "report correction was already requested once; retain missing fields/verdicts as incomplete coverage", assignment_ids=[key])

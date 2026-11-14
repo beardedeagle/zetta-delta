@@ -86,6 +86,33 @@ class SchemaTests(unittest.TestCase):
                 body = json.dumps(fixture, indent=3).encode()
                 self.assertEqual(adapter.normalize(body), (body, 0))
 
+    def test_schema_correction_preserves_unrelated_raw_json_numbers(self):
+        for literal in (b"9007199254740993.0", b"0.1000000000000000000000000001", b"1e400",
+                        b"1e-400", b"-0", b"-0.0", b"18446744073709551615"):
+            with self.subTest(literal=literal):
+                body = (
+                    b'{"tools":[{"type":"function","function":{"name":"delta_settings",'
+                    b'"parameters":{"properties":{"value":{"anyOf":[{"type":"array","items":true}]}}}}},'
+                    b'{"type":"function","function":{"name":"other_tool",'
+                    b'"parameters":{"const":' + literal + b'}}}],'
+                    b'"messages":[{"content":"9007199254740993.0, 1e400, -0, '
+                    b'\\\"const\\\":1e-400, \\\\ and \\u0031"}]}'
+                )
+                corrected, count = adapter.normalize(body)
+                self.assertEqual(count, 1)
+                self.assertIn(b'"const":' + literal + b"}", corrected)
+                self.assertEqual(json.loads(corrected)["messages"], json.loads(body)["messages"])
+                self.assertEqual(adapter.normalize(corrected), (corrected, 0))
+
+    def test_schema_correction_retains_deeply_nested_unrelated_values(self):
+        depth = 700
+        body = (json.dumps(request_body()).encode()[:-1] + b',"nested":' + b"[" * depth
+                + b"9007199254740993.0" + b"]" * depth + b"}")
+        corrected, count = adapter.normalize(body)
+        self.assertEqual(count, 1)
+        self.assertIn(b'"nested":' + b"[" * depth + b"9007199254740993.0" + b"]" * depth, corrected)
+        self.assertEqual(adapter.normalize(corrected), (corrected, 0))
+
     def test_changed_or_already_corrected_native_shapes_are_byte_preserved(self):
         for branch in (
             {"type": "array", "items": {}},

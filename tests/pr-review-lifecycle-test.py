@@ -212,6 +212,65 @@ class LifecycleTests(unittest.TestCase):
         exported = workflow.export_findings(self.directory, {"events": [source]})
         self.assertEqual(exported["findings"][0]["finding"], raw)
 
+    def test_owner_waiver_stops_recovering_settled_vetters_without_claiming_review_completion(self):
+        for status, cause, decision in (("failed", "transient", "retry_route"),
+                                        ("stopped", "cancelled", "runtime_rejection"),
+                                        ("blocked", "evidence-gap", "report_correction")):
+            with self.subTest(status=status, cause=cause):
+                run = FIXTURES.WorkflowTests().discovered(findings=[FIXTURES.raw()])
+                run = workflow.apply_event(run, FIXTURES.event("assignment", FIXTURES.assignment(
+                    "vet", FIXTURES.MODEL_B, "vet", finding_ids=["review-01"])))
+                run = workflow.apply_event(run, FIXTURES.event("started", FIXTURES.start("vet", FIXTURES.MODEL_B)))
+                row = run["targets"][FIXTURES.TARGET]["assignments"]["vet"]
+                run = workflow.apply_event(run, FIXTURES.event("runtime-outcome", {
+                    "assignment_id": "vet", "runtime_handle": row["runtime_handle"], "target": FIXTURES.FROZEN,
+                    "status": status, "cause": cause, "evidence": "native receipt confirms the exact vet attempt ended"}))
+                self.assertEqual(workflow.next_decision(run, run["targets"][FIXTURES.TARGET])["code"], decision)
+                run = workflow.apply_event(run, FIXTURES.event("stage-waiver", {
+                    "stage": "vetting", "snapshot_fingerprint": FIXTURES.FROZEN["source_fingerprint"],
+                    "evidence": "Owner waived independent vetting after the recorded terminal attempt."}))
+                self.assertEqual(workflow.next_decision(run, run["targets"][FIXTURES.TARGET])["code"], "owner_assessment")
+                judgment = FIXTURES.adjudication(disposition="UNVETTED")
+                run = workflow.apply_event(run, FIXTURES.event("adjudication", judgment))
+                target = run["targets"][FIXTURES.TARGET]
+                self.assertTrue(workflow.local_assessment_complete(target))
+                self.assertEqual(workflow.next_decision(run, target)["status"], "assessment-complete")
+                self.assertEqual(target["assignments"]["vet"]["runtime_outcome"]["status"], status)
+                self.assertEqual(target["vets"], {})
+                self.assertIn("assignment vet: " + status, workflow.completion_gaps(run, target))
+                with self.assertRaises(workflow.NeedsDecision):
+                    workflow.apply_event(run, FIXTURES.event("complete", {"coverage_evidence": "Owner assessments recorded."}))
+                run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "changed", "components": ["source"]}))
+                self.assertEqual(workflow.next_decision(run, run["targets"][FIXTURES.TARGET])["code"], "source_integrity")
+
+    def test_vetting_waiver_retains_discovery_active_runtime_and_source_failure_holds(self):
+        for kind, status, decision in (("discovery", "failed", "retry_route"),
+                                       ("vet", "queued", "task_preflight"),
+                                       ("vet", "running", "runtime_completion"),
+                                       ("vet", "unknown", "runtime_reconciliation"),
+                                       ("vet", "source", "runtime_rejection")):
+            with self.subTest(kind=kind, status=status):
+                fixtures = FIXTURES.WorkflowTests()
+                run = fixtures.prepared() if kind == "discovery" else fixtures.discovered(findings=[FIXTURES.raw()])
+                model = FIXTURES.MODEL_A if kind == "discovery" else FIXTURES.MODEL_B
+                run = workflow.apply_event(run, FIXTURES.event("assignment", FIXTURES.assignment(
+                    "attempt", model, kind, **({"finding_ids": ["review-01"]} if kind == "vet" else {}))))
+                if status != "queued":
+                    run = workflow.apply_event(run, FIXTURES.event("started", FIXTURES.start("attempt", model)))
+                if status in ("failed", "unknown", "source"):
+                    row = run["targets"][FIXTURES.TARGET]["assignments"]["attempt"]
+                    run = workflow.apply_event(run, FIXTURES.event("runtime-outcome", {
+                        "assignment_id": "attempt", "runtime_handle": row["runtime_handle"], "target": FIXTURES.FROZEN,
+                        "status": "unknown" if status == "unknown" else "failed",
+                        "cause": "source" if status == "source" else "transient",
+                        "evidence": "native receipt records the exact attempt's current outcome"}))
+                run = workflow.apply_event(run, FIXTURES.event("stage-waiver", {
+                    "stage": "vetting", "snapshot_fingerprint": FIXTURES.FROZEN["source_fingerprint"],
+                    "evidence": "Owner requested local assessments while preserving discovery and native safety holds."}))
+                if status == "source":
+                    run = workflow.apply_event(run, FIXTURES.event("adjudication", FIXTURES.adjudication(disposition="UNVETTED")))
+                self.assertEqual(workflow.next_decision(run, run["targets"][FIXTURES.TARGET])["code"], decision)
+
     def test_pending_launch_blocks_new_mutations_without_invalidating_started(self):
         run = FIXTURES.WorkflowTests().prepared()
         run = workflow.apply_event(run, FIXTURES.event("assignment", FIXTURES.assignment()))

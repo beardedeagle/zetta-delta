@@ -233,6 +233,59 @@ def invalid_constant(value: str) -> None:
     raise ValueError("Non-JSON numeric constant")
 
 
+@dataclass(frozen=True, slots=True)
+class RawNumber:
+    """Retain a numeric token validated by the public JSON decoder hooks.
+
+    Attributes:
+        literal (str): Original JSON number, without float or integer conversion.
+    """
+
+    literal: str
+
+
+def encode_json(value: object) -> bytes:
+    """Serialize decoded JSON without changing numeric tokens or nesting limits.
+
+    Args:
+        value (object): Validated JSON tree whose numbers are RawNumber instances.
+
+    Returns:
+        bytes: Compact UTF-8 JSON preserving every original numeric literal.
+
+    Raises:
+        TypeError: A leaf is not a supported JSON value.
+        UnicodeError: A string cannot be encoded as UTF-8.
+        ValueError: A leaf is a non-JSON numeric constant.
+    """
+    fragments = []
+    pending = [(False, value)]
+    while pending:
+        raw, item = pending.pop()
+        if raw:
+            fragments.append(str(item))
+        elif isinstance(item, RawNumber):
+            fragments.append(item.literal)
+        elif isinstance(item, dict):
+            fragments.append("{")
+            pending.append((True, "}"))
+            for index, (key, member) in enumerate(reversed(item.items())):
+                if index:
+                    pending.append((True, ","))
+                pending.append((False, member))
+                pending.append((True, json.dumps(key, ensure_ascii=False) + ":"))
+        elif isinstance(item, list):
+            fragments.append("[")
+            pending.append((True, "]"))
+            for index, member in enumerate(reversed(item)):
+                if index:
+                    pending.append((True, ","))
+                pending.append((False, member))
+        else:
+            fragments.append(json.dumps(item, ensure_ascii=False, allow_nan=False))
+    return "".join(fragments).encode()
+
+
 def normalize(body: bytes) -> tuple[bytes, int]:
     """Return request bytes and the number of corrected settings schemas.
 
@@ -246,7 +299,8 @@ def normalize(body: bytes) -> tuple[bytes, int]:
         ValueError: Input is invalid JSON, contains duplicate keys, or cannot
             retain JSON values during serialization.
     """
-    request = json.loads(body, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    request = json.loads(body, object_pairs_hook=unique_object, parse_constant=invalid_constant,
+                         parse_int=RawNumber, parse_float=RawNumber)
     tools = request.get("tools") if isinstance(request, dict) else None
     count = 0
     for tool in tools if isinstance(tools, list) else []:
@@ -271,9 +325,7 @@ def normalize(body: bytes) -> tuple[bytes, int]:
                 count += 1
     if not count:
         return body, 0
-    return json.dumps(
-        request, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-    ).encode(), count
+    return encode_json(request), count
 
 
 def create_app(capability: str) -> web.Application:
