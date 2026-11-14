@@ -151,6 +151,27 @@ def owned_directory(path: Path) -> None:
         raise ValueError("runtime storage must be an owned, nonredirected directory without external write access")
 
 
+def make_owned_directory(path: Path) -> None:
+    """Create missing managed directory components with private permissions.
+
+    Args:
+        path (Path): Absolute runtime or backup directory to create or validate.
+
+    Raises:
+        OSError: A component cannot be created or inspected.
+        ValueError: Existing or newly created storage fails ownership validation.
+    """
+    missing = []
+    existing = path
+    while not existing.exists():
+        missing.append(existing)
+        existing = existing.parent
+    owned_directory(existing)
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        owned_directory(directory)
+
+
 def source_revision(sources: dict[str, Path]) -> str | None:
     """Read optional source provenance; installed content hashes remain authoritative.
 
@@ -246,8 +267,7 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
         raise ValueError("runtime scripts already exist; rerun with --force to preserve and replace them")
     if dry_run:
         return {"runtime": expected, "changed": True, "dry_run": True, "destination": str(scripts)}
-    destination.mkdir(parents=True, exist_ok=True)
-    owned_directory(destination)
+    make_owned_directory(destination)
     descriptor = os.open(destination / ".install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "r+") as lock:
         if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode) or os.fstat(lock.fileno()).st_uid != os.getuid():
@@ -264,12 +284,11 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
             except (OSError, ValueError, AttributeError):
                 # A broken old receipt must not prevent an explicitly forced repair.
                 pass
-        releases.mkdir(exist_ok=True)
-        owned_directory(releases)
+        make_owned_directory(releases)
         with tempfile.TemporaryDirectory(prefix=".pending-", dir=releases) as temporary:
             pending = Path(temporary)
             staged = pending / "scripts"
-            staged.mkdir()
+            staged.mkdir(mode=0o700)
             for name, source in sources.items():
                 shutil.copy2(source, staged / name)
                 (staged / name).chmod(0o644)
@@ -289,7 +308,7 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
         try:
             if scripts.exists() or scripts.is_symlink():
                 backup = backup_root / str(scripts).lstrip(os.sep)
-                backup.parent.mkdir(parents=True, exist_ok=True)
+                make_owned_directory(backup.parent)
                 if backup.exists() or backup.is_symlink():
                     raise ValueError("runtime backup already exists; use a fresh backup root")
                 if scripts.is_symlink():

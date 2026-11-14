@@ -113,6 +113,28 @@ class SchemaTests(unittest.TestCase):
         self.assertIn(b'"nested":' + b"[" * depth + b"9007199254740993.0" + b"]" * depth, corrected)
         self.assertEqual(adapter.normalize(corrected), (corrected, 0))
 
+    def test_schema_correction_preserves_accepted_escaped_surrogate_values_and_keys(self):
+        for escape in (b"\\ud800", b"\\udfff"):
+            for fragment in (b'"messages":[{"content":"' + escape + b'"}]',
+                             b'"extra":{"' + escape + b'":1E+400}'):
+                with self.subTest(escape=escape, fragment=fragment):
+                    original = request_body()
+                    original["unicode-😀"] = "café 東京 😀"
+                    if fragment.startswith(b'"messages":'):
+                        original.pop("messages")
+                    body = (json.dumps(original).encode()[:-1] + b"," + fragment
+                            + b',"numbers":[1e400,-0,9007199254740993.0]}')
+                    unchanged = body.replace(b'"delta_settings"', b'"other_tool"')
+                    self.assertEqual(adapter.normalize(unchanged), (unchanged, 0))
+                    expected = json.loads(body, parse_int=str, parse_float=str)
+                    expected["tools"][0]["function"]["parameters"]["properties"]["value"]["anyOf"][1]["items"] = {}
+                    corrected, count = adapter.normalize(body)
+                    self.assertEqual(count, 1)
+                    self.assertEqual(json.loads(corrected, parse_int=str, parse_float=str), expected)
+                    self.assertIn(b'"numbers":[1e400,-0,9007199254740993.0]', corrected)
+                    self.assertIn(escape, corrected)
+                    self.assertEqual(adapter.normalize(corrected), (corrected, 0))
+
     def test_changed_or_already_corrected_native_shapes_are_byte_preserved(self):
         for branch in (
             {"type": "array", "items": {}},

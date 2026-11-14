@@ -452,7 +452,7 @@ PLANNED=()
 backup() { # DEST: save DEST under BACKUP_DIR before it changes
   local saved="$BACKUP_DIR/${1#/}"
   [[ -d $BACKUP_DIR ]] || info "saving the files this install changes under $BACKUP_DIR"
-  mkdir -p -- "$(dirname -- "$saved")"
+  (umask 077; mkdir -p -- "$(dirname -- "$saved")")
   if [[ $1 == "$CONFIG_DIR/settings.json" ]]; then
     # Keep the link for restoration and snapshot its content privately without
     # changing the original target's permissions. A dangling link has no content.

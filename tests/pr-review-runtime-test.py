@@ -112,6 +112,48 @@ class RuntimeTests(unittest.TestCase):
             (self.source / "ensure-context-indexes.py").write_text("# independent index helper\n")
             self.assertEqual(runtime.identity(), expected)
 
+    def test_group_writable_umask_keeps_new_runtime_and_backup_directories_private(self):
+        existing = self.base / "existing"
+        existing.mkdir(mode=0o750)
+        peer = existing / "peer.txt"
+        peer.write_text("unrelated peer data\n")
+        before = self.legacy_record(existing)
+        self.destination = existing / "new/share/review"
+        self.backup = existing / "state/backups/current"
+        previous = os.umask(0o002)
+        try:
+            first = self.install()
+            original = Path(first["release"])
+            (self.source / "workflow.py").write_text("# upgraded runtime\n")
+            result = self.install(force=True)
+            self.assertFalse(self.install(force=True)["changed"])
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE(existing.stat().st_mode), before["."]["mode"])
+        self.assertEqual(peer.read_bytes(), before["peer.txt"]["bytes"])
+        self.assertEqual(stat.S_IMODE(peer.stat().st_mode), before["peer.txt"]["mode"])
+        for path in existing.rglob("*"):
+            if stat.S_ISDIR(path.lstat().st_mode):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700, path)
+        self.assertEqual(Path(result["backup"]).resolve(), original)
+        with patch.object(runtime, "__file__", str(self.destination / "scripts/runtime.py")):
+            self.assertEqual(runtime.identity(), result["runtime"])
+
+    def test_existing_group_writable_directory_is_rejected_without_changing_it(self):
+        self.destination.mkdir()
+        peer = self.destination / "peer.txt"
+        peer.write_text("unrelated peer data\n")
+        self.destination.chmod(0o775)
+        before = self.legacy_record(self.destination)
+        previous = os.umask(0o002)
+        try:
+            with self.assertRaisesRegex(ValueError, "external write access"):
+                self.install()
+        finally:
+            os.umask(previous)
+        self.assertEqual(self.legacy_record(self.destination), before)
+        self.assertFalse(self.backup.exists())
+
     def test_manifest_is_verified_and_legacy_files_are_preserved_before_switch(self):
         scripts = self.destination / "scripts"
         scripts.mkdir(parents=True)

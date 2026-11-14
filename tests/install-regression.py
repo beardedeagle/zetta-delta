@@ -427,6 +427,33 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("usage:", result.stdout)
 
+    def test_legacy_skill_upgrade_keeps_backups_private_under_group_writable_umask(self):
+        legacy = self.home / ".agents/skills/pr-review/scripts"
+        legacy.mkdir(parents=True)
+        original = legacy / "workflow.py"
+        original.write_bytes(b"# original private skill callback\n")
+        state_mode = (self.base / "state").stat().st_mode
+        previous = os.umask(0o002)
+        try:
+            result = self.install("--force")
+        finally:
+            os.umask(previous)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.base / "state").stat().st_mode, state_mode)
+        backups = self.base / "state/zetta-delta/backups"
+        saved = list(backups.glob("*/" + str(original).lstrip("/")))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), b"# original private skill callback\n")
+        for path in backups.rglob("*"):
+            if path.is_dir() and not path.is_symlink():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700, path)
+        runtime = self.home / ".local/share/zetta-delta/review/scripts"
+        self.assertTrue(runtime.is_symlink())
+        identity = subprocess.run([sys.executable, str(runtime / "runtime.py"), "identity"],
+                                  env=self.env, text=True, capture_output=True, check=False)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(json.loads(identity.stdout), json.loads((runtime / "runtime-manifest.json").read_text())["runtime"])
+
     def test_missing_settings_and_runtime_tools_refuse_before_writes(self):
         settings = self.config / "settings.json"
         settings.unlink()

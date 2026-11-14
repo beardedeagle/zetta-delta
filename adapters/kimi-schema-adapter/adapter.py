@@ -245,7 +245,7 @@ class RawNumber:
 
 
 def encode_json(value: object) -> bytes:
-    """Serialize decoded JSON without changing numeric tokens or nesting limits.
+    """Escape decoded strings without changing numeric tokens or nesting limits.
 
     Args:
         value (object): Validated JSON tree whose numbers are RawNumber instances.
@@ -255,7 +255,6 @@ def encode_json(value: object) -> bytes:
 
     Raises:
         TypeError: A leaf is not a supported JSON value.
-        UnicodeError: A string cannot be encoded as UTF-8.
         ValueError: A leaf is a non-JSON numeric constant.
     """
     fragments = []
@@ -273,7 +272,7 @@ def encode_json(value: object) -> bytes:
                 if index:
                     pending.append((True, ","))
                 pending.append((False, member))
-                pending.append((True, json.dumps(key, ensure_ascii=False) + ":"))
+                pending.append((True, json.dumps(key, ensure_ascii=True) + ":"))
         elif isinstance(item, list):
             fragments.append("[")
             pending.append((True, "]"))
@@ -282,7 +281,7 @@ def encode_json(value: object) -> bytes:
                     pending.append((True, ","))
                 pending.append((False, member))
         else:
-            fragments.append(json.dumps(item, ensure_ascii=False, allow_nan=False))
+            fragments.append(json.dumps(item, ensure_ascii=True, allow_nan=False))
     return "".join(fragments).encode()
 
 
