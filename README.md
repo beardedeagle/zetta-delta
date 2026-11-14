@@ -260,6 +260,8 @@ This route can run while Delta is open. It stages and verifies a complete releas
 under `~/.local/share/zetta-delta/review/releases/`, then switches the existing
 `review/scripts` link. New commands use that release; entrypoint wrappers resolve
 the link once so an active command continues using the release it opened. The
+direct workflow and runtime CLIs re-enter their resolved script before loading
+local modules, keeping code, dependencies and identity in one release. The
 first upgrade preserves the old scripts directory in the installer backup; later
 upgrades save a link to the previous release. Restore that backup as
 `review/scripts` to roll back. Release installation never replaces `review/runs`.

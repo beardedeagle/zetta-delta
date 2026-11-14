@@ -1,5 +1,15 @@
 """Identify review code and install complete, independently pinned releases."""
 
+# Re-enter shared CLI aliases before imports can observe a different release.
+if __name__ == "__main__":
+    import runpy as _runpy
+    from pathlib import Path as _Path
+
+    _script = _Path(__file__).resolve(strict=True)
+    if _script != _Path(__file__).absolute():
+        _runpy.run_path(str(_script), run_name="__main__")
+        raise SystemExit(0)
+
 import argparse
 import fcntl
 import hashlib

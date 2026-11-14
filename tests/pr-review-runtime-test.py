@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,52 @@ SPEC = importlib.util.spec_from_file_location("review_runtime", ROOT / "review/s
 assert SPEC is not None and SPEC.loader is not None
 runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
+
+CLI_BOOTSTRAP_PROBE = r"""
+import io
+import json
+import os
+import runpy
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+invoked, alias, replacement = map(Path, sys.argv[1:4])
+wrapper = sys.argv[4] == "wrapper"
+arguments = json.loads(sys.argv[5])
+observed = {}
+
+def trace(frame, event, argument):
+    if event == "line" and frame.f_code.co_filename == str(invoked) and "switched" not in observed:
+        if not wrapper or "scripts" in frame.f_globals:
+            os.replace(replacement, alias)
+            observed["switched"] = True
+    if event == "call" and frame.f_code.co_name == "main":
+        observed["namespace"] = frame.f_globals
+        observed["argv"] = list(sys.argv)
+        observed["flags"] = [sys.flags.isolated, sys.flags.no_site, sys.flags.utf8_mode,
+                             sys.flags.dont_write_bytecode]
+    return trace
+
+stdout, stderr = io.StringIO(), io.StringIO()
+sys.argv = [str(invoked), *arguments]
+with redirect_stdout(stdout), redirect_stderr(stderr):
+    sys.settrace(trace)
+    try:
+        runpy.run_path(str(invoked), run_name="__main__")
+        observed["exit"] = 0
+    except SystemExit as error:
+        observed["exit"] = error.code or 0
+    finally:
+        sys.settrace(None)
+namespace = observed.pop("namespace")
+module = namespace.get("runtime")
+identity = module.identity() if module else namespace["identity"]()
+observed.update(marker=namespace["_CLI_RELEASE_MARKER"], filename=namespace["__file__"],
+                fingerprint=identity["fingerprint"], runtime_file=module.__file__ if module else None,
+                stdout=stdout.getvalue(), stderr=stderr.getvalue())
+print(json.dumps(observed))
+"""
 
 
 class RuntimeTests(unittest.TestCase):
@@ -36,6 +83,93 @@ class RuntimeTests(unittest.TestCase):
 
     def install(self, **kwargs):
         return runtime.install(self.destination, self.backup, sources={p.name: p for p in self.source.iterdir()}, **kwargs)
+
+    def cli_releases(self) -> tuple[dict, dict]:
+        """Install genuine bundles with harmless markers distinguishing their code.
+
+        Returns:
+            tuple[dict, dict]: Complete installed releases A and B.
+        """
+        for name in ("workflow.py", "runtime.py"):
+            path = self.source / name
+            head, tail = path.read_text().rsplit('\nif __name__ == "__main__":\n', 1)
+            path.write_text(head + '\n_CLI_RELEASE_MARKER = "A"\n\nif __name__ == "__main__":\n' + tail)
+        first = self.install()
+        for name in ("workflow.py", "runtime.py"):
+            path = self.source / name
+            path.write_text(path.read_text().replace('_CLI_RELEASE_MARKER = "A"', '_CLI_RELEASE_MARKER = "B"'))
+        return first, self.install(force=True)
+
+    def cli_race(self, first: dict, second: dict, name: str, arguments: list[str], *,
+                 kind: str = "direct") -> dict:
+        """Switch the alias after Python opens A but before its first statement.
+
+        Args:
+            first (dict): Initially selected immutable release.
+            second (dict): Complete release published at the deterministic fence.
+            name (str): Supported workflow or runtime script.
+            arguments (list[str]): Original CLI argument tail.
+            kind (str): Direct shared path, canonical path or skill wrapper.
+
+        Returns:
+            dict: Observed code marker, imports, identity, flags, argv and exit.
+        """
+        alias = self.destination / "scripts"
+        alias.unlink()
+        alias.symlink_to(first["release"], target_is_directory=True)
+        replacement = self.destination / ".probe-release-switch"
+        replacement.symlink_to(second["release"], target_is_directory=True)
+        invoked = alias / name
+        if kind == "canonical":
+            invoked = Path(first["release"]) / name
+        elif kind == "wrapper":
+            invoked = self.base / "skill/scripts" / name
+            invoked.parent.mkdir(parents=True, exist_ok=True)
+            template = (ROOT / "review/entrypoint.py.tmpl").read_text()
+            invoked.write_text(template.replace("{{REVIEW_SCRIPTS_PY}}", repr(str(alias))))
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-X", "utf8=1", "-c", CLI_BOOTSTRAP_PROBE,
+                                 str(invoked), str(alias), str(replacement), kind, json.dumps(arguments)],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_direct_shared_clis_keep_code_imports_and_identity_in_one_release(self):
+        first, second = self.cli_releases()
+        for name, arguments in (("workflow.py", ["--help"]), ("runtime.py", ["identity"])):
+            with self.subTest(script=name):
+                observed = self.cli_race(first, second, name, arguments)
+                self.assertEqual(observed["marker"], "B")
+                self.assertEqual(observed["fingerprint"], second["runtime"]["fingerprint"])
+                self.assertEqual(observed["filename"], str(Path(second["release"]) / name))
+                self.assertEqual(observed["argv"], [str(Path(second["release"]) / name), *arguments])
+                self.assertEqual(observed["flags"], [1, 1, 1, 1])
+                self.assertEqual(observed["exit"], 0)
+                if name == "workflow.py":
+                    self.assertEqual(observed["runtime_file"], str(Path(second["release"]) / "runtime.py"))
+
+    def test_canonical_and_wrapper_clis_keep_the_release_they_already_selected(self):
+        first, second = self.cli_releases()
+        for kind, name in (("canonical", "workflow.py"), ("canonical", "runtime.py"), ("wrapper", "workflow.py")):
+            with self.subTest(kind=kind, script=name):
+                observed = self.cli_race(first, second, name, ["--help"], kind=kind)
+                self.assertEqual(observed["marker"], "A")
+                self.assertEqual(observed["fingerprint"], first["runtime"]["fingerprint"])
+                self.assertEqual(observed["filename"], str(Path(first["release"]) / name))
+                self.assertEqual(observed["flags"], [1, 1, 1, 1])
+                self.assertEqual(observed["exit"], 0)
+
+    def test_direct_cli_bootstrap_preserves_parser_errors_flags_and_arguments(self):
+        first, second = self.cli_releases()
+        arguments = ["--unsupported-option"]
+        for name in ("workflow.py", "runtime.py"):
+            with self.subTest(script=name):
+                observed = self.cli_race(first, second, name, arguments)
+                self.assertEqual(observed["marker"], "B")
+                self.assertEqual(observed["fingerprint"], second["runtime"]["fingerprint"])
+                self.assertEqual(observed["argv"][1:], arguments)
+                self.assertEqual(observed["flags"], [1, 1, 1, 1])
+                self.assertEqual(observed["exit"], 2)
+                self.assertIn("error:", observed["stderr"])
 
     def pending_helper_upgrade(self, *, legacy: bool = False) -> tuple:
         """Retain an offline setup record while replacing its installed release.
