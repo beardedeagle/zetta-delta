@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 if __name__ == "__main__":
-    scripts = Path({{REVIEW_SCRIPTS_PY}})
+    # Pin this command to one complete release before importing sibling modules.
+    scripts = Path({{REVIEW_SCRIPTS_PY}}).resolve(strict=True)
+    sys.dont_write_bytecode = True
     sys.path.insert(0, str(scripts))
     runpy.run_path(str(scripts / Path(__file__).name), run_name="__main__")

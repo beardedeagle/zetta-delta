@@ -90,7 +90,7 @@ check "piped install: pr-review skill" "$(cd "$T/home/.agents/skills/pr-review" 
 check "piped install: pr-review-batch skill" "$(cd "$T/home/.agents/skills/pr-review-batch" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
   "./SKILL.md ./references/effective-identity.md ./references/identity-registry.json ./references/notes.md ./references/repositories.md ./references/review-intake.md ./references/review-publication.md ./references/review-voice-sources.md ./references/review-voice.md ./references/review-workflow.md ./references/roster.md ./scripts/identity.py ./scripts/intake.py ./scripts/workflow.py "
 check "piped install: one shared review runtime" "$(cd "$T/home/.local/share/zetta-delta/review/scripts" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
-  "./ensure-context-indexes.py ./handoff.py ./identity.py ./intake.py ./preparation.py ./publication.py ./review_contract.py ./workflow.py "
+  "./ensure-context-indexes.py ./handoff.py ./identity.py ./intake.py ./preparation.py ./publication.py ./review_contract.py ./runtime-manifest.json ./runtime.py ./workflow.py "
 check "piped install: find-docs skill" "$(cmp -s "$ROOT/skills/find-docs/SKILL.md" "$T/home/.agents/skills/find-docs/SKILL.md" && echo same)" "same"
 check "piped install: one roster and one bon.sh for every skill" "$(cd "$T/home/.agents/skills" \
   && cmp -s orchestrate/references/roster.md adversarial/references/roster.md \

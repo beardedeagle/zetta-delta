@@ -18,11 +18,15 @@ import tempfile
 import uuid
 from pathlib import Path
 
+# Resolve a versioned installation once, including direct saved CLI paths.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import handoff
 import intake
 import preparation
 import publication
 import review_contract as contract
+import runtime
 from review_contract import (
     SEVERITIES,
     NeedsDecision,
@@ -100,7 +104,8 @@ def target_record(repository: str, metadata: dict) -> dict:
             "vet_history": {}, "adjudication_history": {},
             "baselines": {}, "integrity": [], "test_copies": [], "resources_removed": False,
             "setup": None, "index_setup": None, "catalog": None, "discussion_decision": None,
-            "publication_context": None, "publication_discussion": None}
+            "publication_context": None, "publication_discussion": None,
+            "integrity_resolutions": {}}
 
 
 def run_record(method: str, collection: dict, registry: dict, orchestrator: dict,
@@ -377,11 +382,61 @@ def integrity_failures(run: dict) -> tuple[list[str], list[str]]:
             assignment IDs with unsafe accepted or rejected reports, in record order.
     """
     targets = [key for key, target in run["targets"].items()
-               if any(check["status"] != "unchanged" for check in target["integrity"])]
+               if any(check["status"] != "unchanged" and str(index) not in target.get("integrity_resolutions", {})
+                      for index, check in enumerate(target["integrity"]))]
     assignments = [key for target in run["targets"].values() for key, row in target["assignments"].items()
                    if (row["report"] and row["report"]["source_status"] != "unchanged")
                    or row.get("rejected_report", {}).get("source_status", "unchanged") != "unchanged"]
     return targets, assignments
+
+
+def validate_integrity_resolution(run: dict, key: str, data: dict) -> None:
+    """Bind a bookkeeping resolution to original and fresh engine observations.
+
+    Args:
+        run (dict): Replayed journal with a fresh, successful complete check.
+        key (str): Target that owns the historical incident.
+        data (dict): Exact incident, snapshot, administration and check bindings.
+
+    Raises:
+        ValueError: Evidence is stale, duplicated, unbound or not bookkeeping.
+    """
+    fields(data, ("observation", "observation_sha256", "check", "snapshot_fingerprint",
+                  "native_copies_sha256", "cause", "evidence"))
+    target = run["targets"][key]
+    index, check = data["observation"], data["check"]
+    if (type(index) is not int or type(check) is not int or not 0 <= index < check
+            or check != len(target["integrity"]) - 1
+            or str(index) in target.get("integrity_resolutions", {})):
+        raise ValueError("resolution requires an unresolved incident and the latest later check")
+    original = target["integrity"][index]
+    if original["status"] == "unchanged" or target["integrity"][check]["status"] != "unchanged":
+        raise ValueError("bookkeeping resolution requires a fresh unchanged complete check")
+    frozen = target["frozen"]
+    if (frozen is None or target["resources_removed"]
+            or data["snapshot_fingerprint"] != frozen["source_fingerprint"]
+            or data["observation_sha256"] != preparation.fingerprint(original)
+            or data["native_copies_sha256"] != preparation.fingerprint({"copies": runtime_copies(run)})):
+        raise ValueError("resolution evidence differs from its original snapshot or administration")
+    choice(data["cause"], ("completed-native-copy", "registered-native-administration"), "resolution cause")
+    evidence(data["evidence"])
+    settled = {row["runtime_copy"]["root"]: row["runtime_copy"]
+               for item in run["targets"].values() for row in item["assignments"].values()
+               if row["status"] not in ("queued", "running") and "runtime_copy" in row}
+    active = set(active_native_roots(run))
+    settled = {root: proof for root, proof in settled.items() if root not in active}
+    if not settled or not original["components"]:
+        raise ValueError("resolution requires recorded settled native administration")
+    allowed = {"native:" + root for root in settled}
+    allowed.update("native-store:" + proof["git_dir"] for proof in settled.values() if "clone_store" in proof)
+    if data["cause"] == "registered-native-administration":
+        if not any(proof.get("ref") or proof.get("clone_store") for proof in settled.values()):
+            raise ValueError("administration resolution requires exact registered Git references")
+        allowed.add("parent")
+        allowed.update("copy:" + owner + "/" + name for owner, item in run["targets"].items()
+                       for name in item["baselines"])
+    if not set(original["components"]) <= allowed:
+        raise ValueError("source, artifact and unrelated failures cannot use bookkeeping recovery")
 
 
 def pending_launches(run: dict) -> list[tuple[str, str]]:
@@ -734,6 +789,19 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
     """
     fields(event, ("target", "operation", "data"))
     result = copy.deepcopy(run)
+    if event["operation"] == "runtime-adopt":
+        data = fields(event["data"], ("before", "after", "evidence"))
+        if event["target"] is not None or data["before"] != result.get("runtime"):
+            raise ValueError("runtime adoption must bind the run's current runtime")
+        evidence(data["evidence"])
+        runtime.validate_identity(data["after"])
+        if not replay:
+            runtime.verify_recorded(data["after"])
+        result["runtime"] = copy.deepcopy(data["after"])
+        result.setdefault("runtime_history", []).append(copy.deepcopy(data))
+        result["revision"] += 1
+        result["events"].append(copy.deepcopy(event))
+        return result
     if event["operation"] == "native-parent":
         if event["target"] is not None or "admission_mode" not in result:
             raise ValueError("native-parent requires a new run operation with null target")
@@ -846,7 +914,11 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         paths(data["cache_paths"])
         target["index_setup"] = copy.deepcopy(data)
     elif operation == "baseline":
-        fields(data, ("id", "root", "fingerprint"), ("artifact", "artifact_sha256", "filesystem"))
+        fields(data, ("id", "root", "fingerprint"), ("artifact", "artifact_sha256", "filesystem", "exclude", "exclude_generated"))
+        if "exclude" in data:
+            paths(data["exclude"], empty=True)
+        if "exclude_generated" in data and type(data["exclude_generated"]) is not bool:
+            raise ValueError("generated-output exclusion must be boolean")
         if "filesystem" in data and ("project" not in target or data["filesystem"] is not True or "artifact" not in data):
             raise ValueError("filesystem baselines require generated project-parent evidence")
         if ("artifact" in data) != ("artifact_sha256" in data):
@@ -931,6 +1003,36 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
                            for name in ("before", "after"))):
                 raise ValueError("invalid generated-cache change")
         target["integrity"].append(copy.deepcopy(data))
+    elif operation == "integrity-resolution":
+        validate_integrity_resolution(result, event["target"], data)
+        target["integrity_resolutions"][str(data["observation"])] = copy.deepcopy(data)
+    elif operation == "stage-waiver":
+        fields(data, ("stage", "evidence", "snapshot_fingerprint"))
+        choice(data["stage"], ("vetting",), "waived stage")
+        evidence(data["evidence"])
+        if (target["frozen"] is None or target["resources_removed"]
+                or data["snapshot_fingerprint"] != target["frozen"]["source_fingerprint"]
+                or data["stage"] in target.get("stage_waivers", {})):
+            raise ValueError("waiver must bind a new stage and the current frozen snapshot")
+        target.setdefault("stage_waivers", {})[data["stage"]] = copy.deepcopy(data)
+    elif operation == "baseline-policy":
+        fields(data, ("root", "policy", "check", "evidence"))
+        policy = fields(data["policy"], ("fingerprint", "exclude", "exclude_generated"))
+        frozen = target["frozen"]
+        if frozen is None or "project" not in target or target["resources_removed"]:
+            raise ValueError("legacy policy migration requires retained project evidence")
+        originals = {frozen["parent_root"]: frozen["parent_fingerprint"]}
+        originals.update({row["root"]: row["fingerprint"] for row in target["baselines"].values() if row.get("filesystem")})
+        exclusions = {name for name, reason in frozen["manifest"]["excluded"].items() if reason != "Git metadata"}
+        paths(policy["exclude"], empty=True)
+        if (data["root"] not in originals or originals[data["root"]] != policy["fingerprint"]
+                or not set(policy["exclude"]) <= exclusions or type(policy["exclude_generated"]) is not bool
+                or data["root"] in target.get("baseline_policies", {})
+                or type(data["check"]) is not int or data["check"] != len(target["integrity"]) - 1
+                or data["check"] < 0 or target["integrity"][data["check"]]["status"] != "unchanged"):
+            raise ValueError("legacy policy must bind original evidence and its fresh complete check")
+        evidence(data["evidence"])
+        target.setdefault("baseline_policies", {})[data["root"]] = copy.deepcopy(policy)
     elif operation == "test-copy":
         fields(data, ("root",))
         if not target["authorization"] or not target["authorization"]["test_execution"]:
@@ -1055,7 +1157,7 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         contract.task_block(result, event["target"], key, replay=replay, directory=directory)
     elif operation == "recover":
         require_phase(target, "discovery", "vetting", "adjudication")
-        row = contract.recovery(result, target, data)
+        row = contract.recovery(result, target, data, replay=replay)
         target["assignments"][row["id"]] = row
         if data["kind"] != "follow-up":
             target["assignments"][data["assignment_id"]]["superseded_by"] = row["id"]
@@ -1116,6 +1218,8 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             raise ValueError("runtime identity does not match assignment")
         if actual["lane"] in result["unavailable_lanes"]:
             raise NeedsDecision("unavailable_lane", "this effective lane is unavailable for the run")
+        if not replay:
+            contract.provider_capacity(result, target, row)
         handle = identity.text(data["runtime_handle"], "runtime handle")
         reuse = row.get("recovery", {}).get("runtime_handle")
         if reuse is not None and handle != reuse:
@@ -1130,7 +1234,9 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
         if "runtime_parent_root" in data and "runtime_root" not in data:
             raise ValueError("native parent declaration requires an actual runtime root")
         if "runtime_copy" in data:
-            proof = fields(data["runtime_copy"], ("root", "parent_root", "common_dir", "git_dir", "mode", "ref", "head", "created_dirs", "fingerprint"), ("clone_store", "project_root"))
+            proof = fields(data["runtime_copy"], ("root", "parent_root", "common_dir", "git_dir", "mode", "ref", "head", "created_dirs", "fingerprint"), ("clone_store", "project_root", "exclude_generated"))
+            if "exclude_generated" in proof and type(proof["exclude_generated"]) is not bool:
+                raise ValueError("native generated-output exclusion must be boolean")
             parents = {unit["parent_root"] for item in result["targets"].values()
                        for unit in [item["frozen"] or item["setup"]] if unit is not None}
             parents.update(record["root"] for item in result["targets"].values() for record in item["baselines"].values())
@@ -1316,6 +1422,9 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             raise ValueError("adjudication requires an existing unadjudicated finding")
         vet = target["vets"].get(key)
         delegated = target["plan"]["routing"]["stand_in"]
+        local_only = bool(target.get("stage_waivers", {}).get("vetting") and data["disposition"] == "UNVETTED")
+        if local_only:
+            delegated = None
         if delegated is None:
             if data.get("assignment_id") is not None:
                 raise ValueError("this finding requires personal orchestrator adjudication")
@@ -1331,11 +1440,11 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             adjudicator = row["actual_identity"]
         overlap = [stage for stage, person in (("finder", target["findings"][key]["finder"]), ("vetter", vet["vetter"] if vet else None))
                    if person and person["family"] == adjudicator["family"]]
-        if overlap:
+        if overlap and not local_only:
             raise NeedsDecision("independent_adjudication", "adjudication must use a different family from this finding's actual finder and vetter")
         if key in target["adjudications"]:
             target["adjudication_history"].setdefault(key, []).append(copy.deepcopy(target["adjudications"][key]))
-        target["adjudications"][key] = dict(copy.deepcopy(data), adjudicator=copy.deepcopy(adjudicator), family_overlap=[], vet_assignment_id=vet["assignment_id"] if vet else None)
+        target["adjudications"][key] = dict(copy.deepcopy(data), adjudicator=copy.deepcopy(adjudicator), family_overlap=overlap, vet_assignment_id=vet["assignment_id"] if vet else None)
         target["phase"] = "adjudication"
     elif operation == "gap":
         require_phase(target, "intake", "setup", "prepared", "discovery", "vetting", "adjudication")
@@ -1548,6 +1657,9 @@ def status(run: dict) -> dict:
                      "setup": target["setup"] if phase == "setup" else None,
                      "test_copies": target["test_copies"], "resources_removed": target["resources_removed"],
                      "catalog": target["catalog"], "plan": target["plan"],
+                      "stage_waivers": target.get("stage_waivers", {}),
+                      "integrity_resolutions": target.get("integrity_resolutions", {}),
+                      "local_assessment_complete": not any(integrity_failures(run)) and local_assessment_complete(target),
                      "recovery": [{"assignment_id": row["id"], "status": row["status"],
                                    "request": {name: row["recovery"][name] for name in ("kind", "unit_id", "assignment_id", "participant", "runtime_handle", "finding_id") if name in row["recovery"]} if row.get("recovery") else None,
                                    "runtime_outcome": row.get("runtime_outcome"),
@@ -1557,7 +1669,7 @@ def status(run: dict) -> dict:
                      "publication_context": target["publication_context"], "publication_discussion": target["publication_discussion"],
                      "publication": target["publication"],
                      "derived_event": review_event(target) if phase in ("complete", "publication-pending", "published") else None})
-    result = {"run_id": run["run_id"], "revision": run["revision"], "method": run["method"],
+    result = {"run_id": run["run_id"], "revision": run["revision"], "method": run["method"], "runtime": run.get("runtime"),
             "owner": run["owner"], "limits": {"per_thread": 15, "overall": 30},
             "admission_mode": run.get("admission_mode", "observed"), "native_parent": run.get("native_parent"),
             "unavailable_lanes": run["unavailable_lanes"],
@@ -1569,6 +1681,8 @@ def status(run: dict) -> dict:
         result["complete"] = bool(rows) and not any(integrity_failures(run)) and all(
             target["phase"] == "complete" and not completion_gaps(run, target) for target in run["targets"].values())
         result["project_requests"] = copy.deepcopy(run["intake"]["projects"])
+    if "family_limit" in run:
+        result["limits"]["per_family"] = run["family_limit"]
     return result
 
 
@@ -1694,6 +1808,10 @@ def report(run: dict) -> str:
         for field in ("discussion_decision", "publication_discussion", "authorization", "coverage_evidence"):
             lines.append(f"- {field}: {report_text(target.get(field) or 'not recorded')}")
         lines.append(f"- Source observations: {report_text(target['integrity'] or 'not observed')}; resources removed: {target['resources_removed']}.")
+        if target.get("integrity_resolutions"):
+            lines.append(f"- Audited bookkeeping resolutions: {report_text(target['integrity_resolutions'])}.")
+        if target.get("stage_waivers"):
+            lines.append(f"- Explicit owner stage waivers: {report_text(target['stage_waivers'])}; independent review remains incomplete.")
         if target["plan"]:
             plan = target["plan"]
             lines += [f"- Boundaries: {report_text(plan['boundary_evidence'])}", f"- Selection: {report_text(plan['selection_evidence'])}",
@@ -1793,7 +1911,7 @@ def next_decision(run: dict, target: dict) -> dict:
         return {"status": "needs_decision", "code": code, "reason": reason, **details}
     observations, integrity = integrity_failures(run)
     if observations:
-        return needs("source_integrity", "preserve unexpected changes and account for the recorded integrity failure; create a new run", target_ids=observations)
+        return needs("source_integrity", "preserve the incident and export available findings; resolve only proven bookkeeping differences after a fresh complete check", target_ids=observations)
     if target["resources_removed"]:
         return needs("resources_removed", "review resources were cleaned; create a new run for further work")
     if integrity:
@@ -1878,6 +1996,13 @@ def next_decision(run: dict, target: dict) -> dict:
     if gaps:
         return needs("discovery_coverage", "complete planned discovery before vetting or adjudication", gaps=gaps)
     unvetted = [key for key in target["findings"] if key not in target["vets"]]
+    if target.get("stage_waivers", {}).get("vetting"):
+        pending = [key for key in target["findings"] if key not in target["adjudications"]]
+        if pending:
+            return needs("owner_assessment", "owner waived separate vetting; provide evidenced orchestrator UNVETTED assessments", finding_ids=pending)
+        if local_assessment_complete(target):
+            return {"status": "assessment-complete", "code": "local_assessment_complete",
+                    "reason": "requested local assessments are recorded; independent vetting and publication remain incomplete"}
     if unvetted:
         routes = {}
         for key in unvetted:
@@ -2191,16 +2316,106 @@ def write_json(path, data):
             os.unlink(temporary)
 
 
+def export_findings(directory: Path, saved: dict) -> dict:
+    """Extract original reports without replay or live source checks.
+
+    Args:
+        directory (Path): Run directory containing retained report receipts.
+        saved (dict): Raw journal envelope, including failed or legacy events.
+
+    Returns:
+        dict: Available reports, findings and per-record extraction errors.
+
+    Raises:
+        TypeError: The envelope lacks an ordered event history.
+    """
+    if not isinstance(saved, dict) or not isinstance(saved.get("events"), list):
+        raise TypeError("export requires a journal event list")
+    result = {"assessment": "unvetted originals; extraction does not validate claims",
+              "reports": [], "findings": [], "errors": []}
+    seen = set()
+    for revision, event in enumerate(saved["events"], 1):
+        if not isinstance(event, dict) or not isinstance(event.get("data"), dict):
+            result["errors"].append({"revision": revision, "reason": "malformed event retained in original journal"})
+            continue
+        operation, data = event.get("operation"), event["data"]
+        if operation not in ("report-input", "report", "adjudication-report", "report-draft", "report-authored", "orchestrator-finding"):
+            continue
+        entry = {"revision": revision, "target": event.get("target"), "operation": operation,
+                 "assignment_id": data.get("assignment_id"), "source_status": data.get("source_status"),
+                 "validation_errors": copy.deepcopy(data.get("errors", []))}
+        try:
+            if operation in ("report-draft", "report-authored"):
+                original = json.loads(handoff.read(directory, data["report"]).decode("utf-8"))
+                entry["receipt"] = copy.deepcopy(data["report"])
+            elif operation == "report-input":
+                original = json.loads(data["report"]) if isinstance(data.get("report"), str) else data.get("report")
+            elif operation == "orchestrator-finding":
+                original = dict(data, findings=[data["finding"]])
+            else:
+                original = data
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError):
+            entry["raw"] = copy.deepcopy(data)
+            result["errors"].append({"revision": revision, "reason": "report could not be decoded or its receipt verified"})
+            result["reports"].append(entry)
+            continue
+        entry["report"] = copy.deepcopy(original)
+        result["reports"].append(entry)
+        if not isinstance(original, dict) or not isinstance(original.get("findings", []), list):
+            continue
+        for item in original.get("findings", []):
+            digest = preparation.fingerprint({"target": entry["target"], "assignment": entry["assignment_id"], "finding": item})
+            if digest in seen:
+                continue
+            seen.add(digest)
+            result["findings"].append({"revision": revision, "target": entry["target"],
+                                       "assignment_id": entry["assignment_id"], "operation": operation,
+                                       "finding": copy.deepcopy(item)})
+    return result
+
+
+def export_markdown(data: dict) -> str:
+    """Render every retained finding field without implying acceptance.
+
+    Args:
+        data (dict): Read-only export produced by export_findings.
+
+    Returns:
+        str: Markdown with original detail, provenance and extraction errors.
+    """
+    lines = ["# Available findings", "", report_text(data["assessment"]), ""]
+    for index, row in enumerate(data["findings"], 1):
+        item = row["finding"]
+        name = item.get("id", "unnamed") if isinstance(item, dict) else "malformed finding"
+        lines += [f"## {index}. {report_text(name)}", "",
+                  (f"Target: {report_text(row['target'])}; assignment: {report_text(row['assignment_id'])}; "
+                   f"record: {report_text(row['operation'])}; revision: {row['revision']}."), ""]
+        if isinstance(item, dict):
+            for field, value in item.items():
+                lines += [f"**{report_text(field)}:** {report_text(value)}", ""]
+        else:
+            lines += [report_text(item), ""]
+    if data["errors"]:
+        lines += ["## Unreadable retained reports", "", report_text(data["errors"]), ""]
+    return "\n".join(lines)
+
+
 def load_run(path):
     saved = read_json(path)
     if not isinstance(saved, dict) or saved.get("version") != 1:
         raise ValueError("unsupported run record")
     fields(saved, ("initial", "events", "version"))
     initial = saved["initial"]
-    fields(initial, ("method", "intake", "registry", "orchestrator", "thread_id", "run_id"), ("review_own_pr", "admission_mode"))
+    fields(initial, ("method", "intake", "registry", "orchestrator", "thread_id", "run_id"), ("review_own_pr", "admission_mode", "runtime", "family_limit"))
     run = new_run(initial["method"], initial["intake"], initial["registry"], initial["orchestrator"], initial["thread_id"],
                   review_own_pr=initial.get("review_own_pr", False), admission_mode=initial.get("admission_mode"))
     run["run_id"] = stable_id(initial["run_id"])
+    if "runtime" in initial:
+        run["runtime"] = copy.deepcopy(initial["runtime"])
+    if "family_limit" in initial:
+        if type(initial["family_limit"]) is not int or not 1 <= initial["family_limit"] <= 15:
+            raise ValueError("family limit must be an integer from 1 through 15")
+        run["family_limit"] = initial["family_limit"]
     if not isinstance(saved["events"], list):
         raise ValueError("events must be a list")  # noqa: TRY004 - validation errors retain the ValueError contract.
     for event in saved["events"]:
@@ -2257,6 +2472,39 @@ def runtime_copies(run: dict, extra: dict | None = None) -> tuple[dict, ...]:
     return tuple(copies.values())
 
 
+def active_native_roots(run: dict, extra: dict | None = None) -> tuple[str, ...]:
+    """Select live checkout scans without discarding historical administration.
+
+    Args:
+        run (dict): Replayed assignments, including retained completed reports.
+        extra (dict | None): Generated checkout awaiting start registration.
+
+    Returns:
+        tuple[str, ...]: Roots still owned by active work, including shared roots.
+    """
+    roots = {row["runtime_copy"]["root"] for target in run["targets"].values()
+             for row in target["assignments"].values()
+             if row["status"] in ("queued", "running") and "runtime_copy" in row}
+    if extra is not None:
+        roots.add(extra["root"])
+    return tuple(sorted(roots))
+
+
+def local_assessment_complete(target: dict) -> bool:
+    """Identify an explicitly requested local assessment without claiming vetting.
+
+    Args:
+        target (dict): Target retaining discovery coverage and owner instructions.
+
+    Returns:
+        bool: Whether discovery and all requested unvetted assessments are present.
+    """
+    return bool(target.get("stage_waivers", {}).get("vetting") and not discovery_gaps(target)
+                and all(row["status"] not in ("queued", "running") for row in target["assignments"].values())
+                and not any(row.get("material") and not row.get("resolution") for row in target["coverage_gaps"].values())
+                and all(key in target["adjudications"] for key in target["findings"]))
+
+
 def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
     """Collect recorded parent evidence without assuming the native project's repo.
 
@@ -2298,7 +2546,8 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
 
 
 def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
-                  record_unchanged: bool = True, runtime_copy: dict | None = None) -> dict:
+                  record_unchanged: bool = True, runtime_copy: dict | None = None,
+                  legacy_policies: dict | None = None) -> dict:
     """Persist actual baseline observations before accepting dependent records.
 
     Args:
@@ -2309,6 +2558,7 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
         record_unchanged (bool): Journal healthy observations; read-only diff access
             skips these so it preserves the issued launch approval.
         runtime_copy (dict | None): Validated native-start copy awaiting persistence.
+        legacy_policies (dict | None): Explicit migration policies checked before recording.
 
     Returns:
         dict: State with original integrity observations retained.
@@ -2321,6 +2571,9 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
     observations: dict = {}
     baselines = {key + "/" + name: record for key, target in run["targets"].items()
                  for name, record in target["baselines"].items()}
+    policies = {root: policy for target in run["targets"].values()
+                for root, policy in target.get("baseline_policies", {}).items()}
+    policies.update(legacy_policies or {})
     for key, target in list(run["targets"].items()):
         comparison = target["frozen"] or target["setup"]
         if comparison is None or target["resources_removed"]:
@@ -2329,13 +2582,17 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
             raise NeedsDecision("prepare_source", "recorded freeze evidence lacks owned preparation resources; create and prepare a new run")
         observation = preparation.check(directory, run["run_id"], key, comparison, baselines,
                                         setup=target["index_setup"] if target["frozen"] is None else None,
-                                        observations=observations, native_copies=runtime_copies(run, runtime_copy))
+                                        observations=observations, native_copies=runtime_copies(run, runtime_copy),
+                                        active_native_roots=active_native_roots(run, runtime_copy),
+                                        legacy_policies={root: policy for root, policy in policies.items()
+                                                         if root == comparison["parent_root"]
+                                                         or any(row.get("filesystem") and row["root"] == root for row in baselines.values())})
         if (record_unchanged or observation["status"] != "unchanged" or
                 observation.get("cache_changes") and target["integrity"][-1:] != [observation]):
             run = append_record(directory, saved, run, key, "integrity", observation)
     failures, _ = integrity_failures(run)
     if stop and failures:
-        raise NeedsDecision("source_integrity", "changed/unknown source evidence recorded; preserve user work and create a new run")
+        raise NeedsDecision("source_integrity", "unresolved integrity incident; preserve user work and export available findings before investigating bookkeeping recovery")
     return run
 
 
@@ -2459,6 +2716,7 @@ def main() -> int:
     create.add_argument("--review-own-pr", action="store_true", help="review explicitly named self-authored PRs locally; no publication")
     create.add_argument("--admission-mode", choices=ADMISSION_MODES, default="observed",
                         help="observed requires live counts; native records unavailable counts and uses Delta admission")
+    create.add_argument("--family-limit", type=int, help="explicit owner limit for concurrent workers of one model family, 1..15")
     create.add_argument("--previous-run", help="previous private run directory; reuse evaluated discussion and finding history")
     comparison = create.add_mutually_exclusive_group()
     comparison.add_argument("--range", help="explicit LEFT..RIGHT or LEFT...RIGHT")
@@ -2473,6 +2731,29 @@ def main() -> int:
     native_parent = commands.add_parser("native-parent", help="capture this native parent terminal's canonical cwd without a caller-supplied root")
     native_parent.add_argument("--revision", type=int, required=True)
     commands.add_parser("report", help="render recorded status and completion evidence as Markdown; no live checks")
+    export = commands.add_parser("export", help="read all persisted findings and drafts without replay or live checks")
+    export.add_argument("--format", choices=("json", "markdown"), default="json")
+    adopt = commands.add_parser("runtime-adopt", help="explicitly bind a legacy or upgraded run to this verified runtime")
+    adopt.add_argument("--evidence", required=True)
+    adopt.add_argument("--revision", type=int, required=True)
+    resolution = commands.add_parser("resolve-integrity", help="audit a proven bookkeeping-only incident against a fresh complete check")
+    resolution.add_argument("--target", required=True)
+    resolution.add_argument("--observation", type=int, required=True, help="zero-based index in the target's integrity observations")
+    resolution.add_argument("--cause", choices=("completed-native-copy", "registered-native-administration"), required=True)
+    resolution.add_argument("--evidence", required=True)
+    resolution.add_argument("--revision", type=int, required=True)
+    policy = commands.add_parser("adopt-baseline-policy", help="explicitly reproduce a legacy baseline with its recorded review exclusions")
+    policy.add_argument("--target", required=True)
+    policy.add_argument("--root", required=True)
+    policy.add_argument("--exclude", action="append", default=[])
+    policy.add_argument("--exclude-generated", action="store_true")
+    policy.add_argument("--evidence", required=True)
+    policy.add_argument("--revision", type=int, required=True)
+    waiver = commands.add_parser("waive-stage", help="record an explicit owner waiver without claiming independent review")
+    waiver.add_argument("--target", required=True)
+    waiver.add_argument("--stage", choices=("vetting",), required=True)
+    waiver.add_argument("--evidence", required=True)
+    waiver.add_argument("--revision", type=int, required=True)
     diff = commands.add_parser("diff", help="emit the frozen comparison through preparation's isolated Git configuration")
     diff.add_argument("--target", required=True)
     task = commands.add_parser("task", help="gate one native launch/follow-up and return its task; does not dispatch")
@@ -2574,12 +2855,23 @@ def main() -> int:
             run = new_run(
                 initial["method"], collection, initial["registry"], initial["orchestrator"], initial["thread_id"],
                 review_own_pr=args.review_own_pr, admission_mode=args.admission_mode)
+            if args.family_limit is not None:
+                if not 1 <= args.family_limit <= 15:
+                    raise ValueError("family limit must be an integer from 1 through 15")
+                initial["family_limit"] = args.family_limit
+                run["family_limit"] = args.family_limit
             initial["run_id"] = run["run_id"]
+            initial["runtime"] = runtime.identity()
+            run["runtime"] = copy.deepcopy(initial["runtime"])
             directory.mkdir(mode=0o700, parents=False)
             write_json(directory / "run.json", {"version": 1, "initial": initial, "events": []})
         else:
             if directory.resolve() != directory or not directory.is_dir() or (directory / "run.json").is_symlink():
                 raise ValueError("run must be an existing private directory without symlinks")
+            if args.command == "export":
+                exported = export_findings(directory, read_json(directory / "run.json"))
+                print(export_markdown(exported) if args.format == "markdown" else json.dumps(exported, indent=2), end="\n")
+                return 0
             descriptor = os.open(directory / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             with os.fdopen(descriptor, "w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
@@ -2588,12 +2880,54 @@ def main() -> int:
                 if hasattr(args, "revision") and args.revision != run["revision"]:
                     raise ValueError(f"stale revision; current revision is {run['revision']}")
                 event = fields(read_json(args.event), ("target", "operation", "data")) if args.command == "record" else None
-                if args.command not in ("status", "report"):
+                if args.command not in ("status", "report", "runtime-adopt"):
+                    if not run.get("runtime"):
+                        raise NeedsDecision("runtime_identity", "legacy run requires explicit runtime-adopt before mutation; status, report and export remain readable")
+                    try:
+                        runtime.verify_recorded(run["runtime"])
+                    except ValueError as error:
+                        raise NeedsDecision("runtime_identity", "runtime differs from the run; inspect changes and explicitly runtime-adopt") from error
+                if args.command not in ("status", "report", "runtime-adopt", "resolve-integrity", "waive-stage", "adopt-baseline-policy"):
                     settling = ((event["target"], event["data"].get("assignment_id")) if event is not None
                                 and event["operation"] in ("started", "withdraw") and isinstance(event["data"], dict) else None)
                     require_registered_launch(run, settling)
-                if event is not None:
-                    if event["operation"] in ("native-parent", "prepare", "index-setup", "baseline", "integrity", "test-copy", "cleanup", "catalog", "task-ready", "report-draft", "report-authored", "source-read", "source-search-started", "source-search-result", "publication-context", "publication-intent", "publication-outcome", "publication-reconciliation", "publication-receipt") or (event["operation"] == "freeze" and "preparation" in event["data"]):
+                if args.command == "runtime-adopt":
+                    run = append_record(directory, saved, run, None, "runtime-adopt", {
+                        "before": run.get("runtime"), "after": runtime.identity(), "evidence": args.evidence})
+                elif args.command == "resolve-integrity":
+                    run = check_sources(directory, saved, run, stop=False)
+                    target = run["targets"][args.target]
+                    if not 0 <= args.observation < len(target["integrity"]):
+                        raise ValueError("unknown integrity observation")
+                    run = append_record(directory, saved, run, args.target, "integrity-resolution", {
+                        "observation": args.observation,
+                        "observation_sha256": preparation.fingerprint(target["integrity"][args.observation]),
+                        "check": len(target["integrity"]) - 1,
+                        "snapshot_fingerprint": target["frozen"]["source_fingerprint"],
+                        "native_copies_sha256": preparation.fingerprint({"copies": runtime_copies(run)}),
+                        "cause": args.cause, "evidence": args.evidence})
+                elif args.command == "adopt-baseline-policy":
+                    target = run["targets"][args.target]
+                    if "project" not in target or target["frozen"] is None:
+                        raise ValueError("legacy policy migration requires a prepared project")
+                    frozen = target["frozen"]
+                    originals = {frozen["parent_root"]: frozen["parent_fingerprint"]}
+                    originals.update({row["root"]: row["fingerprint"] for row in target["baselines"].values() if row.get("filesystem")})
+                    if args.root not in originals:
+                        raise ValueError("policy root is not protected by this target")
+                    candidate = {"fingerprint": originals[args.root], "exclude": sorted(set(args.exclude)),
+                                 "exclude_generated": args.exclude_generated}
+                    run = check_sources(directory, saved, run, stop=False, legacy_policies={args.root: candidate})
+                    target = run["targets"][args.target]
+                    run = append_record(directory, saved, run, args.target, "baseline-policy", {
+                        "root": args.root, "policy": candidate, "check": len(target["integrity"]) - 1, "evidence": args.evidence})
+                elif args.command == "waive-stage":
+                    target = run["targets"][args.target]
+                    run = append_record(directory, saved, run, args.target, "stage-waiver", {
+                        "stage": args.stage, "evidence": args.evidence,
+                        "snapshot_fingerprint": target["frozen"]["source_fingerprint"]})
+                elif event is not None:
+                    if event["operation"] in ("runtime-adopt", "integrity-resolution", "baseline-policy", "stage-waiver", "native-parent", "prepare", "index-setup", "baseline", "integrity", "test-copy", "cleanup", "catalog", "task-ready", "report-draft", "report-authored", "source-read", "source-search-started", "source-search-result", "publication-context", "publication-intent", "publication-outcome", "publication-reconciliation", "publication-receipt") or (event["operation"] == "freeze" and "preparation" in event["data"]):
                         raise ValueError("generated preparation/task/publication evidence requires its dedicated command")
                     if event["operation"] == "started":
                         row = run["targets"][event["target"]]["assignments"].get(event["data"].get("assignment_id"), {})
@@ -2691,7 +3025,7 @@ def main() -> int:
                                 return 2
                             return 0 if args.command == "source-read" or result["exit_code"] in (0, 1) else 1
                         elif args.command == "task-read":
-                            command = (f"rtk proxy python3 {shlex.quote(str(Path(__file__).absolute()))} --run {shlex.quote(str(directory))}"
+                            command = (f"rtk proxy python3 {shlex.quote(str(Path(__file__).resolve()))} --run {shlex.quote(str(directory))}"
                                        f" task-read --target {shlex.quote(key)} --assignment {shlex.quote(args.assignment)}")
                             print(handoff.task_view(handoff_task(directory, run, key, args.assignment), command,
                                                    section=args.section, offset=args.offset, length=args.length))
@@ -2779,7 +3113,9 @@ def main() -> int:
                                           and any(row["path"] in (".codegraph", ".codegraph/codegraph.db-shm")
                                                   for row in target["project"]["exclusions"]))
                         data = preparation.capture_baseline(directory, args.id, root, runtime_copies(run),
-                                                            filesystem="project" in target, cache_recovery=cache_recovery)
+                                                            filesystem="project" in target, cache_recovery=cache_recovery,
+                                                            exclude=tuple(row["path"] for row in target.get("project", {}).get("exclusions", [])),
+                                                            exclude_generated="project" in target)
                         run = append_record(directory, saved, run, key, "baseline", data)
                     elif args.command == "test-copy":
                         if target["frozen"] is None or target["resources_removed"]:

@@ -373,6 +373,49 @@ class PreparationTests(GitFixture):
         store.symlink_to(store.with_name("redirected.git"), target_is_directory=True)
         self.assertNotEqual(check()["status"], "unchanged")
 
+    def test_completed_native_checkout_can_disappear_without_losing_exact_pin_guards(self):
+        frozen = self.prepare()
+        completed, completed_store, completed_pin = self.native_clone("completed")
+        first = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", frozen, completed, ())
+        active, _, _ = self.native_clone("active")
+        second = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", frozen, active, (first,))
+        copies = (first, second)
+        check = lambda: preparation.check(self.directory, "run-fixture", "local", frozen, {},
+                                         native_copies=copies, active_native_roots=(str(active),))
+        self.assertEqual(check()["status"], "unchanged")
+        shutil.rmtree(completed)
+        shutil.rmtree(completed_store)
+        self.assertEqual(check()["status"], "unchanged")
+        self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {},
+                                          native_copies=copies)["status"], "unknown")
+        self.git("update-ref", completed_pin, self.left)
+        self.assertNotEqual(check()["status"], "unchanged")
+        self.git("update-ref", completed_pin, self.head)
+        (active / "feature.txt").write_text("unexpected active change\n")
+        self.assertNotEqual(check()["status"], "unchanged")
+
+    def test_generated_native_output_is_omitted_but_legacy_file_inventory_is_strict(self):
+        frozen = self.prepare()
+        child, _, _ = self.native_clone()
+        output = child / "nested/target"
+        output.mkdir(parents=True)
+        (output / "artifact").write_text("generated\n")
+        original_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            self.assertNotEqual(path, output)
+            return original_iterdir(path)
+
+        with patch.object(Path, "iterdir", guarded_iterdir):
+            proof = preparation.capture_runtime_copy(self.directory, "run-fixture", "local", frozen, child, ())
+            self.assertTrue(proof["exclude_generated"])
+            self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {},
+                                              native_copies=(proof,))["status"], "unchanged")
+            (output / "artifact").write_text("rebuilt\n")
+            self.assertEqual(preparation.check(self.directory, "run-fixture", "local", frozen, {},
+                                              native_copies=(proof,))["status"], "unchanged")
+        self.assertIn("nested/target/artifact", preparation.files(child))
+
     def test_native_clone_cannot_exempt_a_preexisting_git_store(self):
         child, store, _ = self.native_clone()
         shutil.rmtree(child)

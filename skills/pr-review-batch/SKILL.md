@@ -53,7 +53,19 @@ families before using the orchestrator's. Pinned profiles take no override;
 for user-requested unprofiled models, follow `references/effective-identity.md` before dispatch. Never
 switch the top-level model. Unknown or mismatched served identity holds work;
 self-reported identity text is not proof. Use only authorized models; no
-provider quotas, token/spending budgets or fixed two-per-model/family cap.
+fixed two-per-model/family cap is imposed by this skill. Honor the user's model,
+family, provider, concurrency and spending limits. The engine does not measure
+live provider quotas, token use or currency. It enforces the registry's provider
+concurrency and authorized metered-spawn counters. Pass `create --family-limit`
+for an explicit user-requested family cap across provider accounts.
+
+Use the reference's bounded recovery for both initial-response and response-stream
+failures. Confirm the exact attempt's terminal outcome before retrying; silence
+alone is unknown. Preserve its findings and failure receipt, and stop after the
+permitted retry is exhausted. Deliver available findings when requested even
+while another stage is held. If the user explicitly waives a stage, record that
+instruction and retain its unperformed status; do not claim completed independent
+vetting.
 
 ### Delta dispatch contract
 

@@ -248,6 +248,34 @@ export LOCAL_PROVIDER=<id> LOCAL_MODEL=<served model id> LOCAL_FAMILY=GLM
 ./install.sh --prune-legacy     # add --force when reinstalling
 ```
 
+To update only the shared review runtime, without changing Delta settings,
+profiles, rules, skills or provider configuration:
+
+```bash
+./install.sh --review-runtime-only --dry-run --force
+./install.sh --review-runtime-only --force
+```
+
+This route can run while Delta is open. It stages and verifies a complete release
+under `~/.local/share/zetta-delta/review/releases/`, then switches the existing
+`review/scripts` link. New commands use that release; entrypoint wrappers resolve
+the link once so an active command continues using the release it opened. The
+first upgrade preserves the old scripts directory in the installer backup; later
+upgrades save a link to the previous release. Restore that backup as
+`review/scripts` to roll back. Release installation never replaces `review/runs`.
+Let existing review CLI commands finish before that first directory-to-link
+conversion; subsequent release switches preserve already pinned commands.
+
+Each release has a `runtime-manifest.json` with its journal schema version, hashes
+of the owned review modules, their aggregate fingerprint and the source Git
+revision when available. The content fingerprint identifies the actual bytes,
+including uncommitted changes; a source revision alone is not proof of the
+installed code. Identity and index helpers retain their separate per-run evidence
+bindings. New runs record the runtime identity, and changing the runtime of an
+existing run requires an explicit adoption record. Existing findings stay
+readable across runtime changes. Do not repair installed modules in place; change
+the repository, run its checks and install another complete release.
+
 `--configure-delta` also sets delegation to Only When Asked, model overrides on,
 and concurrency to `THREAD_CAP` per thread and twice that overall. It derives
 required provider IDs from the bundled public URLs when not supplied. A conflicting

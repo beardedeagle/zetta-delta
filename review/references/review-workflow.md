@@ -67,6 +67,20 @@ still bounds recorded running work and reservations, and retains lane, identity,
 workload, integrity, registration and recovery gates. It cannot measure other
 parents' live work in this mode. The choice is immutable in the initial journal.
 
+The registry's provider `limit` bounds registered running work and issued launch
+approvals across the run. Waiting assignments without an issued approval do not
+consume a live provider slot. When the user requests a per-family cap, pass
+`create --family-limit <1..15>`; this limit spans provider accounts. Omitting the
+flag adds no family cap. Unknown native outcomes remain active until reconciled;
+confirmed terminal failures release live concurrency without erasing evidence.
+
+A fresh metered spawn also needs remaining target `authorization.metered_spawns`
+and run-wide registry `metered_max_spawns`. Unique started handles retain their
+spawn charge after success, failure or an unknown outcome. Issued fresh-spawn
+approvals reserve a charge; verified nonlaunch withdrawal releases that
+reservation. A correction or follow-up in the same served handle adds no fresh
+spawn. These counters do not measure provider quota, tokens or currency.
+
 Before dispatch in either mode, run the following in the actual native parent's
 terminal, without `cd`. Code captures the canonical cwd once and binds it to the
 run's thread ID; no root argument or manually recorded event is accepted.
@@ -563,10 +577,23 @@ launches remain held. Withdrawal releases capacity without claiming coverage.
 Source failures can still be recorded and queued work settled, but hold new work.
 
 Each `recover` request supplies `capacity: {parent_active, process_active, evidence}`.
-The shared capacity check preserves observed 15/30 room, includes all recorded
-running kinds and queued/unassigned reservations, and rejects observations below
-recorded running work. Native Delta still owns actual admission and dispatch;
-unrecorded jobs and other runs' queued work are outside this validation.
+The shared check preserves observed 15/30 room and rejects observations below
+recorded running work. A recovery needs a live slot; unrelated queued slices do
+not consume that slot. Queue reservations still bound new-wave allocation, and
+the replacement checks capacity again before launch. Native Delta still owns
+actual admission and dispatch; unrecorded jobs and other runs' queued work are
+outside this validation. Honor the user's family, model, provider and spending
+limits as well as native admission limits.
+
+An initial-response timeout and an idle response stream use the same bounded
+retry contract below, after native evidence confirms that the exact attempt has
+failed. A quiet request or elapsed deadline alone leaves the outcome unknown.
+Retain the failure receipt and any report bytes before retrying. Do not reset the
+allowance through another assignment ID or provider alias. Auth, quota and rate
+failures make that lane unavailable for the run; use a verified alternate route
+only when it preserves the selected model, family, roles and isolation. If the
+retry fails or no permitted route exists, report the incomplete work and deliver
+the available findings instead of starting another retry cycle.
 
 - `retry`: at most one per logical unit after terminal transient/auth/quota/rate
   failure or an eligible queued withdrawal. Unstarted work cannot use report
@@ -604,7 +631,34 @@ After the focused verdict, the designated adjudicator may reconsider a previous
 assignment bound to the latest vet evidence; incorporate its exact judgment.
 Settled decisions cannot restart the cycle. Earlier reports and judgments remain
 available; remaining disagreements/material gaps hold completion. Empty findings
-create no vet, follow-up or stand-in work. Provider budgets are not managed.
+create no vet, follow-up or stand-in work. The engine enforces recorded concurrency
+and metered-spawn allowances. It does not measure live provider quotas, token
+usage or currency; the orchestrator must honor the user's additional limits.
+
+A launch, integrity or provider hold does not justify withholding findings
+already retained. When the user asks for them, return the available claims,
+drafts, provenance and missing coverage promptly, with their current validation
+and vetting status. `export` reads persisted received, authored and draft reports
+without requiring healthy source or launch gates:
+
+```sh
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' export --format markdown
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' export --format json
+```
+
+An explicit user instruction can waive separate vetting for the requested local
+assessment. Record the instruction against the target and current revision:
+
+```sh
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' waive-stage --target '<target>' --stage vetting --evidence '<explicit owner instruction>' --revision <last-returned-revision>
+```
+
+The orchestrator can then record the existing full `adjudication` evidence with
+disposition `UNVETTED`. `local_assessment_complete` describes that requested
+deliverable separately; strict review completion and publication remain blocked
+without the independent vet. Keep missing discovery coverage visible. A waiver
+does not erase unsafe source evidence or turn a skipped stage into completed
+independent scrutiny.
 
 ## Assignment and report commands
 
@@ -1140,3 +1194,22 @@ Project targets cannot authorize submission/PR approval, derive GitHub review
 or merge verdicts, or enter publication preflight/submission/reconciliation.
 These holds apply even when a caller attempts to supply publication authority.
 PR/range journals and existing PR publication safeguards keep their behavior.
+
+
+### Explicit migration of legacy project baseline policies
+
+Old hand-patched runs may omit review paths from parent ledgers without storing
+that policy in the ledger. Do not infer or replace those original fingerprints.
+After inspecting the old runtime and explicitly adopting the current runtime,
+use `adopt-baseline-policy --target TARGET --root ROOT --exclude PATH` (repeat
+`--exclude`), optionally `--exclude-generated`, with `--evidence` and the current
+`--revision`. The engine accepts only recorded review exclusions on an originally
+protected parent/filesystem copy, checks the unchanged frozen source and every
+included ledger entry, and records the policy only if the complete old ledger
+match succeeds. Modern policy ledgers cannot use this migration. Original
+artifacts remain intact. Then resolve each bookkeeping incident separately with
+`resolve-integrity`; policy adoption alone never clears a historical incident.
+
+New runs can record an explicit owner concurrency limit with `create
+--family-limit N`. Provider account limits still come from the identity registry;
+unissued queued work occupies neither provider nor family execution slots.

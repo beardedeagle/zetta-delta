@@ -160,6 +160,53 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"], identity["billing"], identity["limit"]),
                          ("custom:k", "k3", "Kimi", "Kimi Code", "flat", 3))
 
+    def test_runtime_only_installs_a_verified_release_without_provider_or_delta_changes(self):
+        for name in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER"):
+            self.env.pop(name)
+        # The full install would refuse a running Delta and malformed settings.
+        (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
+        settings = self.config / "settings.json"
+        settings.write_text("user settings are untouched\n")
+        result = self.install("--review-runtime-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scripts = self.home / ".local/share/zetta-delta/review/scripts"
+        self.assertTrue(scripts.is_symlink())
+        manifest = json.loads((scripts / "runtime-manifest.json").read_text())
+        identity = subprocess.run([sys.executable, str(scripts / "runtime.py"), "identity"],
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(json.loads(identity.stdout), manifest["runtime"])
+        self.assertEqual(settings.read_text(), "user settings are untouched\n")
+        self.assertFalse((self.config / "profiles").exists())
+        self.assertFalse((self.home / ".agents/skills").exists())
+
+    def test_runtime_only_dry_run_refuses_conflicting_flags_and_never_writes(self):
+        result = self.install("--review-runtime-only", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / ".local/share/zetta-delta/review").exists())
+        for flag in ("--configure-delta", "--prune-legacy", "--clean"):
+            with self.subTest(flag=flag):
+                result = self.install("--review-runtime-only", flag)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("cannot change Delta configuration", result.stderr)
+                self.assertFalse((self.home / ".local/share/zetta-delta/review").exists())
+
+    def test_shared_runtime_manifest_and_old_release_survive_upgrade(self):
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        scripts = self.home / ".local/share/zetta-delta/review/scripts"
+        pinned = scripts.resolve()
+        original = (pinned / "workflow.py").read_bytes()
+        with (self.bundle / "review/scripts/workflow.py").open("a") as stream:
+            stream.write("\n# next source release\n")
+        second = self.install("--review-runtime-only", "--force")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotEqual(scripts.resolve(), pinned)
+        self.assertEqual((pinned / "workflow.py").read_bytes(), original)
+        backup = Path(json.loads(second.stdout)["backup"])
+        self.assertTrue(backup.is_symlink())
+        self.assertEqual(backup.resolve(), pinned)
+
     def test_pr_review_skills_resolve_identity_without_sibling_skills(self):
         self.home = self.base / "home 🧪 with 'apostrophe' & space"
         self.home.mkdir()

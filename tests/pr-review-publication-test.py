@@ -118,7 +118,8 @@ class PublicationTests(unittest.TestCase):
             run = workflow.apply_event(run, fixture.event("authorization", {"submission": True, "test_execution": False,
                 "metered_spawns": 0, "evidence": "User explicitly authorized submission for fixture/project#12"}))
         initial = {"method": method, "intake": fixture.COLLECTION, "registry": fixture.REGISTRY,
-                   "orchestrator": fixture.MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+                   "orchestrator": fixture.MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"],
+                   "runtime": workflow.runtime.identity()}
         saved = {"version": 1, "initial": initial, "events": run["events"]}
         workflow.write_json(self.directory / "run.json", saved)
         return saved, run

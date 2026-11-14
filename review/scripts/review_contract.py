@@ -407,7 +407,8 @@ def shortfall(value: dict | None, *, errors: list[dict] | None = None, field: st
                 raise ValueError("shortfall materiality must be boolean")
 
 
-def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None) -> tuple[int, int]:
+def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None, *,
+                    reserve_queued: bool = True) -> tuple[int, int]:
     """Validate launch room or reserve remaining room for scheduling decisions.
 
     Args:
@@ -415,6 +416,9 @@ def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None)
         capacity (dict): Native counts/evidence, or explicit null counts when
             Delta owns admission for this run.
         assignment_id (str | None): Queued reservation being checked for launch.
+        reserve_queued (bool): Charge waiting allocations during new-wave
+            planning. Bounded recovery replaces settled work and checks live
+            room without charging the unrelated waiting backlog.
 
     Returns:
         tuple[int, int]: Preflight slots and local reservations; native mode
@@ -450,10 +454,12 @@ def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None)
         reserved -= 1
     if not native and capacity["parent_active"] < active:
         raise NeedsDecision("native_capacity", "native observation omits jobs still recorded as running; reconcile their lifecycle")
-    # Waiting work reserves future waves, but must not prevent its own launch.
-    room = (15 - active if native else min(15 - capacity["parent_active"], 30 - capacity["process_active"])) - (reserved if assignment_id is None else 0)
+    # Waiting work reserves future waves, not a live slot needed by a retry.
+    room = (15 - active if native else min(15 - capacity["parent_active"], 30 - capacity["process_active"]))
+    if reserve_queued and assignment_id is None:
+        room -= reserved
     if room <= 0:
-        raise NeedsDecision("native_capacity", "active jobs and retained queued/unassigned allocations fill the admission preflight capacity")
+        raise NeedsDecision("native_capacity", "native admission preflight capacity is full")
     return room, reserved
 
 
@@ -962,13 +968,15 @@ def unit_root(target: dict, row: dict) -> dict:
     return target["assignments"][row["recovery"]["unit_id"]] if row.get("recovery") else row
 
 
-def recovery(run: dict, target: dict, data: dict) -> dict:
+def recovery(run: dict, target: dict, data: dict, *, replay: bool = False) -> dict:
     """Create bounded work for a selected participant without rewriting a report.
 
     Args:
         run (dict): Frozen registry, unavailable lanes and native capacity evidence.
         target (dict): Original assignments, reports and findings.
         data (dict): Retry, correction or focused dispute request.
+        replay (bool): Retain historical admission evidence without applying
+            newly enforced live provider or metered limits retroactively.
 
     Returns:
         dict: New queued assignment retaining the logical unit and participant.
@@ -1058,7 +1066,9 @@ def recovery(run: dict, target: dict, data: dict) -> dict:
             request["unit_id"] = key
     if row["identity"]["lane"] in run["unavailable_lanes"]:
         raise NeedsDecision("unavailable_lane", "this effective lane is unavailable for the run; use a verified same-model retry route or retain incomplete work")
-    native_capacity(run, data["capacity"])
+    native_capacity(run, data["capacity"], reserve_queued=False)
+    if not replay:
+        provider_capacity(run, target, row)
     row["recovery"] = request
     return row
 
@@ -1362,6 +1372,67 @@ def coverage_gaps(target: dict) -> list[str]:
     return gaps
 
 
+def provider_capacity(run: dict, target: dict, row: dict) -> None:
+    """Check configured provider/family room and authorized fresh metered spawns.
+
+    Args:
+        run (dict): Replayed run with registered identities and issued launches.
+        target (dict): Candidate's target and its metered-spawn authorization.
+        row (dict): Candidate assignment, excluding its own issued reservation.
+
+    Raises:
+        NeedsDecision: Provider/family room or metered authorization is exhausted.
+        ValueError: An explicit family cap is outside the native parent limit.
+    """
+    person = row["identity"]
+    assignments = [item for owner in run["targets"].values() for item in owner["assignments"].values()]
+    live = {}
+    for item in assignments:
+        if item["id"] == row["id"] or not (item["status"] == "running" or
+                                                item["status"] == "queued" and item.get("task_ready")):
+            continue
+        actual = item.get("actual_identity") or item["identity"]
+        handle = item.get("runtime_handle") or item.get("recovery", {}).get("runtime_handle")
+        live[("handle", handle) if handle else ("reservation", item["id"])] = actual
+    if sum(item["provider_id"] == person["provider_id"] for item in live.values()) >= person["limit"]:
+        raise NeedsDecision("provider_capacity", "configured provider concurrency is full; preserve waiting work until a live slot opens")
+    family_limit = run.get("family_limit")
+    if family_limit is not None:
+        if type(family_limit) is not int or not 1 <= family_limit <= 15:
+            raise ValueError("family limit must be an integer between one and fifteen")
+        if sum(item["family"] == person["family"] for item in live.values()) >= family_limit:
+            raise NeedsDecision("family_capacity", "explicit family concurrency is full across provider accounts")
+    if person["billing"] != "metered":
+        return
+
+    def metered_slots(items: list[dict]) -> tuple[set[str], set[str]]:
+        """Count served handles and fresh issued approvals without double charges.
+
+        Args:
+            items (list[dict]): Run-wide or target-local assignment records.
+
+        Returns:
+            tuple[set[str], set[str]]: Spent handles and reserved fresh-spawn IDs.
+        """
+        spent = {item["runtime_handle"] for item in items if item.get("runtime_handle")
+                 and (item.get("actual_identity") or {}).get("billing") == "metered"}
+        reserved = {item["id"] for item in items if item["id"] != row["id"]
+                    and item["status"] == "queued" and item.get("task_ready")
+                    and item["identity"]["billing"] == "metered"
+                    and item.get("recovery", {}).get("runtime_handle") not in spent}
+        return spent, reserved
+
+    spent, reserved = metered_slots(assignments)
+    if row.get("recovery", {}).get("runtime_handle") in spent:
+        return
+    authorization = target.get("authorization")
+    local_spent, local_reserved = metered_slots(list(target["assignments"].values()))
+    if authorization is None or len(local_spent) + len(local_reserved) >= authorization["metered_spawns"]:
+        raise NeedsDecision("metered_authorization", "fresh metered spawn requires remaining explicit target authorization")
+    if len(spent) + len(reserved) >= person["metered_max_spawns"]:
+        raise NeedsDecision("metered_capacity", "configured run-wide metered spawn allowance is exhausted; prior failed or unknown attempts retain spend")
+
+
 def dispatch_task(run: dict, key: str, assignment_id: str, capacity: dict, *, replay: bool = False,
                   directory: Path | None = None) -> dict:
     """Gate a native launch or follow-up using the current recorded workflow.
@@ -1391,6 +1462,8 @@ def dispatch_task(run: dict, key: str, assignment_id: str, capacity: dict, *, re
                       for target in run["targets"].values() for item in target["assignments"].values()):
         raise NeedsDecision("runtime_reconciliation", "settle the selected runtime handle before its follow-up")
     native_capacity(run, capacity, assignment_id)
+    if not replay:
+        provider_capacity(run, run["targets"][key], row)
     parent = capacity.get("runtime_parent_root")
     if "admission_mode" in run:
         captured = run.get("native_parent")
@@ -1454,7 +1527,7 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
     units = {unit: target["catalog"]["units"][unit] for unit in row["units"]}
     tests = row["test_plan"]
     run_argument = shlex.quote(str(directory if directory is not None else Path(frozen["source_root"]).parent.parent))
-    script = shlex.quote("workflow.py" if replay else str(Path(__file__).with_name("workflow.py").absolute()))
+    script = shlex.quote("workflow.py" if replay else str(Path(__file__).with_name("workflow.py").resolve()))
     diff = f'rtk proxy python3 {script} --run {run_argument} diff --target {shlex.quote(key)}; echo "exit=$?"'
     payload = {"unit": row["id"], "role": row["role"], "identity": row["identity"], "target_id": key,
                "target": frozen, "source_root": frozen["source_root"], "diff_command": diff,
