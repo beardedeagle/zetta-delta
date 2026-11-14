@@ -242,6 +242,69 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.legacy_record(self.destination), before)
         self.assertFalse(self.backup.exists())
 
+    def test_writable_nonsticky_runtime_and_backup_ancestors_are_rejected_without_changes(self):
+        for owner in ("runtime", "backup"):
+            for mode in (0o775, 0o777):
+                with self.subTest(storage=owner, mode=mode):
+                    name = owner + "-" + str(mode)
+                    shared = self.base / ("shared-" + name)
+                    shared.mkdir()
+                    shared.chmod(mode)
+                    private = shared / "private"
+                    private.mkdir(mode=0o700)
+                    (private / "peer.txt").write_text("unrelated peer data\n")
+                    self.destination = self.base / ("review-" + name)
+                    self.backup = self.base / ("backup-" + name)
+                    selected = private / "owned"
+                    selected.mkdir(mode=0o700)
+                    if owner == "runtime":
+                        self.destination = selected
+                    else:
+                        self.backup = selected
+                    before = self.legacy_record(shared)
+                    with self.assertRaisesRegex(ValueError, "ancestor"):
+                        self.install()
+                    self.assertEqual(self.legacy_record(shared), before)
+                    self.assertFalse((self.backup if owner == "runtime" else self.destination).exists())
+
+    def test_trusted_sticky_system_temp_ancestors_support_owned_runtime_storage(self):
+        temporary = tempfile.TemporaryDirectory(prefix="review-runtime-sticky-", dir=Path("/tmp").resolve())
+        self.addCleanup(temporary.cleanup)
+        parent = Path(temporary.name).resolve()
+        sticky = parent.parent
+        before = sticky.stat()
+        self.assertTrue(before.st_mode & stat.S_ISVTX)
+        self.assertIn(before.st_uid, (0, os.getuid()))
+        self.destination = parent / "review"
+        self.backup = parent / "backup"
+        installed = self.install()
+        self.assertEqual(stat.S_IMODE(sticky.stat().st_mode), stat.S_IMODE(before.st_mode))
+        with patch.object(runtime, "__file__", str(Path(installed["release"]) / "runtime.py")):
+            self.assertEqual(runtime.identity(), installed["runtime"])
+
+    def test_foreign_owned_ancestor_is_rejected_without_changing_storage(self):
+        ancestor = self.base / "foreign"
+        ancestor.mkdir(mode=0o755)
+        self.destination = ancestor / "review"
+        self.destination.mkdir(mode=0o700)
+        (self.destination / "peer.txt").write_text("unrelated peer data\n")
+        before = self.legacy_record(ancestor)
+        lstat = Path.lstat
+
+        def foreign_metadata(path, *args, **kwargs):
+            info = lstat(path, *args, **kwargs)
+            if path == ancestor:
+                values = list(info)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return info
+
+        with (patch.object(Path, "lstat", autospec=True, side_effect=foreign_metadata),
+              self.assertRaisesRegex(ValueError, "ancestor")):
+            self.install()
+        self.assertEqual(self.legacy_record(ancestor), before)
+        self.assertFalse(self.backup.exists())
+
     def test_manifest_is_verified_and_legacy_files_are_preserved_before_switch(self):
         scripts = self.destination / "scripts"
         scripts.mkdir(parents=True)

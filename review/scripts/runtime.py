@@ -168,8 +168,25 @@ def install_sources() -> dict[str, Path]:
     return sources
 
 
+def validate_storage_ancestors(path: Path) -> None:
+    """Reject ancestor directories that permit another user to replace storage.
+
+    Args:
+        path (Path): Canonical managed storage directory with a validated owner.
+
+    Raises:
+        OSError: An ancestor's metadata cannot be read.
+        ValueError: An ancestor is foreign-owned or writable without sticky protection.
+    """
+    for ancestor in path.parents:
+        info = ancestor.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
+                or info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+            raise ValueError("runtime storage ancestor must be trusted and protect against external replacement")
+
+
 def owned_directory(path: Path) -> None:
-    """Refuse redirected, foreign-owned or externally writable runtime storage.
+    """Require private owned storage beneath trusted, replacement-safe ancestors.
 
     Args:
         path (Path): Existing directory managed by this installer.
@@ -182,6 +199,7 @@ def owned_directory(path: Path) -> None:
     if (path.resolve() != path or not stat.S_ISDIR(info.st_mode)
             or info.st_uid != os.getuid() or info.st_mode & 0o022):
         raise ValueError("runtime storage must be an owned, nonredirected directory without external write access")
+    validate_storage_ancestors(path)
 
 
 def make_owned_directory(path: Path) -> None:

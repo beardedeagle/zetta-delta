@@ -268,8 +268,10 @@ conversion; subsequent release switches preserve already pinned commands.
 
 New managed directories are private regardless of caller umask. Existing
 externally writable storage, including individual release parents, is rejected
-without changing its permissions. Storage and replacement authorization are
-checked again under the installation lock before using an existing release.
+without changing its permissions. Existing ancestors must be owned by root or the
+current user and not externally writable; trusted sticky temporary directories
+remain supported. Storage and replacement authorization are checked again under
+the installation lock before using an existing release.
 
 If removing the retired local directory fails after activation, installation
 still succeeds and returns `cleanup_pending` with the retained path and error.
