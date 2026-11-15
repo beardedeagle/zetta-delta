@@ -6,12 +6,22 @@ on:
       - .github/workflows/review-installer.yml
       - install.sh
       - review/**
+      - tests/install-test.sh
       - tests/pr-review-*test.py
 
 permissions:
   contents: read
 
 jobs:
+  posix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify piped installation, backups and cleanup
+        run: bash tests/install-test.sh
   windows:
     runs-on: windows-latest
     timeout-minutes: 10
