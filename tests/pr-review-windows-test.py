@@ -27,7 +27,7 @@ def native_import(name, *args, **kwargs):
 if sys.platform == 'win32':
     builtins.__import__ = native_import
 runpy.run_path(sys.argv[1], run_name='import_probe')
-""", str(ROOT / "review/scripts/runtime.py")], capture_output=True, text=True)
+""", str(ROOT / "review/scripts/runtime.py")], capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
@@ -49,7 +49,7 @@ class WindowsInstallationTests(unittest.TestCase):
 
     def identity(self):
         result = subprocess.run([sys.executable, "-B", str(self.destination / "scripts/runtime.py"), "identity"],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
@@ -78,9 +78,8 @@ class WindowsInstallationTests(unittest.TestCase):
 
     def test_lock_contention_does_not_modify_activation(self):
         first = self.install()
-        with self.runtime.windows.install_lock(self.destination / ".install.lock"):
-            with self.assertRaises(BlockingIOError):
-                self.install(force=True)
+        with self.runtime.windows.install_lock(self.destination / ".install.lock"), self.assertRaises(BlockingIOError):
+            self.install(force=True)
         self.assertEqual(self.identity(), first["runtime"])
 
     def test_legacy_backup_and_failed_pointer_publication_preserve_old_code(self):
@@ -94,9 +93,8 @@ class WindowsInstallationTests(unittest.TestCase):
                 raise OSError("injected activation failure")
             return original(source, target)
 
-        with patch.object(os, "replace", side_effect=fail_pointer):
-            with self.assertRaisesRegex(OSError, "injected activation failure"):
-                self.install(force=True)
+        with patch.object(os, "replace", side_effect=fail_pointer), self.assertRaisesRegex(OSError, "injected activation failure"):
+            self.install(force=True)
         self.assertEqual(legacy.read_text(), "preserve me")
         self.assertFalse((self.destination / ".release").exists())
         # Keep the failed attempt's backup intact; a fresh root is required.
@@ -111,7 +109,7 @@ class WindowsInstallationTests(unittest.TestCase):
         home = self.base / "home"
         home.mkdir()
         result = subprocess.run([bash, str(ROOT / "install.sh"), "--review-runtime-only", "--dry-run"],
-                                env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
+                                env=dict(os.environ, HOME=str(home)), capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((home / ".local").exists())
 

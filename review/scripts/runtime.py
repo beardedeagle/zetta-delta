@@ -11,7 +11,6 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -23,12 +22,100 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from typing import BinaryIO
+
+if os.name == "nt":
+    import importlib.util
+
+    _spec = importlib.util.spec_from_file_location("_review_runtime_windows", Path(__file__).resolve().with_name("runtime_windows.py"))
+    windows = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(windows)
+else:
+    import fcntl
 
 SCHEMA_VERSION = 1
 MODULES = ("handoff.py", "intake.py", "preparation.py", "publication.py",
            "review_contract.py", "runtime.py", "workflow.py")
-HELPERS = ("identity.py", "ensure-context-indexes.py")
+HELPERS = ("identity.py", "ensure-context-indexes.py", "runtime_windows.py")
 MANIFEST = "runtime-manifest.json"
+
+# These fixed launchers select one immutable release. Only the regular-file
+# pointer changes during a Windows upgrade; directory links need no privileges.
+WINDOWS_BOOTSTRAP = '''"""Select one complete installed review release before loading its code."""
+import ctypes
+import importlib.util
+import msvcrt
+import os
+import re
+import runpy
+import sys
+from pathlib import Path
+from ctypes import wintypes
+
+root = Path(__file__).resolve(strict=True).parent.parent
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+create = kernel.CreateFileW
+create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+create.restype = wintypes.HANDLE
+# Readers allow deletion so an installer may atomically replace the pointer.
+handle = create(str(root / ".release"), 0x80000000, 1 | 4, None, 3, 0x00200000, None)
+if handle == wintypes.HANDLE(-1).value:
+    raise ctypes.WinError(ctypes.get_last_error())
+try:
+    descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+except BaseException:
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle(handle)
+    raise
+with os.fdopen(descriptor, "r", encoding="ascii") as pointer:
+    release = pointer.read(128).strip()
+    if pointer.read(1):
+        raise ValueError("invalid installed review release pointer")
+if not re.fullmatch(r"[0-9a-f]{16}-[0-9a-f]{32}", release):
+    raise ValueError("invalid installed review release pointer")
+scripts = root / "releases" / release / "scripts"
+if scripts.resolve(strict=True) != scripts:
+    raise ValueError("redirected installed review release")
+for name in {{MODULE_NAMES}}:
+    loaded = sys.modules.get(name)
+    if loaded is not None and name != __name__:
+        if Path(getattr(loaded, "__file__", "")).parent != scripts:
+            raise RuntimeError("review modules from another release are already loaded")
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(scripts))
+target = scripts / Path(__file__).name
+if __name__ == "__main__":
+    runpy.run_path(str(target), run_name="__main__")
+else:
+    spec = importlib.util.spec_from_file_location(__name__, target)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[__name__] = module
+    spec.loader.exec_module(module)
+    globals().update(vars(module))
+'''.replace("{{MODULE_NAMES}}", repr(tuple(Path(name).stem for name in (*MODULES, *HELPERS))))
+
+
+def open_regular(path: Path) -> BinaryIO:
+    """Open an unredirected regular file using the platform's no-follow API.
+
+    Args:
+        path (Path): Source, installed code or receipt to read.
+
+    Returns:
+        BinaryIO: Open binary stream owned by the caller.
+
+    Raises:
+        OSError: The file cannot be opened.
+        ValueError: The opened object is redirected or not a regular file.
+    """
+    if os.name == "nt":
+        return windows.open_regular(path)
+    stream = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb")
+    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        stream.close()
+        raise ValueError("runtime code must be a regular file")
+    return stream
 
 
 def file_hash(path: Path) -> str:
@@ -44,9 +131,7 @@ def file_hash(path: Path) -> str:
         OSError: The file cannot be read.
         ValueError: The path is redirected or is not a regular file.
     """
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise ValueError("runtime code must be a regular file")
+    with open_regular(path) as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
@@ -106,9 +191,7 @@ def read_installation_manifest(directory: Path, current: dict) -> dict:
     try:
         if receipt.is_symlink():
             raise ValueError("redirected manifest")
-        with os.fdopen(os.open(receipt, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "r") as source:
-            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                raise ValueError("manifest must be a regular file")
+        with open_regular(receipt) as source:
             manifest = json.load(source)
         if (not isinstance(manifest, dict) or type(manifest.get("version")) is not int
                 or manifest["version"] != 1):
@@ -189,6 +272,9 @@ def validate_storage_ancestors(path: Path, *, include_self: bool = False) -> Non
         OSError: An ancestor's metadata cannot be read.
         ValueError: An ancestor is foreign-owned or writable without sticky protection.
     """
+    if os.name == "nt":
+        windows.validate_storage_ancestors(path, include_self=include_self)
+        return
     for ancestor in (path, *path.parents) if include_self else path.parents:
         info = ancestor.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
@@ -206,6 +292,9 @@ def owned_directory(path: Path) -> None:
         OSError: Directory metadata cannot be read.
         ValueError: The directory is not safe for owned code or backups.
     """
+    if os.name == "nt":
+        windows.owned_directory(path)
+        return
     info = path.lstat()
     if (path.resolve() != path or not stat.S_ISDIR(info.st_mode)
             or info.st_uid != os.getuid() or info.st_mode & 0o022):
@@ -223,6 +312,9 @@ def make_owned_directory(path: Path) -> None:
         OSError: A component cannot be created or inspected.
         ValueError: Existing or newly created storage fails ownership validation.
     """
+    if os.name == "nt":
+        windows.make_owned_directory(path)
+        return
     missing = []
     existing = path
     while not existing.exists():
@@ -263,6 +355,14 @@ def validate_installation_storage(destination: Path, backup_root: Path, *, force
     releases = destination / "releases"
     if releases.exists() or releases.is_symlink():
         owned_directory(releases)
+    if os.name == "nt":
+        if scripts.exists() or scripts.is_symlink():
+            owned_directory(scripts)
+        if (destination / ".release").exists() or (destination / ".release").is_symlink():
+            windows_release(destination)
+        if scripts.exists() and not force:
+            raise ValueError("runtime scripts already exist; rerun with --force to preserve and replace them")
+        return
     if scripts.is_symlink():
         target = scripts.resolve()
         if (scripts.lstat().st_uid != os.getuid() or not target.is_relative_to(releases)
@@ -307,6 +407,9 @@ def remove_retired_directory(path: Path) -> None:
         OSError: Directory access, permission repair or removal fails.
         PermissionError: A read-only directory is owned by another user.
     """
+    if os.name == "nt":
+        windows.remove_retired_directory(path)
+        return
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
     try:
         for _, _, _, directory in os.fwalk(".", dir_fd=descriptor, follow_symlinks=False):
@@ -318,6 +421,175 @@ def remove_retired_directory(path: Path) -> None:
     finally:
         os.close(descriptor)
     shutil.rmtree(path)
+
+
+def windows_release(destination: Path) -> Path:
+    """Authenticate a Windows release pointer and its stable entry files.
+
+    Args:
+        destination (Path): Owned runtime root containing the pointer.
+
+    Returns:
+        Path: Validated immutable scripts directory selected by the pointer.
+
+    Raises:
+        OSError: A pointer, entry file or release cannot be read.
+        ValueError: The pointer, launchers or storage are invalid or redirected.
+    """
+    with open_regular(destination / ".release") as stream:
+        release = stream.read(128).decode("ascii").strip()
+        if stream.read(1) or not re.fullmatch(r"[0-9a-f]{16}-[0-9a-f]{32}", release):
+            raise ValueError("invalid installed review release pointer")
+    scripts = destination / "scripts"
+    owned_directory(scripts)
+    for name in (*MODULES, *HELPERS):
+        with open_regular(scripts / name) as stream:
+            if stream.read().decode("utf-8").replace("\r\n", "\n") != WINDOWS_BOOTSTRAP:
+                raise ValueError("installed review release launcher differs")
+    target = destination / "releases" / release / "scripts"
+    owned_directory(target.parent)
+    owned_directory(target)
+    return target
+
+
+def stage_release(releases: Path, sources: dict[str, Path], expected: dict,
+                  expected_files: dict[str, str]) -> Path:
+    """Publish a complete checksummed release before activating any entrypoint.
+
+    Args:
+        releases (Path): Private release storage.
+        sources (dict[str, Path]): Exact owned source files.
+        expected (dict): Runtime identity computed during preflight.
+        expected_files (dict[str, str]): Preflight hashes for all installed files.
+
+    Returns:
+        Path: Newly published release scripts directory.
+
+    Raises:
+        OSError: Staging or publication fails.
+        ValueError: Source bytes change during installation.
+    """
+    make_owned_directory(releases)
+    with tempfile.TemporaryDirectory(prefix=".pending-", dir=releases) as temporary:
+        pending = Path(temporary)
+        staged = pending / "scripts"
+        make_owned_directory(staged)
+        for name, source in sources.items():
+            shutil.copy2(source, staged / name)
+            (staged / name).chmod(0o644)
+        if (any(file_hash(staged / name) != digest for name, digest in expected_files.items())
+                or any(file_hash(sources[name]) != digest for name, digest in expected_files.items())):
+            raise ValueError("runtime source changed during installation")
+        receipt = {"version": 1, "runtime": expected, "installed_files": expected_files,
+                   "source_revision": source_revision(sources)}
+        (staged / MANIFEST).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        (staged / MANIFEST).chmod(0o644)
+        release = releases / (expected["fingerprint"][:16] + "-" + uuid.uuid4().hex)
+        pending.rename(release)
+    return release / "scripts"
+
+
+def copy_windows_tree(source: Path, target: Path) -> None:
+    """Back up private Windows code without traversing reparse entries.
+
+    Args:
+        source (Path): Existing private scripts directory to preserve.
+        target (Path): New private backup directory.
+
+    Raises:
+        OSError: A directory or file cannot be copied.
+        ValueError: An entry is redirected or its storage is unsafe.
+    """
+    owned_directory(source)
+    make_owned_directory(target)
+    for entry in source.iterdir():
+        if entry.is_dir():
+            copy_windows_tree(entry, target / entry.name)
+        else:
+            with open_regular(entry) as original, (target / entry.name).open("xb") as copied:
+                shutil.copyfileobj(original, copied)
+            shutil.copystat(entry, target / entry.name, follow_symlinks=False)
+
+
+def install_windows(destination: Path, backup_root: Path, sources: dict[str, Path],
+                    expected: dict, expected_files: dict[str, str], *, force: bool) -> dict:
+    """Activate native Windows releases through one atomic regular-file pointer.
+
+    Args:
+        destination (Path): Preflight-validated runtime root.
+        backup_root (Path): Separate private backup root.
+        sources (dict[str, Path]): Exact files selected for installation.
+        expected (dict): Expected runtime identity.
+        expected_files (dict[str, str]): Expected installed file digests.
+        force (bool): Explicit replacement authorization.
+
+    Returns:
+        dict: Activation identity, release and backup, with any pending cleanup.
+
+    Raises:
+        OSError: Locking, staging, backup or atomic activation fails.
+        ValueError: Storage, launcher or source validation fails.
+        BlockingIOError: Another installer owns the lock.
+    """
+    make_owned_directory(destination)
+    scripts = destination / "scripts"
+    pointer = destination / ".release"
+    with windows.install_lock(destination / ".install.lock"):
+        validate_installation_storage(destination, backup_root, force=force)
+        current = windows_release(destination) if pointer.exists() else None
+        if current is not None:
+            try:
+                manifest = read_installation_manifest(current, code_identity(current))
+                if manifest["runtime"] == expected and manifest["installed_files"] == expected_files:
+                    return {"runtime": expected, "changed": False, "release": str(current), "backup": None}
+            except (OSError, ValueError):
+                pass  # Explicit forced repair also replaces a broken old receipt.
+        release = stage_release(destination / "releases", sources, expected, expected_files)
+        backup = None
+        if scripts.exists():
+            # A rooted Windows drive/UNC path must never discard backup_root.
+            anchor = re.sub(r"[^A-Za-z0-9._-]", "_", scripts.anchor)
+            backup = backup_root / anchor / Path(*scripts.parts[1:])
+            make_owned_directory(backup.parent)
+            if backup.exists() or backup.is_symlink():
+                raise ValueError("runtime backup already exists; use a fresh backup root")
+            with tempfile.TemporaryDirectory(prefix=".scripts-backup-", dir=backup.parent) as temporary:
+                copied = Path(temporary) / "scripts"
+                copy_windows_tree(current or scripts, copied)
+                copied.rename(backup)
+        previous = None
+        with tempfile.TemporaryDirectory(prefix=".activation-", dir=destination) as temporary:
+            pending = Path(temporary)
+            staged_pointer = pending / ".release"
+            staged_pointer.write_text(release.parent.name + "\n", encoding="ascii")
+            published_launchers = False
+            try:
+                if current is None:
+                    launchers = pending / "scripts"
+                    make_owned_directory(launchers)
+                    for name in (*MODULES, *HELPERS):
+                        (launchers / name).write_text(WINDOWS_BOOTSTRAP, encoding="utf-8")
+                    if scripts.exists():
+                        previous = destination / (".scripts-previous-" + uuid.uuid4().hex)
+                        scripts.rename(previous)
+                    launchers.rename(scripts)
+                    published_launchers = True
+                os.replace(staged_pointer, pointer)
+            except BaseException:
+                if current is None:
+                    if published_launchers:
+                        remove_retired_directory(scripts)
+                    if previous is not None and previous.exists():
+                        previous.rename(scripts)
+                raise
+        result = {"runtime": expected, "changed": True, "release": str(release),
+                  "backup": str(backup) if backup is not None else None}
+        if previous is not None:
+            try:
+                remove_retired_directory(previous)
+            except OSError as error:
+                result["cleanup_pending"] = {"path": str(previous), "error": str(error)}
+        return result
 
 
 def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | None = None,
@@ -352,6 +624,8 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
     releases = destination / "releases"
     if dry_run:
         return {"runtime": expected, "changed": True, "dry_run": True, "destination": str(scripts)}
+    if os.name == "nt":
+        return install_windows(destination, backup_root, sources, expected, expected_files, force=force)
     make_owned_directory(destination)
     descriptor = os.open(destination / ".install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "r+") as lock:
@@ -368,23 +642,7 @@ def install(destination: Path, backup_root: Path, *, sources: dict[str, Path] | 
             except (OSError, ValueError):
                 # A broken old receipt must not prevent an explicitly forced repair.
                 pass
-        make_owned_directory(releases)
-        with tempfile.TemporaryDirectory(prefix=".pending-", dir=releases) as temporary:
-            pending = Path(temporary)
-            staged = pending / "scripts"
-            staged.mkdir(mode=0o700)
-            for name, source in sources.items():
-                shutil.copy2(source, staged / name)
-                (staged / name).chmod(0o644)
-            if (any(file_hash(staged / name) != digest for name, digest in expected_files.items())
-                    or any(file_hash(sources[name]) != digest for name, digest in expected_files.items())):
-                raise ValueError("runtime source changed during installation")
-            receipt = {"version": 1, "runtime": expected, "installed_files": expected_files,
-                       "source_revision": source_revision(sources)}
-            (staged / MANIFEST).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-            (staged / MANIFEST).chmod(0o644)
-            release = releases / (expected["fingerprint"][:16] + "-" + uuid.uuid4().hex)
-            pending.rename(release)
+        release = stage_release(releases, sources, expected, expected_files).parent
         replacement = destination / (".scripts-" + uuid.uuid4().hex)
         replacement.symlink_to(release / "scripts", target_is_directory=True)
         backup = None

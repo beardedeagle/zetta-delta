@@ -7,13 +7,6 @@ on:
       - install.sh
       - review/**
       - tests/pr-review-*test.py
-  push:
-    branches: [fix/review-harness-lifecycle]
-    paths:
-      - .github/workflows/review-installer.yml
-      - install.sh
-      - review/**
-      - tests/pr-review-*test.py
 
 permissions:
   contents: read
@@ -27,4 +20,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify native installation and filesystem safeguards
-        run: python -B tests/pr-review-windows-test.py
+        run: |
+          python -B tests/pr-review-windows-primitives-test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B tests/pr-review-windows-test.py
