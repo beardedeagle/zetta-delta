@@ -407,7 +407,8 @@ def shortfall(value: dict | None, *, errors: list[dict] | None = None, field: st
                 raise ValueError("shortfall materiality must be boolean")
 
 
-def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None) -> tuple[int, int]:
+def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None, *,
+                    reserve_queued: bool = True) -> tuple[int, int]:
     """Validate launch room or reserve remaining room for scheduling decisions.
 
     Args:
@@ -415,6 +416,9 @@ def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None)
         capacity (dict): Native counts/evidence, or explicit null counts when
             Delta owns admission for this run.
         assignment_id (str | None): Queued reservation being checked for launch.
+        reserve_queued (bool): Charge waiting allocations during new-wave
+            planning. Bounded recovery replaces settled work and checks live
+            room without charging the unrelated waiting backlog.
 
     Returns:
         tuple[int, int]: Preflight slots and local reservations; native mode
@@ -450,10 +454,12 @@ def native_capacity(run: dict, capacity: dict, assignment_id: str | None = None)
         reserved -= 1
     if not native and capacity["parent_active"] < active:
         raise NeedsDecision("native_capacity", "native observation omits jobs still recorded as running; reconcile their lifecycle")
-    # Waiting work reserves future waves, but must not prevent its own launch.
-    room = (15 - active if native else min(15 - capacity["parent_active"], 30 - capacity["process_active"])) - (reserved if assignment_id is None else 0)
+    # Waiting work reserves future waves, not a live slot needed by a retry.
+    room = (15 - active if native else min(15 - capacity["parent_active"], 30 - capacity["process_active"]))
+    if reserve_queued and assignment_id is None:
+        room -= reserved
     if room <= 0:
-        raise NeedsDecision("native_capacity", "active jobs and retained queued/unassigned allocations fill the admission preflight capacity")
+        raise NeedsDecision("native_capacity", "native admission preflight capacity is full")
     return room, reserved
 
 
@@ -962,13 +968,37 @@ def unit_root(target: dict, row: dict) -> dict:
     return target["assignments"][row["recovery"]["unit_id"]] if row.get("recovery") else row
 
 
-def recovery(run: dict, target: dict, data: dict) -> dict:
+def resolved_report_observation(target: dict, row: dict) -> int | None:
+    """Return the original report check for an audited live-parent resolution.
+
+    Args:
+        target (dict): Retained integrity observations and validated resolutions.
+        row (dict): File-backed report with its original intake observation.
+
+    Returns:
+        int | None: Bound incident index, or None without matching sealed evidence.
+    """
+    report = row.get("report") or row.get("rejected_report", {})
+    status = report.get("source_status", "unchanged")
+    index = row.get("report_source_observation")
+    if (not row.get("authored_report") or status not in ("changed", "unknown")
+            or type(index) is not int or not 0 <= index < len(target["integrity"])):
+        return None
+    resolution = target.get("integrity_resolutions", {}).get(str(index), {})
+    if target["integrity"][index]["status"] == status and resolution.get("cause") == "live-parent-update":
+        return index
+    return None
+
+
+def recovery(run: dict, target: dict, data: dict, *, replay: bool = False) -> dict:
     """Create bounded work for a selected participant without rewriting a report.
 
     Args:
         run (dict): Frozen registry, unavailable lanes and native capacity evidence.
         target (dict): Original assignments, reports and findings.
-        data (dict): Retry, correction or focused dispute request.
+        data (dict): Retry, correction, resolved-hold resume or focused dispute.
+        replay (bool): Retain historical admission evidence without applying
+            newly enforced live provider or metered limits retroactively.
 
     Returns:
         dict: New queued assignment retaining the logical unit and participant.
@@ -985,7 +1015,7 @@ def recovery(run: dict, target: dict, data: dict) -> dict:
     if data["target"] != target["frozen"] or target["resources_removed"]:
         raise ValueError("recovery requires the complete frozen target and existing resources")
     evidence(data["reason"])
-    kind = choice(data["kind"], ("retry", "correction", "follow-up"), "recovery kind")
+    kind = choice(data["kind"], ("retry", "correction", "resume", "follow-up"), "recovery kind")
     prior = target["assignments"].get(stable_id(data["assignment_id"]))
     if prior is None or prior["status"] in ("queued", "running"):
         raise NeedsDecision("runtime_reconciliation", "settle the exact native task before recovery; elapsed time is not terminal evidence")
@@ -1022,13 +1052,20 @@ def recovery(run: dict, target: dict, data: dict) -> dict:
         if prior.get("withdrawal"):
             raise ValueError("unstarted withdrawn work can only use a bounded retry")
         if "route" in data:
-            raise ValueError("corrections and follow-ups reuse their selected runtime participant")
+            raise ValueError("corrections, resumes and follow-ups reuse their selected runtime participant")
         request["runtime_handle"] = prior["runtime_handle"]
-        if kind == "correction":
+        if kind in ("correction", "resume"):
             if set(data) & {"finding_id", "question", "arguments", "new_evidence", "units"}:
-                raise ValueError("correction cannot change its assigned scope")
+                raise ValueError(f"{kind} cannot change its assigned scope")
             outcome = prior.get("runtime_outcome", {})
-            if outcome.get("cause", "incomplete-report") not in ("incomplete-report", "evidence-gap") or (not prior.get("rejected_report") and prior["status"] not in ("partial", "blocked")):
+            if kind == "resume":
+                observation = resolved_report_observation(target, prior)
+                if (observation is None or not prior.get("report") or prior["status"] not in ("partial", "blocked")
+                        or not any(item["recovery"]["kind"] == "correction" for item in attempts)
+                        or outcome.get("cause", "incomplete-report") not in ("incomplete-report", "evidence-gap")):
+                    raise NeedsDecision("report_resume", "resume requires a spent correction and a partial sealed report bound to a resolved live-parent incident")
+                request["source_observation"] = observation
+            elif outcome.get("cause", "incomplete-report") not in ("incomplete-report", "evidence-gap") or (not prior.get("rejected_report") and prior["status"] not in ("partial", "blocked")):
                 raise NeedsDecision("report_correction", "one correction applies only to a malformed/incomplete report, not a runtime or source failure")
         else:
             decisions(data, ("finding_id", "question", "arguments", "new_evidence", "units"), "dispute_evidence", tuple(data.keys() - {"finding_id", "question", "arguments", "new_evidence", "units"}))
@@ -1058,8 +1095,10 @@ def recovery(run: dict, target: dict, data: dict) -> dict:
             request["unit_id"] = key
     if row["identity"]["lane"] in run["unavailable_lanes"]:
         raise NeedsDecision("unavailable_lane", "this effective lane is unavailable for the run; use a verified same-model retry route or retain incomplete work")
-    native_capacity(run, data["capacity"])
     row["recovery"] = request
+    native_capacity(run, data["capacity"], reserve_queued=False)
+    if not replay:
+        provider_capacity(run, target, row)
     return row
 
 
@@ -1362,6 +1401,67 @@ def coverage_gaps(target: dict) -> list[str]:
     return gaps
 
 
+def provider_capacity(run: dict, target: dict, row: dict) -> None:
+    """Check configured provider/family room and authorized fresh metered spawns.
+
+    Args:
+        run (dict): Replayed run with registered identities and issued launches.
+        target (dict): Candidate's target and its metered-spawn authorization.
+        row (dict): Candidate assignment, excluding its own issued reservation.
+
+    Raises:
+        NeedsDecision: Provider/family room or metered authorization is exhausted.
+        ValueError: An explicit family cap is outside the native parent limit.
+    """
+    person = row["identity"]
+    assignments = [item for owner in run["targets"].values() for item in owner["assignments"].values()]
+    live = {}
+    for item in assignments:
+        if item["id"] == row["id"] or not (item["status"] == "running" or
+                                                item["status"] == "queued" and item.get("task_ready")):
+            continue
+        actual = item.get("actual_identity") or item["identity"]
+        handle = item.get("runtime_handle") or item.get("recovery", {}).get("runtime_handle")
+        live[("handle", handle) if handle else ("reservation", item["id"])] = actual
+    if sum(item["provider_id"] == person["provider_id"] for item in live.values()) >= person["limit"]:
+        raise NeedsDecision("provider_capacity", "configured provider concurrency is full; preserve waiting work until a live slot opens")
+    family_limit = run.get("family_limit")
+    if family_limit is not None:
+        if type(family_limit) is not int or not 1 <= family_limit <= 15:
+            raise ValueError("family limit must be an integer between one and fifteen")
+        if sum(item["family"] == person["family"] for item in live.values()) >= family_limit:
+            raise NeedsDecision("family_capacity", "explicit family concurrency is full across provider accounts")
+    if person["billing"] != "metered":
+        return
+
+    def metered_slots(items: list[dict]) -> tuple[set[str], set[str]]:
+        """Count served handles and fresh issued approvals without double charges.
+
+        Args:
+            items (list[dict]): Run-wide or target-local assignment records.
+
+        Returns:
+            tuple[set[str], set[str]]: Spent handles and reserved fresh-spawn IDs.
+        """
+        spent = {item["runtime_handle"] for item in items if item.get("runtime_handle")
+                 and (item.get("actual_identity") or {}).get("billing") == "metered"}
+        reserved = {item["id"] for item in items if item["id"] != row["id"]
+                    and item["status"] == "queued" and item.get("task_ready")
+                    and item["identity"]["billing"] == "metered"
+                    and item.get("recovery", {}).get("runtime_handle") not in spent}
+        return spent, reserved
+
+    spent, reserved = metered_slots(assignments)
+    if row.get("recovery", {}).get("runtime_handle") in spent:
+        return
+    authorization = target.get("authorization")
+    local_spent, local_reserved = metered_slots(list(target["assignments"].values()))
+    if authorization is None or len(local_spent) + len(local_reserved) >= authorization["metered_spawns"]:
+        raise NeedsDecision("metered_authorization", "fresh metered spawn requires remaining explicit target authorization")
+    if len(spent) + len(reserved) >= person["metered_max_spawns"]:
+        raise NeedsDecision("metered_capacity", "configured run-wide metered spawn allowance is exhausted; prior failed or unknown attempts retain spend")
+
+
 def dispatch_task(run: dict, key: str, assignment_id: str, capacity: dict, *, replay: bool = False,
                   directory: Path | None = None) -> dict:
     """Gate a native launch or follow-up using the current recorded workflow.
@@ -1391,6 +1491,8 @@ def dispatch_task(run: dict, key: str, assignment_id: str, capacity: dict, *, re
                       for target in run["targets"].values() for item in target["assignments"].values()):
         raise NeedsDecision("runtime_reconciliation", "settle the selected runtime handle before its follow-up")
     native_capacity(run, capacity, assignment_id)
+    if not replay:
+        provider_capacity(run, run["targets"][key], row)
     parent = capacity.get("runtime_parent_root")
     if "admission_mode" in run:
         captured = run.get("native_parent")
@@ -1454,7 +1556,7 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
     units = {unit: target["catalog"]["units"][unit] for unit in row["units"]}
     tests = row["test_plan"]
     run_argument = shlex.quote(str(directory if directory is not None else Path(frozen["source_root"]).parent.parent))
-    script = shlex.quote("workflow.py" if replay else str(Path(__file__).with_name("workflow.py").absolute()))
+    script = shlex.quote("workflow.py" if replay else str(Path(__file__).with_name("workflow.py").resolve()))
     diff = f'rtk proxy python3 {script} --run {run_argument} diff --target {shlex.quote(key)}; echo "exit=$?"'
     payload = {"unit": row["id"], "role": row["role"], "identity": row["identity"], "target_id": key,
                "target": frozen, "source_root": frozen["source_root"], "diff_command": diff,
@@ -1512,11 +1614,11 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
     recovery_request = row.get("recovery")
     if recovery_request:
         payload["recovery"] = {name: recovery_request[name] for name in
-                               ("kind", "reason", "question", "arguments", "new_evidence") if name in recovery_request}
+                               ("kind", "reason", "question", "arguments", "new_evidence", "source_observation") if name in recovery_request}
         prior = target["assignments"][recovery_request["assignment_id"]]
         if prior.get("rejected_report"):
             payload["correction"] = {name: prior["rejected_report"][name] for name in ("code", "reason")}
-        elif recovery_request["kind"] == "correction" and prior["report"]:
+        elif recovery_request["kind"] in ("correction", "resume") and prior["report"]:
             payload["correction"] = {name: prior["report"][name] for name in
                                      ("status", "coverage_gaps", "checked_units", "checked_interactions", "verdicts", "adjudications") if name in prior["report"]}
         retained = {}
@@ -1533,7 +1635,7 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
         "Start at assigned hunks, then trace concrete triggers, callers, contracts and consequences. Check all nine categories; no finding quota. Separate pre-existing unrelated observations.",
         "Evaluate PR description, discussion and prior review history against the frozen code. Explanations may refute or change findings; accepting risk or declining a fix alone does not resolve a supported finding. Revalidate recurring claims and preserve their prior IDs/history when linking the evidence.",
         "Record source references and meaningful test evidence or the reason tests were omitted. Scouts inspect statically. Execute only assigned authorized tests in the disposable test root; never use live services.",
-        "Sources and parent must remain unchanged. Baselines detect writes afterward; they do not prevent writes or merge-back. Clean only your own artifacts and report unexpected changes.",
+        "Frozen sources, sealed artifacts and native coordinator/reviewer checkouts must remain unchanged. The live original may advance after freezing; never undo or move its repairs. Baselines detect writes afterward, not prevent them. Clean only your own artifacts and report unexpected changes.",
         f"Use original finding IDs <unit>-NN. Severity must be one of {', '.join(SEVERITIES)}; nit is optional (at most five). Keep actual finder provenance; spillover is a new original finding.",
         "done requires all assigned units/interactions, category evidence and unchanged source. Missing evidence requires partial/blocked, never guessed certainty.",
     )

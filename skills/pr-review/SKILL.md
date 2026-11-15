@@ -63,6 +63,14 @@ follow `references/effective-identity.md` before dispatch. Never switch the top-
 identity or family overlap holds the affected work. Self-reported identity text
 is not evidence of the served model; retain Delta's native identity evidence.
 
+Use the reference's bounded recovery for both initial-response and response-stream
+failures. Confirm the exact attempt's terminal outcome before retrying; silence
+alone is unknown. Preserve its findings and failure receipt, honor the user's
+concurrency and spending limits, and stop after the permitted retry is exhausted.
+Deliver available findings when requested even while another stage is held.
+If the user explicitly waives a stage, record that instruction and retain its
+unperformed status; do not claim completed independent vetting.
+
 ### Delta dispatch contract
 
 Before every spawn or follow-up, call the shared workflow's `task` command with
@@ -72,6 +80,10 @@ register its baseline. `runtime_parent_root` must match that capture. An explici
 `create --admission-mode native` records unavailable live counts as null and lets
 Delta own admission under unchanged 15/30 limits; omit `task --capacity` in that
 mode. Never substitute persisted thread lists or invented zero for live counts.
+Pass `create --family-limit` when the user specifies a per-family concurrency
+cap. Provider limits come from the captured registry. Issued launches count
+against live limits; unrelated waiting assignments do not. Fresh metered spawns
+require recorded target authorization and the registry's remaining spawn allowance.
 An issued task must be registered before another task or fresh scan. While waiting
 for its native cwd, use only `status`/`report`; other commands hold without journal
 changes. Settle that exact launch with `started` or a verified no-start withdrawal.

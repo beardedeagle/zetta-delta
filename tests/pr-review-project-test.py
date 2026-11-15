@@ -122,71 +122,153 @@ class ProjectTests(unittest.TestCase):
         connection.commit()
         return cache / "codegraph.db-shm"
 
-    def test_cache_only_drift_is_audited_without_replacing_original_baselines(self):
-        shm = self.codegraph_cache()
-        run = self.prepared(exclusions=[[".codegraph", "generated index"]])
-        key, target = next(iter(run["targets"].items()))
-        record = preparation.capture_baseline(self.directory, "owner", self.source, (),
-                                              filesystem=True, cache_recovery=True)
-        baseline_bytes = (self.directory / record["artifact"]).read_bytes()
-        before = shm.read_bytes()
-        shm.write_bytes(before[:-1] + bytes([before[-1] ^ 1]))
-        result = preparation.check(self.directory, run["run_id"], key, target["frozen"], {"owner": record})
-        self.assertEqual(result["status"], "unchanged")
-        self.assertEqual(result["cache_changes"], [{"root": str(self.source),
-                         "path": ".codegraph/codegraph.db-shm", "before": hashlib.sha256(before).hexdigest(),
-                         "after": preparation.digest(shm)}])
-        self.assertEqual((self.directory / record["artifact"]).read_bytes(), baseline_bytes)
-        run = workflow.apply_event(run, FIXTURES.event("integrity", result, key))
-        self.assertEqual(workflow.integrity_failures(run), ([], []))
-
-    def test_cache_drift_does_not_exempt_source_database_wal_or_unknown_files(self):
-        shm = self.codegraph_cache()
-        run = self.prepared(exclusions=[[".codegraph", "generated index"]])
-        key, target = next(iter(run["targets"].items()))
-        content = shm.read_bytes()
-        shm.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
-        for relative in ("api.py", ".codegraph/codegraph.db", ".codegraph/codegraph.db-wal", ".codegraph/unknown.py"):
-            path = self.source / relative
-            original = path.read_bytes() if path.exists() else None
-            with self.subTest(path=relative):
-                path.write_bytes((original or b"") + b"unexpected")
-                self.assertNotEqual(preparation.check(self.directory, run["run_id"], key,
-                                    target["frozen"], {})["status"], "unchanged")
-            if original is None:
-                path.unlink()
-            else:
-                path.write_bytes(original)
-
-    def test_cache_recovery_requires_explicit_exclusion_and_stable_identity(self):
-        shm = self.codegraph_cache()
+    def test_disposable_indexes_are_pruned_and_never_block_new_source_checks(self):
+        self.codegraph_cache()
+        for name in (".tgrep", ".zvec-grep"):
+            cache = self.source / name
+            cache.mkdir()
+            (cache / "index.bin").write_bytes(b"old cache")
         run = self.prepared()
         key, target = next(iter(run["targets"].items()))
-        content = shm.read_bytes()
-        shm.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
-        self.assertEqual(preparation.check(self.directory, run["run_id"], key, target["frozen"], {})["status"], "changed")
-        for mutation in ("mode", "replacement", "symlink", "owner"):
-            with self.subTest(mutation=mutation):
-                shm.write_bytes(content)
-                shm.chmod(0o600)
-                run = self.prepared(exclusions=[[".codegraph", "generated index"]])
-                key, target = next(iter(run["targets"].items()))
-                shm.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
-                if mutation == "mode":
-                    shm.chmod(0o644)
-                elif mutation == "replacement":
-                    replacement = shm.with_name("replacement")
-                    replacement.write_bytes(shm.read_bytes())
-                    replacement.chmod(0o600)
-                    replacement.replace(shm)
-                elif mutation == "symlink":
-                    shm.unlink()
-                    shm.symlink_to("codegraph.db")
-                with patch.object(preparation.os, "getuid", return_value=os.getuid() + (mutation == "owner")):
-                    self.assertNotEqual(preparation.check(self.directory, run["run_id"], key,
-                                        target["frozen"], {})["status"], "unchanged")
-                if shm.is_symlink():
-                    shm.unlink()
+        frozen = target["frozen"]
+        self.assertEqual(target["coverage_gaps"], {})
+        for name in preparation.INDEX_DIRECTORIES:
+            self.assertIn(name, frozen["manifest"]["excluded"])
+            self.assertFalse(any(path == name or path.startswith(name + "/") for path in frozen["inventory"]))
+            cache = self.source / name
+            (cache / "changed.bin").write_bytes(b"disposable index churn")
+        self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+        (self.source / "api.py").write_text("changed source\n")
+        self.assertIn("parent", preparation.check(self.directory, run["run_id"], key, frozen, {})["components"])
+
+    def test_index_reason_does_not_hide_explicit_source_omissions(self):
+        (self.source / ".codegraph").write_text("ordinary source file\n")
+        for path, reason in ((path, reason) for path in ("api.py", ".codegraph")
+                             for reason in (preparation.INDEX_REASON, "Git metadata")):
+            with self.subTest(path=path, reason=reason):
+                run = self.prepared(exclusions=[[path, reason]])
+                target = next(iter(run["targets"].values()))
+                self.assertTrue(any(gap["material"] and gap["reason"].startswith(path + ":")
+                                    for gap in target["coverage_gaps"].values()))
+
+    def test_explicit_descendants_of_omitted_indexes_keep_material_coverage_gaps(self):
+        cache = self.source / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("explicitly omitted source\n")
+        for path in (".codegraph/source.py", ".codegraph/absent.py"):
+            with self.subTest(path=path):
+                run = self.prepared(exclusions=[[path, "owner excluded this source"]])
+                target = next(iter(run["targets"].values()))
+                self.assertTrue(any(gap["material"] and gap["reason"].startswith(".codegraph:")
+                                    for gap in target["coverage_gaps"].values()))
+
+    def test_old_hashed_unreviewed_indexes_preserve_artifacts_and_source_guards(self):
+        shm = self.codegraph_cache()
+        run = self.run_record(exclusions=[[".codegraph", "generated index"]])
+        key, target = next(iter(run["targets"].items()))
+        original = preparation.project_baseline
+
+        def legacy_capture(root, exclude=(), **kwargs):
+            kwargs.update(exclude_indexes=False, exclude_generated=False)
+            return original(root, () if root == self.source else exclude, **kwargs)
+
+        with patch.object(preparation, "project_baseline", side_effect=legacy_capture):
+            staged = preparation.prepare(self.directory, run["run_id"], key, target, self.source)
+        artifact = Path(staged["source_root"]).parent / "parent-baseline.json"
+        before = artifact.read_bytes()
+        self.assertIn(".codegraph/codegraph.db", json.loads(before)["files"])
+        self.assertIn("cache_identity", json.loads(before))
+        for name in ("codegraph.db", "codegraph.db-wal", "codegraph.db-shm"):
+            path = shm.with_name(name)
+            path.write_bytes(path.read_bytes() + b"changed disposable bytes")
+        real_fwalk = preparation.os.fwalk
+
+        def guarded_walk(root, *args, **kwargs):
+            for row in real_fwalk(root, *args, **kwargs):
+                self.assertFalse(Path(row[0]).is_relative_to(self.source / ".codegraph"))
+                yield row
+
+        with patch.object(preparation.os, "fwalk", side_effect=guarded_walk):
+            self.assertEqual(preparation.check(self.directory, run["run_id"], key, staged, {})["status"], "unchanged")
+        self.assertEqual(artifact.read_bytes(), before)
+        source_file = Path(staged["source_root"]) / "api.py"
+        source_bytes = source_file.read_bytes()
+        source_file.write_bytes(source_bytes + b"changed reviewed source")
+        self.assertIn("source", preparation.check(self.directory, run["run_id"], key, staged, {})["components"])
+        source_file.write_bytes(source_bytes)
+        artifact.write_text("{}")
+        self.assertNotEqual(preparation.check(self.directory, run["run_id"], key, staged, {})["status"], "unchanged")
+        artifact.write_bytes(before)
+
+    def test_old_omitted_indexes_do_not_require_hash_backfill_or_artifact_replacement(self):
+        self.codegraph_cache()
+        run = self.run_record(exclusions=[[".codegraph", "generated index"]])
+        key, target = next(iter(run["targets"].items()))
+        original = preparation.project_baseline
+
+        def legacy_capture(root, exclude=(), **kwargs):
+            kwargs.update(cache_recovery=False, exclude_indexes=False, exclude_generated=False)
+            return original(root, exclude, **kwargs)
+
+        with patch.object(preparation, "project_baseline", side_effect=legacy_capture):
+            staged = preparation.prepare(self.directory, run["run_id"], key, target, self.source)
+        artifact = Path(staged["source_root"]).parent / "parent-baseline.json"
+        before = artifact.read_bytes()
+        self.assertNotIn(".codegraph/codegraph.db", json.loads(before)["files"])
+        (self.source / ".codegraph/codegraph.db").write_bytes(b"new disposable database")
+        self.assertEqual(preparation.check(self.directory, run["run_id"], key, staged, {})["status"], "unchanged")
+        self.assertEqual(artifact.read_bytes(), before)
+
+    def test_manifest_listed_index_looking_source_remains_strict(self):
+        cache = self.source / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("reviewed source\n")
+        original_inventory = preparation.project_inventory
+        original_baseline = preparation.project_baseline
+
+        def legacy_inventory(root, exclusions=None, destination=None, **kwargs):
+            kwargs["exclude_indexes"] = False
+            return original_inventory(root, exclusions, destination, **kwargs)
+
+        def legacy_baseline(root, exclude=(), **kwargs):
+            kwargs["exclude_indexes"] = False
+            return original_baseline(root, exclude, **kwargs)
+
+        with (patch.object(preparation, "project_inventory", side_effect=legacy_inventory),
+              patch.object(preparation, "project_baseline", side_effect=legacy_baseline)):
+            run = self.prepared()
+        key, target = next(iter(run["targets"].items()))
+        frozen = target["frozen"]
+        self.assertIn(".codegraph/source.py", frozen["manifest"]["entries"])
+        (self.source / ".tgrep").mkdir()
+        (self.source / ".tgrep/index").write_text("unreviewed generated index")
+        self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+        for root in (self.source, Path(frozen["source_root"])):
+            path = root / ".codegraph/source.py"
+            before = path.read_bytes()
+            path.write_bytes(before + b"changed")
+            self.assertNotEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+            path.write_bytes(before)
+
+    def test_disposable_nested_git_metadata_is_ignored_without_hiding_reviewed_git(self):
+        before = {"files": {"api.py": ["file", 0o644, "a" * 64],
+                             ".zvec-grep": ["directory", 0o700],
+                             ".zvec-grep/corpus": ["directory", 0o700],
+                             ".zvec-grep/corpus/source.py": ["file", 0o644, "b" * 64]},
+                  "git": {"head": "c" * 40, "refs": "d" * 64,
+                          "nested": {".zvec-grep/corpus": {"head": "e" * 40}}},
+                  "root_identity": [1, 2, 0o700]}
+        after: dict = {"files": {"api.py": before["files"]["api.py"]},
+                 "git": {"head": "c" * 40, "refs": "d" * 64}, "root_identity": [1, 2, 0o700]}
+        self.assertEqual(preparation.reviewed_ledger(before, ("api.py",)), preparation.reviewed_ledger(after, ("api.py",)))
+        reviewed = ("api.py", ".zvec-grep/corpus/source.py")
+        self.assertNotEqual(preparation.reviewed_ledger(before, reviewed), preparation.reviewed_ledger(after, reviewed))
+        for field, value in (("head", "f" * 40), ("refs", "f" * 64)):
+            changed = copy.deepcopy(after)
+            changed["git"][field] = value
+            self.assertNotEqual(preparation.reviewed_ledger(before, ("api.py",)), preparation.reviewed_ledger(changed, ("api.py",)))
+        after["root_identity"][1] = 3
+        self.assertNotEqual(preparation.reviewed_ledger(before, ("api.py",)), preparation.reviewed_ledger(after, ("api.py",)))
 
     def test_exclusions_require_rationale_and_remain_visible(self):
         generated = self.source / "generated"
@@ -198,6 +280,150 @@ class ProjectTests(unittest.TestCase):
         frozen = next(iter(run["targets"].values()))["frozen"]
         self.assertEqual(frozen["manifest"]["excluded"]["generated"], "generated build output")
         self.assertNotIn("generated/out", frozen["inventory"])
+
+    def test_generated_and_explicit_outputs_are_pruned_before_capture_and_rechecks(self):
+        omitted = ("target", "nested/node_modules", "environments/custom", "custom-out")
+        for relative in omitted:
+            path = self.source / relative
+            path.mkdir(parents=True)
+            (path / "output.bin").write_bytes(b"generated")
+        (self.source / "environments/custom/pyvenv.cfg").write_text("home = /fixture/python\n")
+        included = self.source / "environment-source"
+        included.mkdir()
+        (included / "module.py").write_text("source\n")
+        real_fwalk = preparation.os.fwalk
+
+        def guarded_walk(root, *args, **kwargs):
+            for row in real_fwalk(root, *args, **kwargs):
+                if Path(root) == self.source:
+                    self.assertFalse(any(Path(row[0]).is_relative_to(self.source / name) for name in omitted))
+                yield row
+
+        with patch.object(preparation.os, "fwalk", side_effect=guarded_walk):
+            run = self.prepared(exclusions=[["custom-out", "configured build output"]])
+            key, target = next(iter(run["targets"].items()))
+            frozen = target["frozen"]
+            record = preparation.capture_baseline(self.directory, "owner", self.source, (), filesystem=True,
+                                                   exclude=("custom-out",), exclude_generated=True)
+            self.assertEqual(record["exclude"], ["custom-out"])
+            self.assertTrue(record["exclude_generated"])
+            self.assertTrue(set(omitted) <= set(frozen["manifest"]["excluded"]))
+            self.assertIn("environment-source/module.py", frozen["inventory"])
+            for relative in omitted:
+                (self.source / relative / "output.bin").write_bytes(b"new generated bytes")
+            self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen,
+                                              {"owner": record})["status"], "unchanged")
+            (included / "module.py").write_text("changed source\n")
+            self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen,
+                                              {"owner": record})["status"], "changed")
+            (included / "module.py").write_text("source\n")
+            frozen_output = Path(frozen["source_root"]) / "target"
+            frozen_output.mkdir()
+            (frozen_output / "late.py").write_text("unexpected frozen bytes\n")
+            self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen,
+                                              {"owner": record})["status"], "changed")
+
+    def test_generated_pruning_preserves_explicit_reviewed_paths_and_ancestors(self):
+        names = ("target/nested/source.py", "environment/nested/source.py")
+        for name in names:
+            path = self.source / name
+            path.parent.mkdir(parents=True)
+            path.write_text("reviewed source\n")
+        (self.source / "environment/pyvenv.cfg").write_text("fixture environment\n")
+        omitted = self.source / "node_modules"
+        omitted.mkdir()
+        (omitted / "output").write_text("disposable output\n")
+        reviewed = tuple(names)
+        destination = self.base / "copy"
+        destination.mkdir()
+        original_fwalk = preparation.os.fwalk
+
+        def guarded_walk(root, *args, **kwargs):
+            for row in original_fwalk(root, *args, **kwargs):
+                self.assertFalse(Path(row[0]).is_relative_to(omitted))
+                yield row
+
+        with patch.object(preparation.os, "fwalk", side_effect=guarded_walk):
+            inventory = preparation.project_inventory(self.source, destination=destination,
+                                                       exclude_generated=True, reviewed=reviewed)
+        ledger = preparation.files(self.source, exclude_generated=True, reviewed=reviewed)
+        for name in names:
+            self.assertIn(name, inventory["entries"])
+            self.assertIn(name, ledger)
+            self.assertEqual((destination / name).read_bytes(), (self.source / name).read_bytes())
+            for ancestor in Path(name).parents:
+                if ancestor != Path("."):
+                    self.assertIn(ancestor.as_posix(), inventory["entries"])
+                    self.assertIn(ancestor.as_posix(), ledger)
+        self.assertEqual(inventory["excluded"]["node_modules"], preparation.GENERATED_REASON)
+        self.assertNotIn("node_modules/output", ledger)
+
+    def test_legacy_project_baselines_keep_generated_content_strict(self):
+        output = self.source / "target"
+        output.mkdir()
+        (output / "file").write_text("old\n")
+        before = preparation.project_baseline(self.source)
+        self.assertIn("target/file", before["files"])
+        self.assertNotIn("exclusion_policy", before)
+        (output / "file").write_text("new\n")
+        self.assertNotEqual(preparation.project_baseline(self.source), before)
+
+    def test_explicit_legacy_policy_reproduces_original_bytes_without_replacing_artifacts(self):
+        output = self.source / "target"
+        output.mkdir()
+        (output / "file").write_text("generated\n")
+        run = self.run_record(exclusions=[["target", "build output"]])
+        key, target = next(iter(run["targets"].items()))
+        original = preparation.project_baseline
+
+        def unversioned(root, exclude=(), **kwargs):
+            kwargs.pop("exclude_generated", None)
+            kwargs.pop("exclude_indexes", None)
+            return original(root, exclude, **kwargs)
+
+        with patch.object(preparation, "project_baseline", side_effect=unversioned):
+            staged = preparation.prepare(self.directory, run["run_id"], key, target, self.source)
+        artifact = Path(staged["source_root"]).parent / "parent-baseline.json"
+        before = artifact.read_bytes()
+        policy = {str(self.source): {"fingerprint": staged["parent_fingerprint"],
+                                    "exclude": ["target"], "exclude_generated": True}}
+        check = lambda candidate=policy: preparation.check(self.directory, run["run_id"], key, staged, {},
+                                                           legacy_policies=candidate)
+        self.assertEqual(preparation.check(self.directory, run["run_id"], key, staged, {})["status"], "changed")
+        self.assertEqual(check()["status"], "unchanged")
+        self.assertEqual(artifact.read_bytes(), before)
+        (self.source / "api.py").write_text("changed included source\n")
+        self.assertEqual(check()["status"], "changed")
+        wrong = copy.deepcopy(policy)
+        wrong[str(self.source)]["fingerprint"] = "0" * 64
+        self.assertEqual(check(wrong)["status"], "unknown")
+        wrong = {str(self.source / "missing"): next(iter(policy.values()))}
+        self.assertEqual(check(wrong)["status"], "unknown")
+
+    def test_legacy_policy_cannot_hide_originally_protected_output_or_override_modern_policy(self):
+        output = self.source / "target"
+        output.mkdir()
+        (output / "file").write_text("protected legacy bytes\n")
+        run = self.run_record(exclusions=[["target", "build output"]])
+        key, target = next(iter(run["targets"].items()))
+        original = preparation.project_baseline
+
+        def strict_legacy(root, exclude=(), **kwargs):
+            kwargs.pop("exclude_generated", None)
+            kwargs.pop("exclude_indexes", None)
+            return original(root, (), **kwargs)
+
+        with patch.object(preparation, "project_baseline", side_effect=strict_legacy):
+            staged = preparation.prepare(self.directory, run["run_id"], key, target, self.source)
+        policy = {str(self.source): {"fingerprint": staged["parent_fingerprint"],
+                                    "exclude": ["target"], "exclude_generated": True}}
+        self.assertEqual(preparation.check(self.directory, run["run_id"], key, staged, {},
+                                          legacy_policies=policy)["status"], "changed")
+        modern = self.prepared(exclusions=[["target", "build output"]])
+        modern_key, modern_target = next(iter(modern["targets"].items()))
+        policy[str(self.source)]["fingerprint"] = modern_target["frozen"]["parent_fingerprint"]
+        self.assertEqual(preparation.check(self.directory, modern["run_id"], modern_key, modern_target["frozen"], {},
+                                          legacy_policies=policy)["status"], "unknown")
 
     def test_manifest_snapshot_and_original_mutations_are_detected(self):
         run = self.prepared()
@@ -221,6 +447,39 @@ class ProjectTests(unittest.TestCase):
                 with self.subTest(operation=operation), self.assertRaisesRegex(preparation.NeedsDecision, "project"):
                     workflow.apply_event(run, FIXTURES.event(operation, {}, key))
 
+    def test_live_repairs_do_not_change_frozen_reads_or_clear_snapshot_tampering(self):
+        key, _ = self.issued()
+        original = (self.source / "api.py").read_bytes()
+        (self.source / "api.py").write_text("# concurrent owner repair\n")
+        code, output = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output["content"].encode(), original)
+        _, run = workflow.load_run(self.directory / "run.json")
+        observation = run["targets"][key]["integrity"][-1]
+        self.assertEqual(observation["status"], "unchanged")
+        self.assertEqual(observation["live_parent_changes"]["parent"]["status"], "changed")
+        self.assertEqual((self.source / "api.py").read_text(), "# concurrent owner repair\n")
+        snapshot = Path(run["targets"][key]["frozen"]["source_root"]) / "api.py"
+        snapshot.write_text("# changed review input\n")
+        code, errors = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual((code, errors["code"]), (2, "source_integrity"))
+        snapshot.write_bytes(original)
+        code, errors = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual((code, errors["code"]), (2, "source_integrity"))
+
+    def test_unavailable_live_parent_does_not_skip_protected_snapshot_checks(self):
+        key, _ = self.issued()
+        _, run = workflow.load_run(self.directory / "run.json")
+        snapshot = Path(run["targets"][key]["frozen"]["source_root"]) / "api.py"
+        self.source.rename(self.base / "moved owner checkout")
+        snapshot.write_text("# changed review input\n")
+        code, errors = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual((code, errors["code"]), (2, "source_integrity"))
+        _, run = workflow.load_run(self.directory / "run.json")
+        observation = run["targets"][key]["integrity"][-1]
+        self.assertEqual(observation["live_parent_changes"]["parent"]["status"], "unknown")
+        self.assertIn("source", observation["components"])
+
     def issued(self, roots=None, cross=False):
         run = self.catalogued(roots)
         key, target = next(iter(run["targets"].items()))
@@ -228,10 +487,12 @@ class ProjectTests(unittest.TestCase):
         assignment = FIXTURES.assignment(scope=target["frozen"]["inventory"], units=list(target["catalog"]["units"]),
                                          interactions=list(run["targets"][key]["plan"]["interactions"]))
         run = workflow.apply_event(run, FIXTURES.event("assignment", assignment, key))
-        baseline = preparation.capture_baseline(self.directory, "owner", self.source, (), filesystem=True)
+        baseline = preparation.capture_baseline(self.directory, "owner", self.source, (), filesystem=True,
+                                                 exclude_generated=True)
         run = workflow.apply_event(run, FIXTURES.event("baseline", baseline, key))
         initial = {"method": run["method"], "intake": run["intake"], "registry": run["registry"],
                    "orchestrator": FIXTURES.MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+        initial["runtime"] = workflow.runtime.identity()
         saved = {"version": 1, "initial": initial, "events": run["events"]}
         workflow.write_json(self.directory / "run.json", saved)
         workflow.issue_handoff(self.directory, saved, run, key, "review", {
@@ -500,8 +761,8 @@ class ProjectTests(unittest.TestCase):
         unrelated = self.directory / "keep.txt"
         unrelated.write_text("keep\n")
         original = preparation.project_inventory
-        def moving(root, exclusions=None, destination=None):
-            result = original(root, exclusions, destination)
+        def moving(root, exclusions=None, destination=None, **kwargs):
+            result = original(root, exclusions, destination, **kwargs)
             if destination is not None:
                 (self.source / "api.py").write_text("moved source\n")
             return result
@@ -613,7 +874,8 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(code, 2, hold)
         self.assertEqual(hold["code"], "batch_wave")
         self.assertEqual(hold["revision"], stale["revision"] + 1)
-        (self.source / "api.py").write_text("changed source\n")
+        _, current = workflow.load_run(journal)
+        (Path(current["targets"][key]["frozen"]["source_root"]) / "api.py").write_text("changed source\n")
         code, integrity = self.cli(directory, "record", "--event", str(event_file), "--revision", str(hold["revision"]))
         self.assertEqual(code, 2, integrity)
         self.assertEqual(integrity["code"], "source_integrity")
@@ -653,30 +915,134 @@ class ProjectTests(unittest.TestCase):
     def test_project_parent_baselines_protect_plain_directories(self):
         run = self.prepared()
         key, target = next(iter(run["targets"].items()))
-        record = preparation.capture_baseline(self.directory, "parent", self.source, (), filesystem=True)
+        record = preparation.capture_baseline(self.directory, "parent", self.source, (), filesystem=True,
+                                              exclude_generated=True)
         self.assertTrue(record["filesystem"])
         self.assertEqual(preparation.check(self.directory, run["run_id"], key, target["frozen"], {"parent": record})["status"], "unchanged")
         run = workflow.apply_event(run, FIXTURES.event("baseline", record, key))
         self.assertEqual(workflow.parent_ledgers(self.directory, run)[str(self.source)], preparation.read_baseline(self.directory, record))
 
+    def test_frozen_parent_ledgers_accept_later_live_repairs_but_authenticate_every_capture(self):
+        run = self.prepared()
+        key, target = next(iter(run["targets"].items()))
+        original = workflow.parent_ledgers(self.directory, run)[str(self.source)]
+        snapshot = Path(target["frozen"]["source_root"]) / "api.py"
+        frozen_bytes = snapshot.read_bytes()
+        (self.source / "api.py").write_text("# concurrent owner repair\n")
+        record = preparation.capture_baseline(self.directory, "later-parent", self.source, (), filesystem=True,
+                                              exclude_generated=True)
+        run = workflow.apply_event(run, FIXTURES.event("baseline", record, key))
+        artifact = self.directory / record["artifact"]
+        retained = artifact.read_bytes()
+        self.assertEqual(workflow.parent_ledgers(self.directory, run)[str(self.source)], original)
+        self.assertEqual(snapshot.read_bytes(), frozen_bytes)
+        self.assertEqual(artifact.read_bytes(), retained)
+        self.assertEqual((self.source / "api.py").read_text(), "# concurrent owner repair\n")
+        for protected in (dict(run, native_parent={"root": str(self.source)}),
+                          dict(run, targets={key: dict(target, frozen=None, baselines=run["targets"][key]["baselines"])})):
+            with (self.subTest(protected=bool(protected.get("native_parent"))),
+                  self.assertRaisesRegex(ValueError, "protected parent records disagree")):
+                workflow.parent_ledgers(self.directory, protected)
+        artifact.write_bytes(retained + b"\n")
+        with self.assertRaisesRegex(ValueError, "baseline artifact was replaced or changed"):
+            workflow.parent_ledgers(self.directory, run)
+
     def test_setup_uses_existing_lifecycle_and_test_copies_omit_generated_caches(self):
+        for tool in ("tgrep", "codegraph"):
+            with self.subTest(tool=tool):
+                run = self.run_record()
+                key, target = next(iter(run["targets"].items()))
+                staged = preparation.prepare(self.directory, run["run_id"], key, target, self.source)
+                module, helper_path = preparation.index_helper(bundled=True)
+                cache_name = "." + tool
+                with (patch.object(preparation, "index_helper", return_value=(module, helper_path)),
+                      patch.object(module, "plan_indexes", return_value={"tools": [tool], "available": [tool], "cache_paths": [cache_name]}),
+                      patch.object(module, "unavailable_indexes", return_value=[])):
+                    request = preparation.setup_request(self.directory, run["run_id"], key, staged, [tool])
+                    cache = Path(staged["source_root"]) / cache_name
+                    cache.mkdir()
+                    artifact = cache / ("codegraph.db" if tool == "codegraph" else "index")
+                    artifact.write_text("generated fixture index\n")
+                    frozen = preparation.finalize(self.directory, run["run_id"], key, staged, request, [], None)
+                    self.assertTrue(module.sealed_snapshot(Path(frozen["source_root"])))
+                    copied = preparation.test_copy(self.directory, run["run_id"], key, frozen)
+                    self.assertFalse((copied / cache_name).exists())
+                    self.assertEqual((copied / "api.py").read_bytes(), (self.source / "api.py").read_bytes())
+                    self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+                    artifact.write_text("late index write after sealing\n")
+                    self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+                    (Path(frozen["source_root"]) / "api.py").write_text("changed reviewed source\n")
+                    self.assertIn("source", preparation.check(self.directory, run["run_id"], key, frozen, {})["components"])
+
+    def test_static_test_copy_ignores_late_indexes_but_preserves_legacy_reviewed_index_source(self):
+        cache = self.source / ".codegraph"
+        cache.mkdir()
+        (cache / "source.py").write_text("reviewed source\n")
+        original_inventory = preparation.project_inventory
+        original_baseline = preparation.project_baseline
+
+        def legacy_inventory(root, exclusions=None, destination=None, **kwargs):
+            kwargs["exclude_indexes"] = False
+            return original_inventory(root, exclusions, destination, **kwargs)
+
+        def legacy_baseline(root, exclude=(), **kwargs):
+            kwargs["exclude_indexes"] = False
+            return original_baseline(root, exclude, **kwargs)
+
+        with (patch.object(preparation, "project_inventory", side_effect=legacy_inventory),
+              patch.object(preparation, "project_baseline", side_effect=legacy_baseline)):
+            run = self.prepared()
+        key, target = next(iter(run["targets"].items()))
+        frozen = target["frozen"]
+        source = Path(frozen["source_root"])
+        (source / ".codegraph/index").write_text("late disposable index\n")
+        for name in (".tgrep", ".zvec-grep"):
+            (source / name).mkdir()
+            (source / name / "index").write_text("late disposable index\n")
+        copied = preparation.test_copy(self.directory, run["run_id"], key, frozen)
+        self.assertEqual((copied / ".codegraph/source.py").read_text(), "reviewed source\n")
+        self.assertFalse((copied / ".codegraph/index").exists())
+        self.assertFalse((copied / ".tgrep").exists())
+        self.assertFalse((copied / ".zvec-grep").exists())
+        (source / ".codegraph/source.py").write_text("changed reviewed source\n")
+        with self.assertRaisesRegex(ValueError, "differs from the frozen manifest"):
+            preparation.test_copy(self.directory, run["run_id"], key, frozen)
+
+    def test_project_test_copy_omits_authenticated_new_setup_files_but_keeps_source_strict(self):
+        (self.source / ".delta").mkdir()
+        (self.source / ".delta/source.txt").write_text("reviewed delta configuration\n")
         run = self.run_record()
         key, target = next(iter(run["targets"].items()))
         staged = preparation.prepare(self.directory, run["run_id"], key, target, self.source)
         module, helper_path = preparation.index_helper(bundled=True)
         with (patch.object(preparation, "index_helper", return_value=(module, helper_path)),
-              patch.object(module, "plan_indexes", return_value={"tools": ["tgrep"], "available": ["tgrep"], "cache_paths": [".tgrep"]}),
+              patch.object(module.shutil, "which", side_effect=lambda name: "/fixture/tgrep" if name == "tgrep" else None),
               patch.object(module, "unavailable_indexes", return_value=[])):
             request = preparation.setup_request(self.directory, run["run_id"], key, staged, ["tgrep"])
-            cache = Path(staged["source_root"]) / ".tgrep"
-            cache.mkdir()
-            (cache / "index").write_text("generated fixture index\n")
+            self.assertIn(".sembleignore", request["cache_paths"])
+            source = Path(staged["source_root"])
+            ignore = source / ".sembleignore"
+            ignore.write_text(".delta/\n")
             frozen = preparation.finalize(self.directory, run["run_id"], key, staged, request, [], None)
-            self.assertTrue(module.sealed_snapshot(Path(frozen["source_root"])))
-            copied = preparation.test_copy(self.directory, run["run_id"], key, frozen)
-            self.assertFalse((copied / ".tgrep").exists())
-            self.assertEqual((copied / "api.py").read_bytes(), (self.source / "api.py").read_bytes())
-            self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+        self.assertEqual(preparation.check(self.directory, run["run_id"], key, frozen, {})["status"], "unchanged")
+        copied = preparation.test_copy(self.directory, run["run_id"], key, frozen)
+        self.assertFalse((copied / ".sembleignore").exists())
+        self.assertEqual((copied / ".delta/source.txt").read_text(), "reviewed delta configuration\n")
+        ignore.write_text("changed sealed configuration\n")
+        self.assertIn("source", preparation.check(self.directory, run["run_id"], key, frozen, {})["components"])
+        ignore.write_text(".delta/\n")
+        unrequested = source / "unrequested.txt"
+        unrequested.write_text("unexpected source\n")
+        with self.assertRaisesRegex(ValueError, "differs from the frozen manifest"):
+            preparation.test_copy(self.directory, run["run_id"], key, frozen)
+        unrequested.unlink()
+        for name in ("source-baseline.json", "index-result.json"):
+            artifact = source.parent / name
+            original = artifact.read_bytes()
+            artifact.write_bytes(original + b" ")
+            with self.subTest(artifact=name), self.assertRaisesRegex(ValueError, "evidence changed"):
+                preparation.test_copy(self.directory, run["run_id"], key, frozen)
+            artifact.write_bytes(original)
 
     def test_cli_cleanup_holds_before_removing_another_projects_evidence(self):
         other = self.base / "consumer"
@@ -688,6 +1054,7 @@ class ProjectTests(unittest.TestCase):
         run = workflow.apply_event(run, FIXTURES.event("plan", self.proposed(run, key, True), key))
         initial = {"method": run["method"], "intake": run["intake"], "registry": run["registry"],
                    "orchestrator": FIXTURES.MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+        initial["runtime"] = workflow.runtime.identity()
         (self.directory / "run.json").write_text(json.dumps({"version": 1, "initial": initial, "events": run["events"]}))
         code, result = self.cli(self.directory, "cleanup", "--target", foreign, "--revision", str(run["revision"]))
         self.assertEqual(code, 2, result)

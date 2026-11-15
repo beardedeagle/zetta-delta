@@ -48,8 +48,9 @@
 #   ZETTA_DELTA_REF      commit to fetch the bundle at when none is next to this
 #                        script (curl | bash); there is no default
 #
-# Usage: install.sh [--force] [--dry-run] [--configure-delta] [--prune-legacy] [--skill-dir DIR] [--clean]
+# Usage: install.sh [--force] [--dry-run] [--configure-delta] [--review-runtime-only] [--prune-legacy] [--skill-dir DIR] [--clean]
 # --configure-delta merges bundled credential-free providers and subagent settings.
+# --review-runtime-only switches the shared review code without changing Delta configuration.
 # Quit Delta before installation. Existing files need --force and are backed up.
 set -euo pipefail
 # One brace group, closed on the last line: bash parses all of it before
@@ -70,6 +71,7 @@ PRUNE_LEGACY=0
 CLEAN=0
 HELP=0
 CONFIGURE_DELTA=0
+REVIEW_RUNTIME_ONLY=0
 SKILL_ROOT="${HOME}/.agents/skills"
 
 while (($#)); do
@@ -80,11 +82,16 @@ while (($#)); do
     --skill-dir)    [[ $# -ge 2 ]] || die "--skill-dir needs a value"; SKILL_ROOT="$2"; shift ;;
     --clean)        CLEAN=1 ;;
     --configure-delta) CONFIGURE_DELTA=1 ;;
+    --review-runtime-only) REVIEW_RUNTIME_ONLY=1 ;;
     -h|--help)      HELP=1 ;;
     *)              die "unknown argument: $1 (see --help)" ;;
   esac
   shift
 done
+
+if ((REVIEW_RUNTIME_ONLY && (CONFIGURE_DELTA || PRUNE_LEGACY || CLEAN))); then
+  die "--review-runtime-only cannot change Delta configuration or clean other files"
+fi
 
 # Rendered helper commands need one absolute shell argument. Line breaks cannot
 # be represented by the line-oriented templates; reject them before any writes.
@@ -137,11 +144,56 @@ fi
 readonly SCRIPT_DIR SELF
 if ((HELP)); then usage; exit 0; fi
 
-# ---------------------------------------------------------------- inputs ---
+# Resolve installation roots component by component before .. so a symlinked
+# parent keeps its filesystem meaning. Destinations below them are never resolved:
+# dangling profile/rule links remain entries for preflight and link backups.
+canonical_dir() {
+  local path="$1" label="$2" resolved="" rest part candidate
+  if [[ $path =~ ^[A-Za-z]:[\\/] || $path == \\\\* ]]; then
+    command -v cygpath >/dev/null 2>&1 || die "Windows $label paths need cygpath; use an absolute POSIX path"
+    path="$(cygpath -u -- "$path")" || die "could not convert $label directory"
+  fi
+  [[ $path == /* ]] || path="$PWD/$path"
+  [[ $path != //* ]] || resolved=/
+  rest="$path"
+  while [[ -n $rest ]]; do
+    rest="${rest#/}"; part="${rest%%/*}"
+    if [[ $rest == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    case $part in
+      ""|.) ;;
+      ..) resolved="${resolved%/*}" ;;
+      *)
+        candidate="$resolved/$part"
+        if [[ -d $candidate ]]; then resolved="$(cd -- "$candidate" && pwd -P)"
+        elif [[ -e $candidate || -L $candidate ]]; then die "$label path component is not a directory: $candidate"
+        else resolved="$candidate"
+        fi ;;
+    esac
+  done
+  printf '%s\n' "${resolved:-/}"
+}
+RUNTIME_BACKUP_DIR="$(canonical_dir "$BACKUP_DIR" "review backup")"
+readonly RUNTIME_BACKUP_DIR
 
 # The same PATH prefix travels in the generated rules to Delta's POSIX shell.
 TOOL_BIN="${PREFIX:-$HOME/.local}/bin"
 export PATH="$TOOL_BIN:$PATH"
+
+# Runtime-only upgrades use complete releases and leave profiles/settings alone.
+# Existing commands pin their resolved release; new commands see the new link.
+if ((REVIEW_RUNTIME_ONLY)); then
+  command -v python3 >/dev/null 2>&1 || die "python3 not found"
+  python3 -c 'import tomllib' 2>/dev/null || die "Python 3.11 or later is required"
+  runtime_destination="$(canonical_dir "$HOME/.local/share/zetta-delta/review" "review runtime")"
+  runtime_args=(install --destination "$runtime_destination" --backup-root "$RUNTIME_BACKUP_DIR")
+  ((!FORCE)) || runtime_args+=(--force)
+  ((!DRY_RUN)) || runtime_args+=(--dry-run)
+  python3 "$SCRIPT_DIR/review/scripts/runtime.py" "${runtime_args[@]}"
+  exit $?
+fi
+
+# ---------------------------------------------------------------- inputs ---
+
 REQUIRED_TOOLS=(python3 git gh rg rtk tgrep semble codegraph zg ctx7 githits caveman node)
 for tool in "${REQUIRED_TOOLS[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found; run bootstrap.sh from a clone first"
@@ -350,34 +402,6 @@ delta_config_dir() {
     *)                    die "unsupported OS; set DELTA_CONFIG_DIR" ;;
   esac
 }
-# Resolve installation roots component by component before .. so a symlinked
-# parent keeps its filesystem meaning. Destinations below them are never resolved:
-# dangling profile/rule links remain entries for preflight and link backups.
-canonical_dir() {
-  local path="$1" label="$2" resolved="" rest part candidate
-  if [[ $path =~ ^[A-Za-z]:[\\/] || $path == \\\\* ]]; then
-    command -v cygpath >/dev/null 2>&1 || die "Windows $label paths need cygpath; use an absolute POSIX path"
-    path="$(cygpath -u -- "$path")" || die "could not convert $label directory"
-  fi
-  [[ $path == /* ]] || path="$PWD/$path"
-  [[ $path != //* ]] || resolved=/
-  rest="$path"
-  while [[ -n $rest ]]; do
-    rest="${rest#/}"; part="${rest%%/*}"
-    if [[ $rest == */* ]]; then rest="${rest#*/}"; else rest=""; fi
-    case $part in
-      ""|.) ;;
-      ..) resolved="${resolved%/*}" ;;
-      *)
-        candidate="$resolved/$part"
-        if [[ -d $candidate ]]; then resolved="$(cd -- "$candidate" && pwd -P)"
-        elif [[ -e $candidate || -L $candidate ]]; then die "$label path component is not a directory: $candidate"
-        else resolved="$candidate"
-        fi ;;
-    esac
-  done
-  printf '%s\n' "${resolved:-/}"
-}
 CONFIG_DIR="$(canonical_dir "$(delta_config_dir)" "Delta config")"
 SKILL_ROOT="$(canonical_dir "$SKILL_ROOT" "skill")"
 REVIEW_DIR="$(canonical_dir "$HOME/.local/share/zetta-delta/review" "review runtime")"
@@ -433,7 +457,7 @@ PLANNED=()
 backup() { # DEST: save DEST under BACKUP_DIR before it changes
   local saved="$BACKUP_DIR/${1#/}"
   [[ -d $BACKUP_DIR ]] || info "saving the files this install changes under $BACKUP_DIR"
-  mkdir -p -- "$(dirname -- "$saved")"
+  (umask 077; mkdir -p -- "$(dirname -- "$saved")")
   if [[ $1 == "$CONFIG_DIR/settings.json" ]]; then
     # Keep the link for restoration and snapshot its content privately without
     # changing the original target's permissions. A dangling link has no content.
@@ -518,6 +542,23 @@ install_output() { # DEST CMD [ARG...]: write CMD's output to DEST
   tmp="$(mktemp "${dest}.XXXXXX")"
   "$@" > "$tmp"
   commit_file "$tmp" "$dest"
+}
+
+install_review_runtime() {
+  local -a runtime_args=(install --destination "$REVIEW_DIR" --backup-root "$RUNTIME_BACKUP_DIR")
+  if ((PLANNING)); then
+    PLANNED+=("$REVIEW_DIR/scripts")
+    runtime_args+=(--dry-run)
+  elif ((DRY_RUN)); then
+    runtime_args+=(--dry-run)
+  fi
+  # Bundle preflight reports every existing destination before refusing writes.
+  if ((PLANNING || FORCE)); then runtime_args+=(--force); fi
+  if ((PLANNING)); then
+    python3 "$SCRIPT_DIR/review/scripts/runtime.py" "${runtime_args[@]}" >/dev/null
+  else
+    python3 "$SCRIPT_DIR/review/scripts/runtime.py" "${runtime_args[@]}"
+  fi
 }
 
 profile() { install_file "$SCRIPT_DIR/profiles/$1.toml.tmpl" "$PROFILES_DIR/$1.toml" render; }
@@ -952,11 +993,7 @@ write_bundle() {
   install_file "$SCRIPT_DIR/skills/pr-review-batch/SKILL.md" "$SKILL_DIR/SKILL.md" render
   install_file "$SCRIPT_DIR/skills/pr-review-batch/references/notes.md" "$SKILL_DIR/references/notes.md"
   install_file "$SCRIPT_DIR/skills/find-docs/SKILL.md" "$SKILL_ROOT/find-docs/SKILL.md"
-  for module in intake workflow handoff preparation publication review_contract; do
-    install_file "$SCRIPT_DIR/review/scripts/$module.py" "$REVIEW_DIR/scripts/$module.py"
-  done
-  install_file "$SCRIPT_DIR/skills/orchestrate/scripts/identity.py" "$REVIEW_DIR/scripts/identity.py"
-  install_file "$SCRIPT_DIR/stack/context-indexes/ensure-context-indexes.py" "$REVIEW_DIR/scripts/ensure-context-indexes.py"
+  install_review_runtime
   for skill in pr-review pr-review-batch; do
     SKILL_DIR="$SKILL_ROOT/$skill"
     install_file "$SCRIPT_DIR/review/references/repositories.md" "$SKILL_DIR/references/repositories.md"

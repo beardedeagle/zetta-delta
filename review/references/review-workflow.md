@@ -67,6 +67,20 @@ still bounds recorded running work and reservations, and retains lane, identity,
 workload, integrity, registration and recovery gates. It cannot measure other
 parents' live work in this mode. The choice is immutable in the initial journal.
 
+The registry's provider `limit` bounds registered running work and issued launch
+approvals across the run. Waiting assignments without an issued approval do not
+consume a live provider slot. When the user requests a per-family cap, pass
+`create --family-limit <1..15>`; this limit spans provider accounts. Omitting the
+flag adds no family cap. Unknown native outcomes remain active until reconciled;
+confirmed terminal failures release live concurrency without erasing evidence.
+
+A fresh metered spawn also needs remaining target `authorization.metered_spawns`
+and run-wide registry `metered_max_spawns`. Unique started handles retain their
+spawn charge after success, failure or an unknown outcome. Issued fresh-spawn
+approvals reserve a charge; verified nonlaunch withdrawal releases that
+reservation. A correction or follow-up in the same served handle adds no fresh
+spawn. These counters do not measure provider quota, tokens or currency.
+
 Before dispatch in either mode, run the following in the actual native parent's
 terminal, without `cd`. Code captures the canonical cwd once and binds it to the
 run's thread ID; no root argument or manually recorded event is accepted.
@@ -266,7 +280,7 @@ baselines. Choose useful indexes with optional `setup --tools ...`; omit setup
 for static inspection. `setup` records intent before invoking the existing
 bounded index maintainer, reusing its cache, embedding and build limits.
 `finalize` is required in both cases before planning or assignments.
-Finalization seals the source, including prepared caches. Native reviewers must
+Finalization seals the source. Native reviewers must
 not run `SessionStart` maintenance, create caches or refresh indexes there afterward.
 Use the emitted `source_git_prefix` (`GIT_OPTIONAL_LOCKS=0`) for Git reads and
 `source_search_command` for static searches. Append `--pattern='<literal>'`,
@@ -274,25 +288,40 @@ optional `--regex`, and repeated `--path '<relative-path>'` to narrow the frozen
 source scope. The engine supplies the search executable, argument separator and
 the source root; do not append raw search flags, another root or a trailing `--`.
 
+Setup may create recorded new support files such as `.sembleignore`. Comparison
+with pre-setup evidence omits only authorized paths absent from that evidence and
+the reviewed inventory. Finalization seals the full resulting files; later edits
+remain integrity failures. Project test copies retain the original review manifest
+and omit those generated support files alongside disposable indexes.
+
 Within roots authorized by `~/.config/context-roots`, static search uses
 `tgrep --no-index`. Everywhere else, including default private run snapshots,
 it routes directly to `rg --no-config`; no cache-capable tool is invoked there.
 Missing/unreadable policy fails closed to that route. Both routes include hidden
 and ignored source, exclude Git administration, and preserve literal/regex search.
-Prepared indexes
-are usable only through a read-only route that cannot start a writer; otherwise
-inspect statically. Preserve unexpected changes and prepare a new run rather
-than cleaning or replacing its baseline. A clean Git status does not establish
-full integrity: ignored caches and index metadata are checked too.
-For new project captures explicitly excluding `.codegraph` or its
-`codegraph.db-shm`, an existing regular SHM file may change content while retaining
-its recorded identity, size, owner and permissions. The cache directory and SQLite
-database identities must also remain unchanged and safely owned. Each observation
-retains original/current SHM hashes as `cache_changes`; original baselines remain
-immutable. Database/WAL changes, additions, removals, replacements, symlinks,
-ownership/permission changes and all other source/Git changes still hold the run.
-Reviewed caches and legacy baselines without recorded recovery identities stay
-strict; this is not a blanket cache exclusion or a cache repair.
+Prepared indexes are usable only through a read-only route that cannot start a
+writer; otherwise inspect statically. Preserve unexpected source changes and
+prepare a new run rather than cleaning or replacing its baseline. A clean Git
+status does not establish full integrity: included ignored and untracked source,
+Git administration, retained reports and runtime code remain protected.
+
+Disposable `.codegraph`, `.tgrep` and `.zvec-grep` index contents outside the
+frozen review manifest do not participate in source-integrity comparisons. New
+project captures omit these index directories before traversal or hashing. Old
+ledger artifacts and their fingerprints remain intact and are authenticated
+before comparing their non-index entries; no cache hashes are backfilled. Paths
+already listed in a frozen project manifest or PR/range inventory remain sealed
+review evidence. This policy never exempts reviewed source, report artifacts,
+Git references or runtime identity from their existing checks.
+
+New native-copy proofs record the same index exclusion. Legacy native proofs
+containing only a fingerprint retain their original scan policy because no
+authenticated file ledger exists to separate source from cache bytes. Completed
+workers still retain their Git-reference checks without scanning their temporary
+checkout or clone store. Later setup and finalization use the same recorded
+exclusion and owner policies, so retired checkout paths do not become required again.
+An artifact-backed shared baseline continues to protect its original owners'
+reviewed source paths after their prepared resources are removed.
 
 `source-search` journals a pending execution before running, retains full stdout
 and stderr with hashes, and returns previews of at most 8192 bytes each. Exit zero
@@ -406,6 +435,17 @@ Native commits need not equal the reviewed repository's commit: the registered
 native project may be a different repository. Setup and finalization consume the
 same registered native copies and participating-copy baselines as ordinary checks.
 These bookkeeping exceptions never apply to a frozen source or sealed artifacts.
+Once an independent snapshot is frozen, the original source checkout may advance
+while its owner repairs findings. Its changes remain recorded as
+`live_parent_changes`; they do not change the review's source or block snapshot
+reads, report intake, vetting or adjudication. Setup and finalization still require
+the original to remain unchanged during capture. Frozen snapshots, manifests,
+sealed artifacts, native coordinator/reviewer checkouts and other participating
+copies remain protected. Reports identify live-original changes and continue to
+refer to the captured version, including findings already repaired in the live tree.
+Worker preflight authenticates every retained parent ledger, but later captures of
+a mutable original need not match its earlier source bytes or Git state. The first
+authenticated ledger remains the reference for native bookkeeping; it is not rewritten.
 A verified checkout's `.codegraph/socket` is recorded by kind, permissions, owner,
 device, inode and metadata change time without reading its contents. This
 also applies to owned nested checkouts; their Git ownership is validated before
@@ -489,7 +529,7 @@ distinct family routes for both methods. Native dispatch remains separate.
 | `report-input` | `assignment_id`, exact `runtime_handle`, frozen `target`, original `report` (JSON object/text or null), native `evidence`, and observed `source_status`. Validates through `report` or `adjudication-report`; retains malformed/incomplete replies with the precise validation error instead of losing them. A rejected reply settles the task as blocked and permits one same-handle correction. Repeated inputs for the same attempt are rejected. |
 | `report-draft` | Generated by `author-report` only for an invalid draft: exact assignment/task digest, original input and candidate report artifact references, and all independently detectable validation errors. Requires the running recorded identity. Retains bytes and diagnostics without final submission, accepted findings/coverage or a consumed correction. |
 | `report-authored` | Generated by `author-report` after draft validation: exact assignment, issued task digest, original input and assembled report artifact references. Allows one final per running attempt; receipt still validates actual source/runtime evidence. Historical assembly errors remain readable. Both original documents remain sealed. |
-| `recover` | New stable `id`, prior `assignment_id`, `kind: retry/correction/follow-up`, frozen `target`, `reason`, fresh native `capacity`, and kind-specific evidence below. Creates a linked queued attempt. Retry/correction limits belong to the logical unit, not its new IDs; follow-up limits belong to the original finding. Original reports, identities and gaps remain recorded. |
+| `recover` | New stable `id`, prior `assignment_id`, `kind: retry/correction/resume/follow-up`, frozen `target`, `reason`, fresh native `capacity`, and kind-specific evidence below. Creates a linked queued attempt. Retry/correction/resume limits belong to the logical unit, not its new IDs; follow-up limits belong to the original finding. Original reports, identities and gaps remain recorded. |
 | `report` | `assignment_id`, terminal `status: done/partial/blocked/failed/stopped`, exact frozen `target` object, `checked` paths, `findings` list, `evidence`, `source_status: unchanged/changed/unknown`. `done` requires all assigned paths and an unchanged source record. Changed/unknown source records hold further dispatch records and completion. Findings need `id`, exact `finder` record, `severity`, `category`, `path`, positive `line`, `side: base/target`, `trigger`, `impact`, `evidence`, `fix`, `root_cause`. Also requires `reviewer`, `checked_units`, `checked_interactions`, all nine `categories`, `verification`, `coverage_gaps`, `pre_existing`, `learned`, and `verdicts`. Findings carry source `references`. Vet discoveries are spillover and retain the vetter as finder. A completed vet report atomically registers exactly one verdict per assigned raw ID with its actual vetter; partial or rejected reports register none. Only a completed focused follow-up may revise a verdict, preserving its predecessor in history. |
 | `vet` | `finding_id`, `assignment_id`, `verdict: CONFIRMED/ADJUSTED/REJECTED/UNVERIFIABLE`, resulting `severity`/`category`, independent `evidence`, `fix_assessment`, resulting `claim`, and source `references`. Existing-journal acknowledgment of a verdict already registered from a completed different-family report; requires an exact report match and the current assignment. Changes no judgment and rejects duplicate or superseded acknowledgments. New reviews require no separate `vet` records. |
 | `adjudication-report` | Running planned batch stand-in's `assignment_id`, terminal `status`, exact frozen `target`, actual `reviewer`, `adjudications` list, `evidence`, and `source_status`. Each judgment follows the final evidence contract below and includes the stand-in's `assignment_id`. IDs must be unique and assigned; `done` requires one decision per ID and unchanged sources. Retains the immutable original report. |
@@ -563,10 +603,23 @@ launches remain held. Withdrawal releases capacity without claiming coverage.
 Source failures can still be recorded and queued work settled, but hold new work.
 
 Each `recover` request supplies `capacity: {parent_active, process_active, evidence}`.
-The shared capacity check preserves observed 15/30 room, includes all recorded
-running kinds and queued/unassigned reservations, and rejects observations below
-recorded running work. Native Delta still owns actual admission and dispatch;
-unrecorded jobs and other runs' queued work are outside this validation.
+The shared check preserves observed 15/30 room and rejects observations below
+recorded running work. A recovery needs a live slot; unrelated queued slices do
+not consume that slot. Queue reservations still bound new-wave allocation, and
+the replacement checks capacity again before launch. Native Delta still owns
+actual admission and dispatch; unrecorded jobs and other runs' queued work are
+outside this validation. Honor the user's family, model, provider and spending
+limits as well as native admission limits.
+
+An initial-response timeout and an idle response stream use the same bounded
+retry contract below, after native evidence confirms that the exact attempt has
+failed. A quiet request or elapsed deadline alone leaves the outcome unknown.
+Retain the failure receipt and any report bytes before retrying. Do not reset the
+allowance through another assignment ID or provider alias. Auth, quota and rate
+failures make that lane unavailable for the run; use a verified alternate route
+only when it preserves the selected model, family, roles and isolation. If the
+retry fails or no permitted route exists, report the incomplete work and deliver
+the available findings instead of starting another retry cycle.
 
 - `retry`: at most one per logical unit after terminal transient/auth/quota/rate
   failure or an eligible queued withdrawal. Unstarted work cannot use report
@@ -583,6 +636,14 @@ unrecorded jobs and other runs' queued work are outside this validation.
   findings exactly and may preserve draft IDs from their ancestor assignments.
   Persistent missing fields/verdicts hold coverage. A successful correction does
   not resolve a separately recorded material gap without `resolve-gap` evidence.
+- `resume`: at most one per logical unit after its correction is spent, for a
+  sealed partial or blocked report bound to an individually resolved
+  `live-parent-update` incident. Reuse the same handle, frozen scope and retained
+  read receipts. The engine records the original observation in the new task;
+  it preserves earlier reports and findings without resetting retries or
+  corrections. Unresolved source failures, missing bindings and unrelated
+  resolutions remain blocking. Complete the existing coverage and report
+  contract; old vet judgments are history, not predetermined new outcomes.
 - `follow-up`: at most one per original finding, using its completed selected
   vetter's handle after this PR's active work settles. Supply `finding_id`, a
   focused `question`, `arguments: {finder, vetter}` copied exactly from the
@@ -604,7 +665,37 @@ After the focused verdict, the designated adjudicator may reconsider a previous
 assignment bound to the latest vet evidence; incorporate its exact judgment.
 Settled decisions cannot restart the cycle. Earlier reports and judgments remain
 available; remaining disagreements/material gaps hold completion. Empty findings
-create no vet, follow-up or stand-in work. Provider budgets are not managed.
+create no vet, follow-up or stand-in work. The engine enforces recorded concurrency
+and metered-spawn allowances. It does not measure live provider quotas, token
+usage or currency; the orchestrator must honor the user's additional limits.
+
+A launch, integrity or provider hold does not justify withholding findings
+already retained. When the user asks for them, return the available claims,
+drafts, provenance and missing coverage promptly, with their current validation
+and vetting status. `export` reads persisted received, authored and draft reports
+without requiring healthy source or launch gates:
+
+```sh
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' export --format markdown
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' export --format json
+```
+
+An explicit user instruction can waive separate vetting for the requested local
+assessment. Record the instruction against the target and current revision:
+
+```sh
+rtk proxy python3 {{WORKFLOW_SH}} --run '<run-directory>' waive-stage --target '<target>' --stage vetting --evidence '<explicit owner instruction>' --revision <last-returned-revision>
+```
+
+The orchestrator can then record the existing full `adjudication` evidence with
+disposition `UNVETTED`. `local_assessment_complete` describes that requested
+deliverable separately; strict review completion and publication remain blocked
+without the independent vet. Keep missing discovery coverage visible. A waiver
+does not erase unsafe source evidence or turn a skipped stage into completed
+independent scrutiny.
+Settled vet failures covered by the waiver do not require recovery before that
+local assessment can finish. Source-related failures and active or unknown
+attempts retain their existing holds.
 
 ## Assignment and report commands
 
@@ -1092,8 +1183,10 @@ unchanged. `baseline` protects plain native-parent directories as filesystem
 ledgers for project runs, and still protects existing Git administration.
 
 Preparation records a provisional material `capture-...` gap for each explicit
-nonmetadata omission or unsupported entry. Assess those records, preserve actual
-material gaps, and use the existing `resolve-gap` evidence path only when there is
+source omission or unsupported entry. Automatic disposable index exclusions stay
+visible in the manifest without creating material source-coverage gaps. Assess the gap
+records, preserve actual material gaps, and use the existing `resolve-gap`
+evidence path only when there is
 a supported disposition. Neither an excluded path nor a skipped special entry
 silently counts as reviewed. Original-source movement and manifest/copy tampering
 hold further work; a later clean observation cannot erase the failure history.
@@ -1140,3 +1233,44 @@ Project targets cannot authorize submission/PR approval, derive GitHub review
 or merge verdicts, or enter publication preflight/submission/reconciliation.
 These holds apply even when a caller attempts to supply publication authority.
 PR/range journals and existing PR publication safeguards keep their behavior.
+
+
+### Explicit migration of legacy project baseline policies
+
+Settle any issued launch with `started` or verified non-launch withdrawal before
+runtime adoption, stage waivers, policy migration or integrity resolution. These
+mutations must not advance the journal while a worker is awaiting registration.
+Use the release that issued the approval to settle it before adopting a new
+runtime. Read-only status, report and findings export remain available.
+
+Old hand-patched runs may omit review paths from parent ledgers without storing
+that policy in the ledger. Do not infer or replace those original fingerprints.
+After inspecting the old runtime and explicitly adopting the current runtime,
+use `adopt-baseline-policy --target TARGET --root ROOT --exclude PATH` (repeat
+`--exclude`), optionally `--exclude-generated`, with `--evidence` and the current
+`--revision`. The engine accepts only recorded review exclusions on an originally
+protected parent/filesystem copy, checks the unchanged frozen source and every
+included ledger entry, and records the policy only if the complete old ledger
+match succeeds. Modern policy ledgers cannot use this migration. Original
+artifacts remain intact. Then resolve each bookkeeping incident separately with
+`resolve-integrity`; policy adoption alone never clears a historical incident.
+
+New integrity resolutions require evidence retained by the original check.
+Parent/copy reference incidents need matching source and other Git metadata,
+plus the original observed refs normalized against exact registered settled pins.
+A later clean scan or restored file cannot establish the original cause;
+ambiguous legacy incidents remain unresolved. Completed-checkout cleanup requires
+an original missing-root observation. Earlier accepted resolution records remain
+readable as historical evidence.
+
+If an older runtime blocked a frozen review solely because its live original
+advanced, adopt the verified runtime and use `resolve-integrity --target TARGET
+--observation INDEX --cause live-parent-update --evidence REASON --revision N`.
+Each resolution retains its original incident and requires a fresh complete check
+of the frozen source, artifacts and protected copies. This cause accepts only
+original-checkout components; it cannot clear a snapshot, artifact or reviewer-copy
+failure. Never restore the live checkout to satisfy a frozen review's old baseline.
+
+New runs can record an explicit owner concurrency limit with `create
+--family-limit N`. Provider account limits still come from the identity registry;
+unissued queued work occupies neither provider nor family execution slots.

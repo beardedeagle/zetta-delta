@@ -160,6 +160,189 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((identity["provider_id"], identity["model_id"], identity["family"], identity["lane"], identity["billing"], identity["limit"]),
                          ("custom:k", "k3", "Kimi", "Kimi Code", "flat", 3))
 
+    def test_runtime_only_installs_a_verified_release_without_provider_or_delta_changes(self):
+        for name in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER"):
+            self.env.pop(name)
+        # The full install would refuse a running Delta and malformed settings.
+        (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
+        settings = self.config / "settings.json"
+        settings.write_text("user settings are untouched\n")
+        result = self.install("--review-runtime-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scripts = self.home / ".local/share/zetta-delta/review/scripts"
+        self.assertTrue(scripts.is_symlink())
+        manifest = json.loads((scripts / "runtime-manifest.json").read_text())
+        identity = subprocess.run([sys.executable, str(scripts / "runtime.py"), "identity"],
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(json.loads(identity.stdout), manifest["runtime"])
+        self.assertEqual(settings.read_text(), "user settings are untouched\n")
+        self.assertFalse((self.config / "profiles").exists())
+        self.assertFalse((self.home / ".agents/skills").exists())
+
+    def assert_runtime_only_prefers_tool_python(self, prefix: Path | None = None) -> None:
+        """Retain the full installer's interpreter preference for runtime upgrades.
+
+        Args:
+            prefix (Path | None): Custom tool prefix, or the default local prefix.
+        """
+        if prefix is not None:
+            self.env["PREFIX"] = str(prefix)
+        tools = (prefix or self.home / ".local") / "bin"
+        tools.mkdir(parents=True)
+        preferred = tools / "python3"
+        preferred.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        preferred.chmod(0o755)
+        (self.base / "bin/python3").write_text("#!/bin/sh\nexit 73\n")
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        scripts = self.home / ".local/share/zetta-delta/review/scripts"
+        pinned = scripts.resolve()
+        receipt = (pinned / "runtime-manifest.json").read_bytes()
+        settings = self.config / "settings.json"
+        settings.write_text("malformed settings must stay opaque to runtime upgrades\n")
+        original = {str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}
+        for name in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER"):
+            self.env.pop(name)
+        (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
+        source = self.bundle / "review/scripts/workflow.py"
+        source.write_bytes(source.read_bytes() + b"\n# runtime upgrade using the preferred interpreter\n")
+        preview = self.install("--review-runtime-only", "--force", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertEqual(scripts.resolve(), pinned)
+        upgraded = self.install("--review-runtime-only", "--force")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        self.assertNotEqual(scripts.resolve(), pinned)
+        self.assertEqual((pinned / "runtime-manifest.json").read_bytes(), receipt)
+        self.assertEqual(Path(json.loads(upgraded.stdout)["backup"]).resolve(), pinned)
+        identity = subprocess.run([sys.executable, str(scripts / "runtime.py"), "identity"],
+                                  text=True, capture_output=True, check=False)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(json.loads(identity.stdout), json.loads((scripts / "runtime-manifest.json").read_text())["runtime"])
+        self.assertEqual({str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}, original)
+
+    def test_runtime_only_prefers_default_tool_python_over_unsupported_ambient_python(self):
+        self.assert_runtime_only_prefers_tool_python()
+
+    def test_runtime_only_prefers_custom_prefix_python_over_unsupported_ambient_python(self):
+        self.assert_runtime_only_prefers_tool_python(self.base / "preferred tools")
+
+    def test_runtime_only_rejects_unsuitable_preferred_or_fallback_python_without_writes(self):
+        tools = self.home / ".local/bin"
+        tools.mkdir(parents=True)
+        preferred = tools / "python3"
+        preferred.write_text("#!/bin/sh\nexit 73\n")
+        preferred.chmod(0o755)
+        for selected in ("preferred", "fallback"):
+            with self.subTest(selected=selected):
+                if selected == "fallback":
+                    preferred.unlink()
+                    (self.base / "bin/python3").write_text("#!/bin/sh\nexit 73\n")
+                result = self.install("--review-runtime-only", "--dry-run")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("Python 3.11 or later", result.stderr)
+                self.assertNoWrites()
+
+    def test_runtime_only_dry_run_refuses_conflicting_flags_and_never_writes(self):
+        result = self.install("--review-runtime-only", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / ".local/share/zetta-delta/review").exists())
+        for flag in ("--configure-delta", "--prune-legacy", "--clean"):
+            with self.subTest(flag=flag):
+                result = self.install("--review-runtime-only", flag)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("cannot change Delta configuration", result.stderr)
+                self.assertFalse((self.home / ".local/share/zetta-delta/review").exists())
+
+    def assert_upgrade_with_symlinked_storage(self, storage: str, *, runtime_only: bool = True,
+                                             state_alias_from_start: bool = False) -> None:
+        """Upgrade a complete install through an owned directory alias.
+
+        Args:
+            storage (str): Runtime data or backup state root to relocate.
+            runtime_only (bool): Upgrade only the runtime rather than the full bundle.
+            state_alias_from_start (bool): Use the state alias for initial installation.
+        """
+        physical = self.base / ("physical " + storage)
+        alias = self.home / ".local/share" if storage == "data" else self.base / "state"
+        if storage == "data":
+            physical.mkdir(mode=0o700)
+            (self.home / ".local").mkdir(mode=0o700)
+            alias.symlink_to(physical, target_is_directory=True)
+        elif state_alias_from_start:
+            alias.rename(physical)
+            alias.symlink_to(physical, target_is_directory=True)
+            preview = self.install("--dry-run")
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            self.assertNoWrites()
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        scripts = self.home / ".local/share/zetta-delta/review/scripts"
+        pinned = scripts.resolve()
+        original = (pinned / "workflow.py").read_bytes()
+        receipt = (pinned / "runtime-manifest.json").read_bytes()
+        if storage == "state" and not state_alias_from_start:
+            alias.rename(physical)
+            alias.symlink_to(physical, target_is_directory=True)
+        mode = physical.stat().st_mode
+        settings = {str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}
+        if runtime_only:
+            for name in ("KIMI_PROVIDER", "ZAI_PROVIDER", "QWEN_PROVIDER"):
+                self.env.pop(name)
+            (self.base / "bin/pgrep").write_text("#!/bin/sh\nexit 0\n")
+        with (self.bundle / "review/scripts/workflow.py").open("a") as stream:
+            stream.write("\n# next source release through directory alias\n")
+        releases = set(pinned.parent.parent.iterdir())
+        arguments = ["--review-runtime-only"] if runtime_only else []
+        preview = self.install(*arguments, "--force", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        if runtime_only:
+            self.assertEqual(json.loads(preview.stdout)["destination"], str(scripts.resolve().parents[2] / "scripts"))
+        self.assertEqual(set(pinned.parent.parent.iterdir()), releases)
+        self.assertEqual(scripts.resolve(), pinned)
+        upgraded = self.install(*arguments, "--force")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        self.assertNotEqual(scripts.resolve(), pinned)
+        self.assertEqual((pinned / "workflow.py").read_bytes(), original)
+        self.assertEqual((pinned / "runtime-manifest.json").read_bytes(), receipt)
+        runtime_result, _ = json.JSONDecoder().raw_decode(upgraded.stdout[upgraded.stdout.index("{"):])
+        self.assertEqual(Path(runtime_result["backup"]).resolve(), pinned)
+        identity = subprocess.run([sys.executable, str(scripts / "runtime.py"), "identity"],
+                                  env=self.env, text=True, capture_output=True, check=False)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(json.loads(identity.stdout), json.loads((scripts / "runtime-manifest.json").read_text())["runtime"])
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(physical.stat().st_mode, mode)
+        self.assertEqual({str(path.relative_to(self.config)): path.read_bytes() for path in self.config.rglob("*") if path.is_file()}, settings)
+
+    def test_runtime_only_upgrade_accepts_symlinked_data_directory(self):
+        self.assert_upgrade_with_symlinked_storage("data")
+
+    def test_runtime_only_upgrade_accepts_symlinked_state_directory(self):
+        self.assert_upgrade_with_symlinked_storage("state")
+
+    def test_full_install_and_upgrade_accept_initial_state_directory_alias(self):
+        self.assert_upgrade_with_symlinked_storage("state", runtime_only=False, state_alias_from_start=True)
+
+    def test_full_upgrade_accepts_relocated_state_directory_alias(self):
+        self.assert_upgrade_with_symlinked_storage("state", runtime_only=False)
+
+    def test_shared_runtime_manifest_and_old_release_survive_upgrade(self):
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        scripts = self.home / ".local/share/zetta-delta/review/scripts"
+        pinned = scripts.resolve()
+        original = (pinned / "workflow.py").read_bytes()
+        with (self.bundle / "review/scripts/workflow.py").open("a") as stream:
+            stream.write("\n# next source release\n")
+        second = self.install("--review-runtime-only", "--force")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotEqual(scripts.resolve(), pinned)
+        self.assertEqual((pinned / "workflow.py").read_bytes(), original)
+        backup = Path(json.loads(second.stdout)["backup"])
+        self.assertTrue(backup.is_symlink())
+        self.assertEqual(backup.resolve(), pinned)
+
     def test_pr_review_skills_resolve_identity_without_sibling_skills(self):
         self.home = self.base / "home 🧪 with 'apostrophe' & space"
         self.home.mkdir()
@@ -379,6 +562,33 @@ class InstallerTests(unittest.TestCase):
                                         text=True, capture_output=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("usage:", result.stdout)
+
+    def test_legacy_skill_upgrade_keeps_backups_private_under_group_writable_umask(self):
+        legacy = self.home / ".agents/skills/pr-review/scripts"
+        legacy.mkdir(parents=True)
+        original = legacy / "workflow.py"
+        original.write_bytes(b"# original private skill callback\n")
+        state_mode = (self.base / "state").stat().st_mode
+        previous = os.umask(0o002)
+        try:
+            result = self.install("--force")
+        finally:
+            os.umask(previous)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.base / "state").stat().st_mode, state_mode)
+        backups = self.base / "state/zetta-delta/backups"
+        saved = list(backups.glob("*/" + str(original).lstrip("/")))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), b"# original private skill callback\n")
+        for path in backups.rglob("*"):
+            if path.is_dir() and not path.is_symlink():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700, path)
+        runtime = self.home / ".local/share/zetta-delta/review/scripts"
+        self.assertTrue(runtime.is_symlink())
+        identity = subprocess.run([sys.executable, str(runtime / "runtime.py"), "identity"],
+                                  env=self.env, text=True, capture_output=True, check=False)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertEqual(json.loads(identity.stdout), json.loads((runtime / "runtime-manifest.json").read_text())["runtime"])
 
     def test_missing_settings_and_runtime_tools_refuse_before_writes(self):
         settings = self.config / "settings.json"

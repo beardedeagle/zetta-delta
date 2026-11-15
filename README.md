@@ -248,6 +248,60 @@ export LOCAL_PROVIDER=<id> LOCAL_MODEL=<served model id> LOCAL_FAMILY=GLM
 ./install.sh --prune-legacy     # add --force when reinstalling
 ```
 
+To update only the shared review runtime, without changing Delta settings,
+profiles, rules, skills or provider configuration:
+
+```bash
+./install.sh --review-runtime-only --dry-run --force
+./install.sh --review-runtime-only --force
+```
+
+This route can run while Delta is open. It stages and verifies a complete release
+under `~/.local/share/zetta-delta/review/releases/`, then switches the existing
+`review/scripts` link. New commands use that release; entrypoint wrappers resolve
+the link once so an active command continues using the release it opened. The
+direct workflow and runtime CLIs re-enter their resolved script before loading
+local modules, keeping code, dependencies and identity in one release. The
+first upgrade preserves the old scripts directory in the installer backup; later
+upgrades save a link to the previous release. Restore that backup as
+`review/scripts` to roll back. Release installation never replaces `review/runs`.
+Let existing review CLI commands finish before that first directory-to-link
+conversion; subsequent release switches preserve already pinned commands.
+
+With native Windows Python under Git Bash/MSYS, installation uses private Win32
+ACLs and a nonblocking byte-range lock. Fixed entry files select a complete release
+through the atomically replaced `review/.release` file, without Administrator or
+Developer Mode link privileges. Upgrades retain the old release and copy its code
+to the installer backup. To roll back, run the backed-up `runtime.py install` with
+the same destination, a fresh backup root and `--force`. For a legacy backup,
+stop active commands, restore its scripts directory and remove `review/.release`.
+As on POSIX, let active commands finish before converting a legacy scripts directory. This backend covers
+installation; the review engine still requires its existing POSIX environment.
+
+New managed directories are private regardless of caller umask. Existing
+externally writable storage, including individual release parents, is rejected
+without changing its permissions. Existing ancestors must be owned by root or the
+current user and not externally writable; trusted sticky temporary directories
+remain supported. Storage and replacement authorization are checked again under
+the installation lock before using an existing release.
+
+If removing the retired local directory fails after activation, installation
+still succeeds and returns `cleanup_pending` with the retained path and error.
+The verified release is active and its completed backup remains available.
+
+Each release has a `runtime-manifest.json` with its journal schema version, hashes
+of the owned review modules, their aggregate fingerprint and the source Git
+revision when available. The content fingerprint identifies the actual bytes,
+including uncommitted changes; a source revision alone is not proof of the
+installed code. Bundled identity, index and Windows installer helper bytes are checked against the
+installation receipt; their evidence remains separate from the aggregate module
+fingerprint. Pending setups retain their original helper path and hash across
+upgrades, using the authenticated helper in the retained release or a byte-identical
+trusted legacy alias. New runs record the runtime identity. Changing the runtime of
+an existing run requires an explicit adoption record. Existing findings stay
+readable across runtime changes. Do not repair installed modules in place; change
+the repository, run its checks and install another complete release.
+
 `--configure-delta` also sets delegation to Only When Asked, model overrides on,
 and concurrency to `THREAD_CAP` per thread and twice that overall. It derives
 required provider IDs from the bundled public URLs when not supplied. A conflicting

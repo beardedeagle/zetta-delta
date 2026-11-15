@@ -21,7 +21,7 @@ import workflow
 
 REPO = "fixture/project"
 TARGET = REPO + "#12"
-REGISTRY = {"version": 1, "thread_limit": 15, "metered_max_spawns": 2,
+REGISTRY: dict = {"version": 1, "thread_limit": 15, "metered_max_spawns": 2,
             "providers": [{"provider_id": "provider-a", "lane": "lane-a", "billing": "flat", "limit": 3},
                           {"provider_id": "provider-b", "lane": "lane-b", "billing": "flat", "limit": 2},
                           {"provider_id": "provider-c", "lane": "lane-c", "billing": "flat", "limit": 2}],
@@ -91,8 +91,8 @@ def assignment(key="review", model=MODEL_A, kind="discovery", required=True, **e
             "test_plan": {"commands": [], "root": None, "evidence": "static trace sufficient"}, **extra}
 
 
-def partitioned_run(frozen=FROZEN, catalog=CATALOG):
-    run = workflow.new_run("pr-review", COLLECTION, REGISTRY, MODEL_C, "thread-fixture")
+def partitioned_run(frozen=FROZEN, catalog=CATALOG, registry=REGISTRY):
+    run = workflow.new_run("pr-review", COLLECTION, registry, MODEL_C, "thread-fixture")
     run = workflow.apply_event(run, event("freeze", frozen))
     run = workflow.apply_event(run, event("catalog", catalog))
     proposed = plan()
@@ -779,8 +779,16 @@ class DispatchGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "approved native parent"):
             workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"], runtime_copy=proof)))
         proof["parent_root"] = "/native/project"
-        started = workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"], runtime_copy=proof)))
-        self.assertEqual(started["targets"][TARGET]["assignments"]["review"]["status"], "running")
+        for candidate in (proof, dict(proof, exclude_indexes=True), dict(proof, exclude_indexes=False)):
+            with self.subTest(proof=candidate):
+                started = workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"], runtime_copy=candidate)))
+                row = started["targets"][TARGET]["assignments"]["review"]
+                self.assertEqual(row["status"], "running")
+                self.assertEqual(row["runtime_copy"], candidate)
+        for invalid in (None, 0, 1, "true", [], {}):
+            with self.subTest(exclude_indexes=invalid), self.assertRaises(ValueError):
+                workflow.apply_event(run, event("started", dict(start(), runtime_root=proof["root"],
+                    runtime_copy=dict(proof, exclude_indexes=invalid))))
 
     def test_legacy_task_approval_replays_without_certifying_new_dispatch(self):
         run = self.queued()
@@ -899,7 +907,10 @@ class DispatchGateTests(unittest.TestCase):
         catalog = copy.deepcopy(CATALOG)
         catalog["units"] = {f"review-{index:04d}-000": dict(next(iter(CATALOG["units"].values())), paths=[path], offset=index * 40)
                             for index, path in enumerate(frozen["inventory"])}
-        run = partitioned_run(frozen, catalog)
+        registry = copy.deepcopy(REGISTRY)
+        registry["providers"][0]["limit"] = 15
+        catalog["profiles"]["fixture-profile"]["identity"] = workflow.model_record(MODEL_A, registry)
+        run = partitioned_run(frozen, catalog, registry)
         for index, (key, unit) in enumerate(catalog["units"].items()):
             run = workflow.apply_event(run, event("assignment", assignment(f"unit{index}", scope=unit["paths"], units=[key])))
         for index in range(15):
@@ -909,7 +920,8 @@ class DispatchGateTests(unittest.TestCase):
         with self.assertRaises(workflow.NeedsDecision) as caught:
             workflow.contract.dispatch_task(run, TARGET, "unit15", self.capacity(15, 15))
         self.assertEqual(caught.exception.code, "native_capacity")
-        first = dict(report("unit0"), target=frozen, checked=[frozen["inventory"][0]], checked_units=["review-0000-000"])
+        first = dict(report("unit0"), target=frozen, reviewer=workflow.model_record(MODEL_A, registry),
+                     checked=[frozen["inventory"][0]], checked_units=["review-0000-000"])
         run = workflow.apply_event(run, event("report", first))
         run = workflow.apply_event(run, event("task-ready", {"assignment_id": "unit15", "capacity": self.capacity(14, 29)}))
         run = workflow.apply_event(run, event("started", start("unit15")))
@@ -936,6 +948,7 @@ class DispatchGateTests(unittest.TestCase):
             root = Path(directory).resolve()
             initial = {"method": run["method"], "intake": run["intake"], "registry": run["registry"],
                        "orchestrator": MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+            initial["runtime"] = workflow.runtime.identity()
             workflow.write_json(root / "run.json", {"version": 1, "initial": initial, "events": run["events"]})
             workflow.write_json(root / "capacity.json", self.capacity())
 
@@ -992,6 +1005,103 @@ class DispatchGateTests(unittest.TestCase):
             self.assertEqual(workflow.load_run(root / "run.json")[1]["targets"][TARGET]["assignments"]["review"]["status"], "running")
 
 
+class ProviderCapacityTests(unittest.TestCase):
+    def queued(self, count=2, billing="flat"):
+        run = DispatchGateTests().queued()
+        run["registry"]["providers"][0].update(limit=2, billing=billing)
+        target = run["targets"][TARGET]
+        person = workflow.model_record(MODEL_A, run["registry"])
+        target["catalog"]["profiles"]["fixture-profile"]["identity"] = person
+        target["assignments"]["review"]["identity"] = person
+        for number in range(count):
+            key = f"other{number}"
+            other = copy.deepcopy(target)
+            other["assignments"] = {key: dict(copy.deepcopy(target["assignments"]["review"]),
+                id=key, status="running", actual_identity=person, runtime_handle=key + "-handle",
+                runtime_evidence="registered native identity and handle")}
+            run["targets"][key] = other
+        return run
+
+    def dispatch(self, run):
+        active = sum(row["status"] == "running" for target in run["targets"].values()
+                     for row in target["assignments"].values())
+        return workflow.contract.dispatch_task(run, TARGET, "review", DispatchGateTests().capacity(active, active))
+
+    def outcome(self, run, key, status):
+        return workflow.apply_event(run, event("runtime-outcome", {"assignment_id": key,
+            "runtime_handle": key + "-handle", "target": FROZEN, "status": status,
+            "cause": "transient", "evidence": "exact native outcome receipt"}, key))
+
+    def test_provider_limit_blocks_dispatch_and_failed_handle_releases_only_live_capacity(self):
+        run = self.queued()
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(run)
+        self.assertEqual(caught.exception.code, "provider_capacity")
+        unknown = self.outcome(run, "other0", "unknown")
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(unknown)
+        self.assertEqual(caught.exception.code, "provider_capacity")
+        settled = self.outcome(unknown, "other0", "failed")
+        self.assertEqual(self.dispatch(settled)["dispatch"]["action"], "spawn")
+        self.assertEqual(settled["targets"]["other0"]["assignments"]["other0"]["runtime_outcome"]["status"], "failed")
+
+    def test_issued_launch_counts_but_unissued_queue_does_not(self):
+        run = self.queued()
+        row = run["targets"]["other0"]["assignments"]["other0"]
+        row.update(status="queued", actual_identity=None, task_ready={"revision": run["revision"]})
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(run)
+        self.assertEqual(caught.exception.code, "provider_capacity")
+        row.pop("task_ready")
+        self.assertEqual(self.dispatch(run)["dispatch"]["action"], "spawn")
+
+    def test_unrelated_provider_remains_available_and_explicit_family_cap_spans_accounts(self):
+        run = self.queued()
+        alternate = {"provider_id": "provider-b", "model_id": "model-a"}
+        run["registry"]["models"].append(dict(alternate, family="family-a"))
+        run["targets"]["other0"]["assignments"]["other0"]["actual_identity"] = workflow.model_record(alternate, run["registry"])
+        self.assertEqual(self.dispatch(run)["dispatch"]["action"], "spawn")
+        run["family_limit"] = 2
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(run)
+        self.assertEqual(caught.exception.code, "family_capacity")
+
+    def test_metered_spend_keeps_failed_and_unknown_handles_and_fresh_launch_reservations(self):
+        run = self.queued(billing="metered")
+        target = run["targets"][TARGET]
+        target["authorization"] = {"submission": False, "test_execution": False,
+            "metered_spawns": 2, "evidence": "owner permits two metered spawns"}
+        run = self.outcome(run, "other0", "failed")
+        run = self.outcome(run, "other1", "unknown")
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(run)
+        self.assertEqual(caught.exception.code, "metered_capacity")
+        reserved = copy.deepcopy(run)
+        pending = reserved["targets"]["other1"]["assignments"]["other1"]
+        pending.update(status="queued", actual_identity=None, task_ready={"revision": run["revision"]})
+        pending.pop("runtime_handle")
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(reserved)
+        self.assertEqual(caught.exception.code, "metered_capacity")
+        candidate = target["assignments"]["review"]
+        candidate["recovery"] = {"runtime_handle": "other0-handle"}
+        workflow.contract.provider_capacity(run, target, candidate)
+
+    def test_metered_launch_requires_target_authorization_and_honors_its_lower_allowance(self):
+        run = self.queued(count=0, billing="metered")
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(run)
+        self.assertEqual(caught.exception.code, "metered_authorization")
+        target = run["targets"][TARGET]
+        target["authorization"] = {"submission": False, "test_execution": False,
+            "metered_spawns": 1, "evidence": "owner permits one metered spawn"}
+        target["assignments"]["spent"] = dict(copy.deepcopy(target["assignments"]["review"]),
+            id="spent", status="failed", actual_identity=target["assignments"]["review"]["identity"], runtime_handle="spent-handle")
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            self.dispatch(run)
+        self.assertEqual(caught.exception.code, "metered_authorization")
+
+
 class FileHandoffTests(unittest.TestCase):
     queued = DispatchGateTests.queued
     prepared = WorkflowTests.prepared
@@ -1006,6 +1116,7 @@ class FileHandoffTests(unittest.TestCase):
         run = workflow.apply_event(run, event("integrity", {"status": "unchanged", "components": []}))
         initial = {"method": run["method"], "intake": run["intake"], "registry": run["registry"],
                    "orchestrator": MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+        initial["runtime"] = workflow.runtime.identity()
         self.saved = {"version": 1, "initial": initial, "events": run["events"]}
         workflow.write_json(self.root / "run.json", self.saved)
         self.dispatch = workflow.issue_handoff(self.root, self.saved, run, TARGET, "review", self.capacity())
@@ -1339,6 +1450,7 @@ class FileHandoffTests(unittest.TestCase):
             "route": {"profile": "alternate", "model": alternate, "evidence": "verified available route"}}))
         initial = {"method": run["method"], "intake": run["intake"], "registry": run["registry"],
                    "orchestrator": MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+        initial["runtime"] = workflow.runtime.identity()
         saved = {"version": 1, "initial": initial, "events": run["events"]}
         workflow.write_json(self.root / "run.json", saved)
         workflow.issue_handoff(self.root, saved, run, TARGET, "retry", self.capacity())
@@ -1477,6 +1589,7 @@ class FileHandoffTests(unittest.TestCase):
         run = workflow.apply_event(run, event("assignment", assignment("vet", MODEL_B, "vet", finding_ids=["review-01"])))
         initial = {"method": run["method"], "intake": run["intake"], "registry": run["registry"],
                    "orchestrator": MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+        initial["runtime"] = workflow.runtime.identity()
         saved = {"version": 1, "initial": initial, "events": run["events"]}
         workflow.write_json(self.root / "run.json", saved)
         workflow.issue_handoff(self.root, saved, run, TARGET, "vet", self.capacity())
@@ -2162,6 +2275,106 @@ class RecoveryTests(unittest.TestCase):
     judge_report = FamilyRoutingTests.judge_report
     judge_running = FamilyRoutingTests.judge_running
 
+    def metered_running(self, allowance: int = 1, provider_limit: int = 3) -> dict:
+        """Start a metered finder with explicit target and run allowances.
+
+        Args:
+            allowance (int): Authorized target and configured run spawn count.
+            provider_limit (int): Concurrent finder-provider allowance.
+
+        Returns:
+            dict: Valid run with one served metered handle.
+        """
+        registry = copy.deepcopy(REGISTRY)
+        registry["metered_max_spawns"] = allowance
+        registry["providers"][0].update(billing="metered", limit=provider_limit)
+        registry["providers"][1]["billing"] = "metered"
+        catalog = copy.deepcopy(CATALOG)
+        for row in catalog["profiles"].values():
+            person = row["identity"]
+            row["identity"] = workflow.model_record({key: person[key] for key in ("provider_id", "model_id")}, registry)
+        run = workflow.new_run("pr-review", COLLECTION, registry, MODEL_C, "thread-fixture")
+        for operation, data in (("freeze", FROZEN), ("catalog", catalog), ("plan", plan()),
+                                ("authorization", {"submission": False, "test_execution": False,
+                                    "metered_spawns": allowance, "evidence": "owner authorizes the bounded metered participants"}),
+                                ("assignment", assignment()), ("started", start())):
+            run = workflow.apply_event(run, event(operation, data))
+        return run
+
+    def test_metered_report_correction_reuses_served_handle_at_spent_spawn_limit(self):
+        run = self.metered_running()
+        person = run["targets"][TARGET]["assignments"]["review"]["actual_identity"]
+        run = self.receive(run, dict(report(status="partial"), reviewer=person))
+        run = workflow.apply_event(run, event("recover", self.request(run, "correction", key="correct")))
+        task = workflow.contract.dispatch_task(run, TARGET, "correct", DispatchGateTests().capacity())
+        self.assertEqual(task["dispatch"]["action"], "follow-up")
+        self.assertEqual(task["runtime_handle"], "review-handle")
+        run = workflow.apply_event(run, event("started", dict(start("correct"), runtime_handle="review-handle")))
+        handles = {row["runtime_handle"] for row in run["targets"][TARGET]["assignments"].values()
+                   if row.get("actual_identity")}
+        self.assertEqual(handles, {"review-handle"})
+
+    def test_metered_focused_follow_up_reuses_vetter_at_spent_spawn_limit(self):
+        run = self.metered_running(allowance=2)
+        person = run["targets"][TARGET]["assignments"]["review"]["actual_identity"]
+        finding = dict(raw(), finder=person)
+        run = self.receive(run, dict(report(findings=[finding]), reviewer=person))
+        run = workflow.apply_event(run, event("assignment", assignment("vet", MODEL_B, "vet", finding_ids=[finding["id"]])))
+        run = workflow.apply_event(run, event("started", start("vet", MODEL_B)))
+        vetter = run["targets"][TARGET]["assignments"]["vet"]["actual_identity"]
+        run = self.receive(run, dict(report("vet", verdicts=[vet(verdict="UNVERIFIABLE")]), reviewer=vetter), "vet")
+        run = workflow.apply_event(run, event("recover", self.request(run, "follow-up", "vet", "focused")))
+        task = workflow.contract.dispatch_task(run, TARGET, "focused", DispatchGateTests().capacity())
+        self.assertEqual(task["dispatch"]["action"], "follow-up")
+        self.assertEqual(task["runtime_handle"], "vet-handle")
+        run = workflow.apply_event(run, event("started", dict(start("focused", MODEL_B), runtime_handle="vet-handle")))
+        self.assertEqual(run["targets"][TARGET]["findings"][finding["id"]], finding)
+
+    def test_metered_recovery_keeps_fresh_spawn_unknown_outcome_and_live_caps(self):
+        run = self.outcome(self.metered_running(), status="unknown")
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            workflow.apply_event(run, event("recover", self.request(run, "correction", key="correct")))
+        self.assertEqual(caught.exception.code, "runtime_reconciliation")
+        failed = self.outcome(run)
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            workflow.apply_event(failed, event("recover", self.request(failed)))
+        self.assertEqual(caught.exception.code, "metered_authorization")
+        for cap in ("provider", "family"):
+            with self.subTest(cap=cap):
+                run = self.metered_running(provider_limit=1 if cap == "provider" else 3)
+                person = run["targets"][TARGET]["assignments"]["review"]["actual_identity"]
+                run = self.receive(run, dict(report(status="partial"), reviewer=person))
+                other = copy.deepcopy(run["targets"][TARGET])
+                other["assignments"] = {"busy": dict(other["assignments"]["review"], id="busy", status="running",
+                    runtime_handle="busy-handle", report=None)}
+                run["targets"]["other"] = other
+                if cap == "family":
+                    run["family_limit"] = 1
+                request = self.request(run, "correction", key="correct", capacity=DispatchGateTests().capacity(1, 1))
+                with self.assertRaises(workflow.NeedsDecision) as caught:
+                    workflow.apply_event(run, event("recover", request))
+                self.assertEqual(caught.exception.code, cap + "_capacity")
+
+    def test_unvetted_orchestrator_assessment_preserves_missing_independent_stage(self):
+        run = self.discovered(findings=[raw()])
+        original = copy.deepcopy(run["targets"][TARGET]["findings"])
+        assessment = adjudication(disposition="UNVETTED")
+        run = workflow.apply_event(run, event("adjudication", assessment))
+        target = run["targets"][TARGET]
+        self.assertEqual(target["findings"], original)
+        self.assertEqual(target["vets"], {})
+        self.assertEqual(target["adjudications"]["review-01"]["disposition"], "UNVETTED")
+        self.assertEqual(target["adjudications"]["review-01"]["adjudicator"], run["orchestrator"])
+        self.assertIn("finding review-01: UNVETTED", workflow.completion_gaps(run, target))
+        for disposition in ("CONFIRMED", "ADJUSTED"):
+            with self.subTest(disposition=disposition), self.assertRaises(workflow.NeedsDecision) as caught:
+                workflow.contract.adjudication(dict(assessment, disposition=disposition), target)
+            self.assertEqual(caught.exception.code, "missing_vet")
+        with self.assertRaises(workflow.NeedsDecision):
+            workflow.apply_event(run, event("complete", {"coverage_evidence": "owner requested local assessment"}))
+        with self.assertRaises(ValueError):
+            workflow.apply_event(run, event("publication-context", {}))
+
     def test_unlaunched_vet_work_can_settle_after_a_lane_failure_without_claiming_coverage(self):
         capacity = {"parent_active": 0, "process_active": 0, "evidence": "native observation: no active tasks"}
         claims = [dict(raw(f"review-{number:02}"), root_cause=f"cause-{number}", trigger=f"input {number}")
@@ -2437,7 +2650,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(target["assignments"]["retry"]["report"]["findings"], [raw()])
         self.assertIn("finding review-01: UNVETTED", workflow.completion_gaps(run, target))
 
-    def test_recovery_observations_include_other_running_work_and_queued_reservations(self):
+    def test_recovery_observations_include_running_work_without_charging_waiting_reservations(self):
         run = self.outcome(self.running())
         other = "fixture/project#13"
         run["targets"][other] = copy.deepcopy(run["targets"][TARGET])
@@ -2446,9 +2659,44 @@ class RecoveryTests(unittest.TestCase):
             workflow.apply_event(run, event("recover", self.request(run)))
         self.assertEqual(caught.exception.code, "native_capacity")
         run["targets"][other]["assignments"]["other"]["status"] = "queued"
-        capacity = {"parent_active": 14, "process_active": 29, "evidence": "one slot already reserved locally"}
-        with self.assertRaises(workflow.NeedsDecision):
-            workflow.apply_event(run, event("recover", self.request(run, capacity=capacity)))
+        capacity = {"parent_active": 14, "process_active": 29, "evidence": "one live slot available; other work is waiting"}
+        recovered = workflow.apply_event(run, event("recover", self.request(run, capacity=capacity)))
+        self.assertEqual(recovered["targets"][TARGET]["assignments"]["retry"]["status"], "queued")
+        self.assertEqual(recovered["targets"][other]["assignments"], run["targets"][other]["assignments"])
+
+    def test_provider_timeout_recovery_drains_seventeen_slices_without_withdrawing_backlog(self):
+        frozen = dict(FROZEN, inventory=[f"src/f{index}.py" for index in range(17)])
+        catalog = copy.deepcopy(CATALOG)
+        catalog["units"] = {f"review-{index:04d}-000": dict(next(iter(CATALOG["units"].values())),
+            paths=[path], offset=index * 40) for index, path in enumerate(frozen["inventory"])}
+        for failure in ("initial HTTP response timed out", "response stream stopped yielding bytes"):
+            with self.subTest(failure=failure):
+                run = partitioned_run(frozen, catalog)
+                for index, (unit, metadata) in enumerate(catalog["units"].items()):
+                    run = workflow.apply_event(run, event("assignment", assignment(f"slice{index}",
+                        scope=metadata["paths"], units=[unit])))
+                for key in ("slice0", "slice1"):
+                    run = workflow.apply_event(run, event("started", start(key)))
+                outcome = {"assignment_id": "slice0", "runtime_handle": "slice0-handle", "target": frozen,
+                    "status": "failed", "cause": "transient", "evidence": failure}
+                run = workflow.apply_event(run, event("runtime-outcome", outcome))
+                waiting = {key: copy.deepcopy(row) for key, row in run["targets"][TARGET]["assignments"].items()
+                           if row["status"] == "queued"}
+                capacity = {"parent_active": 1, "process_active": 1, "evidence": "failed handle is terminal; one peer remains active"}
+                retry = self.request(run, prior="slice0", target=frozen, capacity=capacity)
+                run = workflow.apply_event(run, event("recover", retry))
+                run = workflow.apply_event(run, event("started", start("retry")))
+                assignments = run["targets"][TARGET]["assignments"]
+                self.assertEqual(sum(row["status"] == "running" for row in assignments.values()), 2)
+                self.assertEqual({key: assignments[key] for key in waiting}, waiting)
+                self.assertEqual(len(waiting), 15)
+                self.assertEqual(assignments["slice0"]["runtime_outcome"], outcome)
+                run = workflow.apply_event(run, event("runtime-outcome", dict(outcome,
+                    assignment_id="retry", runtime_handle="retry-handle")))
+                with self.assertRaises(workflow.NeedsDecision) as caught:
+                    workflow.apply_event(run, event("recover", self.request(run, prior="retry", key="again",
+                        target=frozen, capacity=capacity)))
+                self.assertEqual(caught.exception.code, "recovery_exhausted")
 
     def test_recovery_capacity_source_and_target_bindings_preserve_state(self):
         run = self.outcome(self.running())
@@ -2606,6 +2854,7 @@ class RecoveryTests(unittest.TestCase):
             root = Path(directory).resolve()
             initial = {"method": run["method"], "intake": run["intake"], "registry": run["registry"], "orchestrator": MODEL_C,
                        "thread_id": run["thread_id"], "run_id": run["run_id"]}
+            initial["runtime"] = workflow.runtime.identity()
             workflow.write_json(root / "run.json", {"version": 1, "initial": initial, "events": run["events"]})
             workflow.write_json(root / "event.json", reply)
             argv = ["workflow.py", "--run", str(root), "record", "--event", str(root / "event.json"), "--revision", str(run["revision"])]
@@ -2830,6 +3079,7 @@ class BatchWaveTests(unittest.TestCase):
             root = Path(directory).resolve()
             initial = {"method": "pr-review-batch", "intake": run["intake"], "registry": run["registry"],
                        "orchestrator": MODEL_C, "thread_id": run["thread_id"], "run_id": run["run_id"]}
+            initial["runtime"] = workflow.runtime.identity()
             workflow.write_json(root / "run.json", {"version": 1, "initial": initial, "events": run["events"]})
             workflow.write_json(root / "event.json", event("batch-wave", wave_decisions(run), None))
             argv = ["workflow.py", "--run", str(root), "record", "--event", str(root / "event.json"), "--revision", str(run["revision"])]
