@@ -578,7 +578,9 @@ def install_windows(destination: Path, backup_root: Path, sources: dict[str, Pat
             except BaseException:
                 if current is None:
                     if published_launchers:
-                        remove_retired_directory(scripts)
+                        # Restore old entrypoints before deleting failed launchers;
+                        # cleanup errors must never prevent rollback.
+                        scripts.rename(pending / "failed-launchers")
                     if previous is not None and previous.exists():
                         previous.rename(scripts)
                 raise

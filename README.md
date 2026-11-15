@@ -268,6 +268,15 @@ upgrades save a link to the previous release. Restore that backup as
 Let existing review CLI commands finish before that first directory-to-link
 conversion; subsequent release switches preserve already pinned commands.
 
+With native Windows Python under Git Bash/MSYS, installation uses private Win32
+ACLs and a nonblocking byte-range lock. Fixed entry files select a complete release
+through the atomically replaced `review/.release` file, without Administrator or
+Developer Mode link privileges. Upgrades retain the old release and copy its code
+to the installer backup. To roll back, run the backed-up `runtime.py install` with
+the same destination, a fresh backup root and `--force`. As on POSIX, let active
+commands finish before converting a legacy scripts directory. This backend covers
+installation; the review engine still requires its existing POSIX environment.
+
 New managed directories are private regardless of caller umask. Existing
 externally writable storage, including individual release parents, is rejected
 without changing its permissions. Existing ancestors must be owned by root or the
@@ -283,7 +292,7 @@ Each release has a `runtime-manifest.json` with its journal schema version, hash
 of the owned review modules, their aggregate fingerprint and the source Git
 revision when available. The content fingerprint identifies the actual bytes,
 including uncommitted changes; a source revision alone is not proof of the
-installed code. Bundled identity and index helper bytes are checked against the
+installed code. Bundled identity, index and Windows installer helper bytes are checked against the
 installation receipt; their evidence remains separate from the aggregate module
 fingerprint. Pending setups retain their original helper path and hash across
 upgrades, using the authenticated helper in the retained release or a byte-identical

@@ -93,7 +93,9 @@ class WindowsInstallationTests(unittest.TestCase):
                 raise OSError("injected activation failure")
             return original(source, target)
 
-        with patch.object(os, "replace", side_effect=fail_pointer), self.assertRaisesRegex(OSError, "injected activation failure"):
+        with (patch.object(os, "replace", side_effect=fail_pointer),
+              patch.object(self.runtime, "remove_retired_directory", side_effect=PermissionError("cleanup unavailable")),
+              self.assertRaisesRegex(OSError, "injected activation failure")):
             self.install(force=True)
         self.assertEqual(legacy.read_text(), "preserve me")
         self.assertFalse((self.destination / ".release").exists())

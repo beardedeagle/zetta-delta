@@ -242,8 +242,11 @@ def _validate_handle(handle: int, *, managed: bool) -> None:
             if header.kind != 0 or header.size < 12:
                 raise ValueError("unsupported granting Windows ACL entry in runtime storage")
             mask = ctypes.cast(address.value + 4, ctypes.POINTER(wintypes.DWORD)).contents.value
-            if mask & rights and _sid_text(address.value + 8) not in trusted:
-                raise ValueError("runtime storage permits external Windows mutation or replacement")
+            trustee = _sid_text(address.value + 8)
+            if mask & rights and trustee not in trusted:
+                raise ValueError("runtime storage permits external Windows mutation or replacement "
+                                 f"(SID {trustee}, ACE {index}, mask 0x{mask:08x}, "
+                                 f"unsafe rights 0x{mask & rights:08x}, flags 0x{header.flags:02x})")
     finally:
         _kernel32.LocalFree(descriptor)
 
@@ -291,6 +294,8 @@ def validate_storage_ancestors(path: Path, *, include_self: bool = False) -> Non
         handle = _open_handle(ancestor, directory=True)
         try:
             _validate_handle(handle, managed=False)
+        except ValueError as error:
+            raise ValueError(f"runtime storage ancestor {ancestor}: {error}") from error
         finally:
             _kernel32.CloseHandle(handle)
 
