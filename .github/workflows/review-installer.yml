@@ -22,5 +22,6 @@ jobs:
       - name: Verify native installation and filesystem safeguards
         run: |
           python -B tests/pr-review-windows-primitives-test.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $storageResult = $LASTEXITCODE
           python -B tests/pr-review-windows-test.py
+          if ($storageResult -ne 0 -or $LASTEXITCODE -ne 0) { exit 1 }

@@ -85,18 +85,44 @@ class WindowsInstallationTests(unittest.TestCase):
     def test_forced_upgrade_replaces_old_bootstraps_and_preserves_their_bytes(self):
         first = self.install()
         old = (self.destination / "scripts/runtime.py").read_bytes()
+        old_pointer = (self.destination / ".release").read_bytes()
         replacement = self.runtime.WINDOWS_BOOTSTRAP + "\n# next bootstrap revision\n"
         with patch.object(self.runtime, "WINDOWS_BOOTSTRAP", replacement):
             result = self.install(force=True)
         self.assertTrue(result["changed"])
         self.assertEqual(self.identity(), first["runtime"])
         self.assertEqual((Path(result["backup"]) / ".entrypoints/runtime.py").read_bytes(), old)
+        self.assertEqual((Path(result["backup"]) / ".previous-release").read_bytes(), old_pointer)
         # A damaged regular entrypoint can also be repaired by the source installer.
         self.backup = self.base / "repair-backup"
         (self.destination / "scripts/runtime.py").write_bytes(b"broken\xff")
         repaired = self.install(force=True)
         self.assertTrue(repaired["changed"])
         self.assertEqual(self.identity(), first["runtime"])
+
+    def test_failed_managed_bootstrap_upgrade_restores_pointer_and_all_entrypoints(self):
+        first = self.install()
+        pointer = self.destination / ".release"
+        before_pointer = pointer.read_bytes()
+        before_files = {p.name: p.read_bytes() for p in (self.destination / "scripts").iterdir()}
+        original = os.replace
+
+        def fail_pointer(source, target):
+            if Path(target) == pointer:
+                raise OSError("injected managed activation failure")
+            return original(source, target)
+
+        with (patch.object(self.runtime, "WINDOWS_BOOTSTRAP", self.runtime.WINDOWS_BOOTSTRAP + "\n# upgrade\n"),
+              patch.object(os, "replace", side_effect=fail_pointer),
+              self.assertRaisesRegex(OSError, "injected managed activation failure")):
+            self.install(force=True)
+        self.assertEqual(pointer.read_bytes(), before_pointer)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.destination / "scripts").iterdir()}, before_files)
+        self.assertEqual(self.identity(), first["runtime"])
+        saved = list(self.backup.rglob(".previous-release"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), before_pointer)
+        self.assertEqual({p.name: p.read_bytes() for p in (saved[0].parent / ".entrypoints").iterdir()}, before_files)
 
     def test_legacy_backup_and_failed_pointer_publication_preserve_old_code(self):
         self.runtime.make_owned_directory(self.destination / "scripts")
