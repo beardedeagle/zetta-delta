@@ -2699,7 +2699,9 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
 
     Returns:
         dict[str, dict]: Canonical roots mapped to their first authenticated ledger,
-            agreeing on all source paths reviewed by any owner of that root.
+            agreeing on all source paths reviewed by any owner of a protected root.
+            Frozen live originals may have later captures of concurrent repairs;
+            every artifact is authenticated without replacing the original ledger.
 
     Raises:
         ValueError: Parent evidence changed or two records disagree.
@@ -2707,6 +2709,7 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
     """
     records: dict[str, list[dict]] = {}
     reviewed = parent_reviewed_paths(run)
+    live_originals = live_parent_roots(run)
     for key, target in run["targets"].items():
         frozen = target["frozen"] or target["setup"]
         if frozen and not target["resources_removed"] and "preparation" in frozen:
@@ -2727,7 +2730,7 @@ def parent_ledgers(directory: Path, run: dict) -> dict[str, dict]:
     for root, ledgers in records.items():
         paths = reviewed[root]
         original = preparation.reviewed_ledger(ledgers[0], paths)
-        if any(preparation.reviewed_ledger(ledger, paths) != original for ledger in ledgers[1:]):
+        if root not in live_originals and any(preparation.reviewed_ledger(ledger, paths) != original for ledger in ledgers[1:]):
             raise ValueError("protected parent records disagree")
         parents[root] = ledgers[0]
     return parents

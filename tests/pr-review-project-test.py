@@ -922,6 +922,31 @@ class ProjectTests(unittest.TestCase):
         run = workflow.apply_event(run, FIXTURES.event("baseline", record, key))
         self.assertEqual(workflow.parent_ledgers(self.directory, run)[str(self.source)], preparation.read_baseline(self.directory, record))
 
+    def test_frozen_parent_ledgers_accept_later_live_repairs_but_authenticate_every_capture(self):
+        run = self.prepared()
+        key, target = next(iter(run["targets"].items()))
+        original = workflow.parent_ledgers(self.directory, run)[str(self.source)]
+        snapshot = Path(target["frozen"]["source_root"]) / "api.py"
+        frozen_bytes = snapshot.read_bytes()
+        (self.source / "api.py").write_text("# concurrent owner repair\n")
+        record = preparation.capture_baseline(self.directory, "later-parent", self.source, (), filesystem=True,
+                                              exclude_generated=True)
+        run = workflow.apply_event(run, FIXTURES.event("baseline", record, key))
+        artifact = self.directory / record["artifact"]
+        retained = artifact.read_bytes()
+        self.assertEqual(workflow.parent_ledgers(self.directory, run)[str(self.source)], original)
+        self.assertEqual(snapshot.read_bytes(), frozen_bytes)
+        self.assertEqual(artifact.read_bytes(), retained)
+        self.assertEqual((self.source / "api.py").read_text(), "# concurrent owner repair\n")
+        for protected in (dict(run, native_parent={"root": str(self.source)}),
+                          dict(run, targets={key: dict(target, frozen=None, baselines=run["targets"][key]["baselines"])})):
+            with (self.subTest(protected=bool(protected.get("native_parent"))),
+                  self.assertRaisesRegex(ValueError, "protected parent records disagree")):
+                workflow.parent_ledgers(self.directory, protected)
+        artifact.write_bytes(retained + b"\n")
+        with self.assertRaisesRegex(ValueError, "baseline artifact was replaced or changed"):
+            workflow.parent_ledgers(self.directory, run)
+
     def test_setup_uses_existing_lifecycle_and_test_copies_omit_generated_caches(self):
         for tool in ("tgrep", "codegraph"):
             with self.subTest(tool=tool):

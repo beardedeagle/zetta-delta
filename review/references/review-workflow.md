@@ -443,6 +443,9 @@ the original to remain unchanged during capture. Frozen snapshots, manifests,
 sealed artifacts, native coordinator/reviewer checkouts and other participating
 copies remain protected. Reports identify live-original changes and continue to
 refer to the captured version, including findings already repaired in the live tree.
+Worker preflight authenticates every retained parent ledger, but later captures of
+a mutable original need not match its earlier source bytes or Git state. The first
+authenticated ledger remains the reference for native bookkeeping; it is not rewritten.
 A verified checkout's `.codegraph/socket` is recorded by kind, permissions, owner,
 device, inode and metadata change time without reading its contents. This
 also applies to owned nested checkouts; their Git ownership is validated before
