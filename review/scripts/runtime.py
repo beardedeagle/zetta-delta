@@ -21,13 +21,15 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from io import BufferedReader
 from pathlib import Path
-from typing import BinaryIO
 
 if os.name == "nt":
     import importlib.util
 
     _spec = importlib.util.spec_from_file_location("_review_runtime_windows", Path(__file__).resolve().with_name("runtime_windows.py"))
+    if _spec is None or _spec.loader is None:
+        raise ImportError("native Windows installer helper cannot be loaded")
     windows = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(windows)
 else:
@@ -40,7 +42,7 @@ HELPERS = ("identity.py", "ensure-context-indexes.py", "runtime_windows.py")
 MANIFEST = "runtime-manifest.json"
 
 # These fixed launchers select one immutable release. Only the regular-file
-# pointer changes during a Windows upgrade; directory links need no privileges.
+# pointer changes during a Windows upgrade, avoiding directory-link privileges.
 WINDOWS_BOOTSTRAP = '''"""Select one complete installed review release before loading its code."""
 import ctypes
 import importlib.util
@@ -89,6 +91,8 @@ if __name__ == "__main__":
     runpy.run_path(str(target), run_name="__main__")
 else:
     spec = importlib.util.spec_from_file_location(__name__, target)
+    if spec is None or spec.loader is None:
+        raise ImportError("installed review entrypoint cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     sys.modules[__name__] = module
     spec.loader.exec_module(module)
@@ -96,14 +100,14 @@ else:
 '''.replace("{{MODULE_NAMES}}", repr(tuple(Path(name).stem for name in (*MODULES, *HELPERS))))
 
 
-def open_regular(path: Path) -> BinaryIO:
+def open_regular(path: Path) -> BufferedReader:
     """Open an unredirected regular file using the platform's no-follow API.
 
     Args:
         path (Path): Source, installed code or receipt to read.
 
     Returns:
-        BinaryIO: Open binary stream owned by the caller.
+        BufferedReader: Open binary stream owned by the caller.
 
     Raises:
         OSError: The file cannot be opened.
@@ -598,7 +602,7 @@ def install_windows(destination: Path, backup_root: Path, sources: dict[str, Pat
                         scripts.rename(previous)
                     launchers.rename(scripts)
                     published_launchers = True
-                os.replace(staged_pointer, pointer)
+                windows.replace_file(staged_pointer, pointer)
             except BaseException:
                 if replace_launchers:
                     if published_launchers:

@@ -105,7 +105,7 @@ class WindowsInstallationTests(unittest.TestCase):
         pointer = self.destination / ".release"
         before_pointer = pointer.read_bytes()
         before_files = {p.name: p.read_bytes() for p in (self.destination / "scripts").iterdir()}
-        original = os.replace
+        original = self.runtime.windows.replace_file
 
         def fail_pointer(source, target):
             if Path(target) == pointer:
@@ -113,7 +113,7 @@ class WindowsInstallationTests(unittest.TestCase):
             return original(source, target)
 
         with (patch.object(self.runtime, "WINDOWS_BOOTSTRAP", self.runtime.WINDOWS_BOOTSTRAP + "\n# upgrade\n"),
-              patch.object(os, "replace", side_effect=fail_pointer),
+              patch.object(self.runtime.windows, "replace_file", side_effect=fail_pointer),
               self.assertRaisesRegex(OSError, "injected managed activation failure")):
             self.install(force=True)
         self.assertEqual(pointer.read_bytes(), before_pointer)
@@ -128,14 +128,14 @@ class WindowsInstallationTests(unittest.TestCase):
         self.runtime.make_owned_directory(self.destination / "scripts")
         legacy = self.destination / "scripts/legacy.txt"
         legacy.write_text("preserve me")
-        original = os.replace
+        original = self.runtime.windows.replace_file
 
         def fail_pointer(source, target):
             if Path(target) == self.destination / ".release":
                 raise OSError("injected activation failure")
             return original(source, target)
 
-        with (patch.object(os, "replace", side_effect=fail_pointer),
+        with (patch.object(self.runtime.windows, "replace_file", side_effect=fail_pointer),
               patch.object(self.runtime, "remove_retired_directory", side_effect=PermissionError("cleanup unavailable")),
               self.assertRaisesRegex(OSError, "injected activation failure")):
             self.install(force=True)

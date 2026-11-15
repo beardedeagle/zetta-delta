@@ -10,7 +10,7 @@ import errno
 import os
 import shutil
 import stat
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, nullcontext
 from ctypes import wintypes
 from functools import lru_cache
@@ -23,12 +23,13 @@ class _SecurityAttributes(ctypes.Structure):
                 ("inherit", wintypes.BOOL)]
 
 
-class _SidAndAttributes(ctypes.Structure):
-    _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
-
-
 class _AttributeTagInfo(ctypes.Structure):
     _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
+
+
+class _FileRenameInfo(ctypes.Structure):
+    _fields_ = [("flags", wintypes.DWORD), ("root", wintypes.HANDLE),
+                ("length", wintypes.DWORD), ("name", wintypes.WCHAR * 1)]
 
 
 class _Acl(ctypes.Structure):
@@ -72,6 +73,9 @@ if os.name == "nt":
     _kernel32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
                                                     ctypes.c_void_p, wintypes.DWORD]
     _kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _kernel32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                    ctypes.c_void_p, wintypes.DWORD]
+    _kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
     _kernel32.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_SecurityAttributes)]
     _kernel32.CreateDirectoryW.restype = wintypes.BOOL
     _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
@@ -118,6 +122,38 @@ def _sid_text(sid: int) -> str:
         _kernel32.LocalFree(value)
 
 
+def _token_sid(information_class: int) -> str:
+    """Read a SID from the process token's user or default-owner information.
+
+    Args:
+        information_class (int): TokenUser (1) or TokenOwner (4).
+
+    Returns:
+        str: Canonical SID from the requested token record.
+
+    Raises:
+        OSError: The process token cannot be queried.
+    """
+    token = wintypes.HANDLE()
+    if not _advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(), 0x8, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        needed = wintypes.DWORD()
+        _advapi32.GetTokenInformation(token, information_class, None, 0, ctypes.byref(needed))
+        if ctypes.get_last_error() != 122 or not needed.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_string_buffer(needed.value)
+        if not _advapi32.GetTokenInformation(token, information_class, buffer, len(buffer), ctypes.byref(needed)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # TOKEN_USER and TOKEN_OWNER both begin with a SID pointer.
+        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p)).contents.value
+        if sid is None:
+            raise ValueError("Windows process token returned no SID")
+        return _sid_text(sid)
+    finally:
+        _kernel32.CloseHandle(token)
+
+
 @lru_cache(maxsize=1)
 def _current_sid() -> str:
     """Return the process user's SID, independently of an elevated token owner.
@@ -128,24 +164,25 @@ def _current_sid() -> str:
     Raises:
         OSError: The process token cannot be queried.
     """
-    token = wintypes.HANDLE()
-    if not _advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(), 0x8, ctypes.byref(token)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        needed = wintypes.DWORD()
-        _advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
-        if ctypes.get_last_error() != 122 or not needed.value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        buffer = ctypes.create_string_buffer(needed.value)
-        if not _advapi32.GetTokenInformation(token, 1, buffer, len(buffer), ctypes.byref(needed)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return _sid_text(ctypes.cast(buffer, ctypes.POINTER(_SidAndAttributes)).contents.sid)
-    finally:
-        _kernel32.CloseHandle(token)
+    return _token_sid(1)
+
+
+@lru_cache(maxsize=1)
+def _managed_owners() -> frozenset[str]:
+    """Include an elevated process's trusted default owner for its created files.
+
+    Returns:
+        frozenset[str]: Process user and its default owner if already system-trusted.
+
+    Raises:
+        OSError: The process token cannot be queried.
+    """
+    owner = _token_sid(4)
+    return frozenset({_current_sid()} | ({owner} if owner in _TRUSTED_SYSTEM_SIDS else set()))
 
 
 @contextmanager
-def _private_attributes() -> Iterator[_SecurityAttributes]:
+def _private_attributes() -> Generator[_SecurityAttributes, None, None]:
     """Supply an explicit owner and protected inheritable private ACL at creation.
 
     Yields:
@@ -167,7 +204,7 @@ def _private_attributes() -> Iterator[_SecurityAttributes]:
 
 
 def _open_handle(path: Path, *, directory: bool = False, writable: bool = False,
-                 create: bool = False) -> int:
+                 create: bool = False, delete: bool = False) -> int:
     """Open a disk object itself and reject every reparse-point redirection.
 
     Args:
@@ -175,6 +212,7 @@ def _open_handle(path: Path, *, directory: bool = False, writable: bool = False,
         directory (bool): Require a directory instead of a regular file.
         writable (bool): Request write access and allow competing lock handles.
         create (bool): Create a missing regular file with a private ACL.
+        delete (bool): Request DELETE access for an atomic rename.
 
     Returns:
         int: Owned native handle; the caller must close or transfer it.
@@ -186,6 +224,8 @@ def _open_handle(path: Path, *, directory: bool = False, writable: bool = False,
     access = 0x00020080 | (0 if directory else 0x80000000)  # READ_CONTROL, attributes, data.
     if writable:
         access |= 0x40000000  # GENERIC_WRITE.
+    if delete:
+        access |= 0x00010000  # DELETE.
     sharing = 0x1 | (0x2 if writable else 0x4)  # READ with WRITE or DELETE.
     if directory:
         sharing |= 0x2  # Metadata validation must coexist with existing directory writers.
@@ -213,7 +253,7 @@ def _validate_handle(handle: int, *, managed: bool) -> None:
 
     Args:
         handle (int): No-follow handle with READ_CONTROL access.
-        managed (bool): Require the current owner and forbid all external writes.
+        managed (bool): Require the process user/default trusted owner and forbid external writes.
 
     Raises:
         OSError: Ownership or access-control metadata cannot be read.
@@ -227,8 +267,8 @@ def _validate_handle(handle: int, *, managed: bool) -> None:
     try:
         current = _current_sid()
         trusted = _TRUSTED_SYSTEM_SIDS | {current}
-        owner_sid = _sid_text(owner) if owner.value else None
-        if owner_sid not in ({current} if managed else trusted):
+        owner_sid = _sid_text(owner.value) if owner.value else None
+        if owner_sid not in (_managed_owners() if managed else trusted):
             raise ValueError("runtime storage must have a trusted Windows owner")
         if not dacl.value:
             raise ValueError("runtime storage must have a restricting Windows DACL")
@@ -237,13 +277,16 @@ def _validate_handle(handle: int, *, managed: bool) -> None:
             address = ctypes.c_void_p()
             if not _advapi32.GetAce(dacl, index, ctypes.byref(address)):
                 raise ctypes.WinError(ctypes.get_last_error())
-            header = ctypes.cast(address, ctypes.POINTER(_AceHeader)).contents
+            ace = address.value
+            if ace is None:
+                raise ValueError("Windows DACL returned no ACE")
+            header = ctypes.cast(ace, ctypes.POINTER(_AceHeader)).contents
             if header.flags & 0x8 or header.kind in (1, 6, 10, 12):
                 continue  # INHERIT_ONLY or deny ACEs cannot grant current-object access.
             if header.kind != 0 or header.size < 12:
                 raise ValueError("unsupported granting Windows ACL entry in runtime storage")
-            mask = ctypes.cast(address.value + 4, ctypes.POINTER(wintypes.DWORD)).contents.value
-            trustee = _sid_text(address.value + 8)
+            mask = ctypes.cast(ace + 4, ctypes.POINTER(wintypes.DWORD)).contents.value
+            trustee = _sid_text(ace + 8)
             # OWNER RIGHTS denotes this object's already validated owner. It is
             # neither an acceptable standalone owner nor a broadly trusted SID.
             effective_trustee = owner_sid if trustee == "S-1-3-4" else trustee
@@ -283,6 +326,52 @@ def open_regular(path: Path, *, writable: bool = False, create: bool = False) ->
         raise
 
 
+def replace_file(source: Path, destination: Path) -> None:
+    """Atomically publish a regular file while existing readers retain old bytes.
+
+    Windows' legacy MoveFileEx replacement rejects open destination handles.
+    FileRenameInfoEx with POSIX semantics preserves both atomic publication and
+    already opened readers. Unsupported filesystems fail without a weaker fallback.
+
+    Args:
+        source (Path): Closed, complete private file awaiting publication.
+        destination (Path): Final filename on the same filesystem, under private storage.
+
+    Raises:
+        OSError: Windows cannot inspect or atomically replace the files.
+        ValueError: Paths, types, ownership or ACLs violate private storage rules.
+    """
+    if not source.is_absolute() or not destination.is_absolute() or source == destination:
+        raise ValueError("runtime publication requires distinct absolute private paths")
+    owned_directory(source.parent)
+    if source.parent != destination.parent:
+        owned_directory(destination.parent)
+    handle = _open_handle(source, delete=True)
+    try:
+        _validate_handle(handle, managed=True)
+        try:
+            target = _open_handle(destination)
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                _validate_handle(target, managed=True)
+            finally:
+                _kernel32.CloseHandle(target)
+        name = str(destination).encode("utf-16-le", "surrogatepass")
+        offset = _FileRenameInfo.name.offset
+        buffer = ctypes.create_string_buffer(max(ctypes.sizeof(_FileRenameInfo), offset + len(name) + 2))
+        information = _FileRenameInfo.from_buffer(buffer)
+        information.flags = 0x1 | 0x2  # REPLACE_IF_EXISTS | POSIX_SEMANTICS.
+        information.root = None
+        information.length = len(name)
+        ctypes.memmove(ctypes.addressof(buffer) + offset, name, len(name))
+        if not _kernel32.SetFileInformationByHandle(handle, 22, buffer, len(buffer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
 def validate_storage_ancestors(path: Path, *, include_self: bool = False) -> None:
     """Require trusted nonredirected ancestors that prevent external replacement.
 
@@ -305,7 +394,7 @@ def validate_storage_ancestors(path: Path, *, include_self: bool = False) -> Non
 
 
 def owned_directory(path: Path) -> None:
-    """Require current-user owned private storage beneath trusted ancestors.
+    """Require private storage owned by the process user or its trusted default owner.
 
     Args:
         path (Path): Absolute existing directory managed by the installer.
@@ -355,7 +444,7 @@ def make_owned_directory(path: Path) -> None:
 
 
 @contextmanager
-def install_lock(path: Path) -> Iterator[BinaryIO]:
+def install_lock(path: Path) -> Generator[BinaryIO, None, None]:
     """Hold one nonblocking Windows byte-range lock on a protected regular file.
 
     Args:

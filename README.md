@@ -273,8 +273,9 @@ ACLs and a nonblocking byte-range lock. Fixed entry files select a complete rele
 through the atomically replaced `review/.release` file, without Administrator or
 Developer Mode link privileges. Upgrades retain the old release and copy its code
 to the installer backup. To roll back, run the backed-up `runtime.py install` with
-the same destination, a fresh backup root and `--force`. As on POSIX, let active
-commands finish before converting a legacy scripts directory. This backend covers
+the same destination, a fresh backup root and `--force`. For a legacy backup,
+stop active commands, restore its scripts directory and remove `review/.release`.
+As on POSIX, let active commands finish before converting a legacy scripts directory. This backend covers
 installation; the review engine still requires its existing POSIX environment.
 
 New managed directories are private regardless of caller umask. Existing

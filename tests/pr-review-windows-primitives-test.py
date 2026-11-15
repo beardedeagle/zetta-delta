@@ -61,6 +61,16 @@ class WindowsStorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             native.make_owned_directory(leaf)
 
+    def test_process_default_owner_is_accepted_for_created_storage(self):
+        # Elevated Windows tokens can default new objects to Administrators;
+        # their ordinary tempfile/mkdir output must remain valid managed storage.
+        ordinary = self.storage / "ordinary"
+        ordinary.mkdir()
+        native.owned_directory(ordinary)
+        native.make_owned_directory(ordinary / "private-child")
+        native.remove_retired_directory(ordinary)
+        self.assertFalse(ordinary.exists())
+
     def test_owner_rights_grants_only_the_validated_owner(self):
         directory = self.storage / "owner-rights"
         native.make_owned_directory(directory)
@@ -145,10 +155,26 @@ except BlockingIOError:
         pointer.write_bytes(b"old")
         replacement.write_bytes(b"new")
         with native.open_regular(pointer) as pinned:
-            os.replace(replacement, pointer)
+            native.replace_file(replacement, pointer)
             self.assertEqual(pinned.read(), b"old")
         with native.open_regular(pointer) as current:
             self.assertEqual(current.read(), b"new")
+
+    def test_initial_pointer_publication_and_unsafe_target_rejection(self):
+        pointer = self.storage / ".release"
+        pending = self.storage / "pending"
+        native.make_owned_directory(pending)
+        replacement = pending / ".next"
+        replacement.write_bytes(b"initial")
+        native.replace_file(replacement, pointer)
+        self.assertEqual(pointer.read_bytes(), b"initial")
+        self.assertFalse(replacement.exists())
+        self.grant_everyone(pointer, "M")
+        replacement.write_bytes(b"unsafe")
+        with self.assertRaisesRegex(ValueError, "external Windows mutation"):
+            native.replace_file(replacement, pointer)
+        self.assertEqual(pointer.read_bytes(), b"initial")
+        self.assertEqual(replacement.read_bytes(), b"unsafe")
 
     def test_retired_cleanup_removes_readonly_files_without_following_junction(self):
         retired = self.storage / "retired"
