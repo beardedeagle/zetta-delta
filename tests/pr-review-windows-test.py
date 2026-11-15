@@ -82,6 +82,22 @@ class WindowsInstallationTests(unittest.TestCase):
             self.install(force=True)
         self.assertEqual(self.identity(), first["runtime"])
 
+    def test_forced_upgrade_replaces_old_bootstraps_and_preserves_their_bytes(self):
+        first = self.install()
+        old = (self.destination / "scripts/runtime.py").read_bytes()
+        replacement = self.runtime.WINDOWS_BOOTSTRAP + "\n# next bootstrap revision\n"
+        with patch.object(self.runtime, "WINDOWS_BOOTSTRAP", replacement):
+            result = self.install(force=True)
+        self.assertTrue(result["changed"])
+        self.assertEqual(self.identity(), first["runtime"])
+        self.assertEqual((Path(result["backup"]) / ".entrypoints/runtime.py").read_bytes(), old)
+        # A damaged regular entrypoint can also be repaired by the source installer.
+        self.backup = self.base / "repair-backup"
+        (self.destination / "scripts/runtime.py").write_bytes(b"broken\xff")
+        repaired = self.install(force=True)
+        self.assertTrue(repaired["changed"])
+        self.assertEqual(self.identity(), first["runtime"])
+
     def test_legacy_backup_and_failed_pointer_publication_preserve_old_code(self):
         self.runtime.make_owned_directory(self.destination / "scripts")
         legacy = self.destination / "scripts/legacy.txt"

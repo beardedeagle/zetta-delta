@@ -424,7 +424,7 @@ def remove_retired_directory(path: Path) -> None:
 
 
 def windows_release(destination: Path) -> Path:
-    """Authenticate a Windows release pointer and its stable entry files.
+    """Validate a Windows release pointer and its private release storage.
 
     Args:
         destination (Path): Owned runtime root containing the pointer.
@@ -433,8 +433,8 @@ def windows_release(destination: Path) -> Path:
         Path: Validated immutable scripts directory selected by the pointer.
 
     Raises:
-        OSError: A pointer, entry file or release cannot be read.
-        ValueError: The pointer, launchers or storage are invalid or redirected.
+        OSError: A pointer or release cannot be read.
+        ValueError: The pointer or storage is invalid or redirected.
     """
     with open_regular(destination / ".release") as stream:
         release = stream.read(128).decode("ascii").strip()
@@ -442,14 +442,33 @@ def windows_release(destination: Path) -> Path:
             raise ValueError("invalid installed review release pointer")
     scripts = destination / "scripts"
     owned_directory(scripts)
-    for name in (*MODULES, *HELPERS):
-        with open_regular(scripts / name) as stream:
-            if stream.read().decode("utf-8").replace("\r\n", "\n") != WINDOWS_BOOTSTRAP:
-                raise ValueError("installed review release launcher differs")
     target = destination / "releases" / release / "scripts"
     owned_directory(target.parent)
     owned_directory(target)
     return target
+
+
+def windows_launchers_match(scripts: Path) -> bool:
+    """Check whether fixed entry files need an explicitly forced replacement.
+
+    Args:
+        scripts (Path): Validated private entrypoint directory.
+
+    Returns:
+        bool: True when every regular entry file matches this installer.
+
+    Raises:
+        OSError: An existing file cannot be read.
+        ValueError: An entry is redirected or is not a regular file.
+    """
+    for name in (*MODULES, *HELPERS):
+        try:
+            with open_regular(scripts / name) as stream:
+                if stream.read().replace(b"\r\n", b"\n") != WINDOWS_BOOTSTRAP.encode():
+                    return False
+        except FileNotFoundError:
+            return False
+    return True
 
 
 def stage_release(releases: Path, sources: dict[str, Path], expected: dict,
@@ -537,7 +556,8 @@ def install_windows(destination: Path, backup_root: Path, sources: dict[str, Pat
     with windows.install_lock(destination / ".install.lock"):
         validate_installation_storage(destination, backup_root, force=force)
         current = windows_release(destination) if pointer.exists() else None
-        if current is not None:
+        replace_launchers = current is None or not windows_launchers_match(scripts)
+        if current is not None and not replace_launchers:
             try:
                 manifest = read_installation_manifest(current, code_identity(current))
                 if manifest["runtime"] == expected and manifest["installed_files"] == expected_files:
@@ -556,6 +576,10 @@ def install_windows(destination: Path, backup_root: Path, sources: dict[str, Pat
             with tempfile.TemporaryDirectory(prefix=".scripts-backup-", dir=backup.parent) as temporary:
                 copied = Path(temporary) / "scripts"
                 copy_windows_tree(current or scripts, copied)
+                if current is not None and replace_launchers:
+                    copy_windows_tree(scripts, copied / ".entrypoints")
+                    with open_regular(pointer) as original:
+                        (copied / ".previous-release").write_bytes(original.read())
                 copied.rename(backup)
         previous = None
         with tempfile.TemporaryDirectory(prefix=".activation-", dir=destination) as temporary:
@@ -564,7 +588,7 @@ def install_windows(destination: Path, backup_root: Path, sources: dict[str, Pat
             staged_pointer.write_text(release.parent.name + "\n", encoding="ascii")
             published_launchers = False
             try:
-                if current is None:
+                if replace_launchers:
                     launchers = pending / "scripts"
                     make_owned_directory(launchers)
                     for name in (*MODULES, *HELPERS):
@@ -576,7 +600,7 @@ def install_windows(destination: Path, backup_root: Path, sources: dict[str, Pat
                     published_launchers = True
                 os.replace(staged_pointer, pointer)
             except BaseException:
-                if current is None:
+                if replace_launchers:
                     if published_launchers:
                         # Restore old entrypoints before deleting failed launchers;
                         # cleanup errors must never prevent rollback.

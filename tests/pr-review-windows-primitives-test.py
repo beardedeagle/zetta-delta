@@ -61,6 +61,20 @@ class WindowsStorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             native.make_owned_directory(leaf)
 
+    def test_owner_rights_grants_only_the_validated_owner(self):
+        directory = self.storage / "owner-rights"
+        native.make_owned_directory(directory)
+        result = subprocess.run(["icacls", str(directory), "/grant", "*S-1-3-4:(OI)(CI)(F)"],
+                                text=True, capture_output=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        native.owned_directory(directory)
+        native.make_owned_directory(directory / "child")
+        self.grant_everyone(directory, "M")
+        with self.assertRaisesRegex(ValueError, "external Windows mutation"):
+            native.owned_directory(directory)
+        with self.assertRaisesRegex(ValueError, "external Windows mutation"):
+            native.validate_storage_ancestors(directory, include_self=True)
+
     def test_ancestor_create_rights_are_safe_but_replacement_rights_are_not(self):
         ancestor = self.storage / "ancestor"
         native.make_owned_directory(ancestor)

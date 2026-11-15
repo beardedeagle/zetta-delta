@@ -227,7 +227,8 @@ def _validate_handle(handle: int, *, managed: bool) -> None:
     try:
         current = _current_sid()
         trusted = _TRUSTED_SYSTEM_SIDS | {current}
-        if not owner.value or _sid_text(owner) not in ({current} if managed else trusted):
+        owner_sid = _sid_text(owner) if owner.value else None
+        if owner_sid not in ({current} if managed else trusted):
             raise ValueError("runtime storage must have a trusted Windows owner")
         if not dacl.value:
             raise ValueError("runtime storage must have a restricting Windows DACL")
@@ -243,7 +244,10 @@ def _validate_handle(handle: int, *, managed: bool) -> None:
                 raise ValueError("unsupported granting Windows ACL entry in runtime storage")
             mask = ctypes.cast(address.value + 4, ctypes.POINTER(wintypes.DWORD)).contents.value
             trustee = _sid_text(address.value + 8)
-            if mask & rights and trustee not in trusted:
+            # OWNER RIGHTS denotes this object's already validated owner. It is
+            # neither an acceptable standalone owner nor a broadly trusted SID.
+            effective_trustee = owner_sid if trustee == "S-1-3-4" else trustee
+            if mask & rights and effective_trustee not in trusted:
                 raise ValueError("runtime storage permits external Windows mutation or replacement "
                                  f"(SID {trustee}, ACE {index}, mask 0x{mask:08x}, "
                                  f"unsafe rights 0x{mask & rights:08x}, flags 0x{header.flags:02x})")
