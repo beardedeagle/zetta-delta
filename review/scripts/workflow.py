@@ -413,11 +413,7 @@ def report_source_failure(target: dict, row: dict) -> bool:
     status = report.get("source_status", "unchanged")
     if status == "unchanged":
         return False
-    index = row.get("report_source_observation")
-    resolution = target.get("integrity_resolutions", {}).get(str(index), {})
-    return not (row.get("authored_report") and type(index) is int and 0 <= index < len(target["integrity"])
-                and target["integrity"][index]["status"] == status
-                and resolution.get("cause") == "live-parent-update")
+    return contract.resolved_report_observation(target, row) is None
 
 
 def live_parent_roots(run: dict) -> tuple[str, ...]:
@@ -1814,7 +1810,7 @@ def status(run: dict) -> dict:
                       "integrity_resolutions": target.get("integrity_resolutions", {}),
                       "local_assessment_complete": not any(integrity_failures(run)) and local_assessment_complete(target),
                      "recovery": [{"assignment_id": row["id"], "status": row["status"],
-                                   "request": {name: row["recovery"][name] for name in ("kind", "unit_id", "assignment_id", "participant", "runtime_handle", "finding_id") if name in row["recovery"]} if row.get("recovery") else None,
+                                   "request": {name: row["recovery"][name] for name in ("kind", "unit_id", "assignment_id", "participant", "runtime_handle", "finding_id", "source_observation") if name in row["recovery"]} if row.get("recovery") else None,
                                    "runtime_outcome": row.get("runtime_outcome"),
                                    "report_error": {name: row["rejected_report"][name] for name in ("code", "reason")} if row.get("rejected_report") else None}
                                   for row in target["assignments"].values() if row.get("recovery") or row.get("runtime_outcome") or row.get("rejected_report")],
@@ -2141,6 +2137,9 @@ def next_decision(run: dict, target: dict) -> dict:
         used = {item["recovery"]["kind"] for item in target["assignments"].values() if item.get("recovery", {}).get("unit_id") == root["id"]}
         if (outcome or {}).get("cause", "incomplete-report") in ("incomplete-report", "evidence-gap") and (row.get("rejected_report") or row["status"] in ("partial", "blocked")):
             if "correction" in used:
+                if ("resume" not in used and row.get("report")
+                        and contract.resolved_report_observation(target, row) is not None):
+                    return needs("report_resume", "request the one same-handle resume bound to this resolved live-parent incident", assignment_ids=[key], runtime_handle=row["runtime_handle"])
                 return needs("recovery_exhausted", "report correction was already requested once; retain missing fields/verdicts as incomplete coverage", assignment_ids=[key])
             return needs("report_correction", "request the one report correction through this selected runtime handle", assignment_ids=[key], runtime_handle=row["runtime_handle"],
                          error={name: row["rejected_report"][name] for name in ("code", "reason")} if row.get("rejected_report") else None)

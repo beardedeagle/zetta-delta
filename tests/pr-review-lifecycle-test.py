@@ -123,6 +123,87 @@ class LifecycleTests(unittest.TestCase):
             with self.subTest(component=component), self.assertRaisesRegex(ValueError, "protected copies"):
                 workflow.apply_event(unsafe, FIXTURES.event("integrity-resolution", self.resolution(unsafe, cause="live-parent-update")))
 
+    def resolved_partial_correction(self):
+        """Build a spent correction bound to a resolved live-original incident.
+
+        Returns:
+            dict: Metered run retaining both partial reports and their incident.
+        """
+        recovery = FIXTURES.RecoveryTests()
+        run = recovery.metered_running()
+        person = run["targets"][FIXTURES.TARGET]["assignments"]["review"]["actual_identity"]
+        finding = dict(FIXTURES.raw(), finder=person)
+        run = recovery.receive(run, dict(FIXTURES.report(status="partial", findings=[finding]), reviewer=person))
+        run = workflow.apply_event(run, FIXTURES.event("recover", recovery.request(run, "correction", key="correct")))
+        run = workflow.apply_event(run, FIXTURES.event("started", dict(FIXTURES.start("correct"), runtime_handle="review-handle")))
+        run = recovery.receive(run, dict(FIXTURES.report("correct", status="partial", findings=[finding]), reviewer=person), "correct")
+        target = run["targets"][FIXTURES.TARGET]
+        target["frozen"]["preparation"] = {"resource": "snapshot-" + "a" * 32}
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "changed", "components": ["parent"]}))
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "unchanged", "components": []}))
+        row = run["targets"][FIXTURES.TARGET]["assignments"]["correct"]
+        row["report"]["source_status"] = "changed"
+        row["authored_report"] = {"report": {"artifact": "retained-original"}}
+        row["report_source_observation"] = 0
+        return workflow.apply_event(run, FIXTURES.event("integrity-resolution", self.resolution(run, cause="live-parent-update")))
+
+    def test_resolved_source_hold_resumes_once_without_resetting_correction_or_spawn_limits(self):
+        run = self.resolved_partial_correction()
+        target = run["targets"][FIXTURES.TARGET]
+        originals = copy.deepcopy(target["assignments"])
+        request = dict(FIXTURES.RecoveryTests().request(run, "resume", "correct", "resumed"), target=target["frozen"])
+        self.assertEqual(workflow.next_decision(run, target)["code"], "report_resume")
+        resumed = workflow.apply_event(run, FIXTURES.event("recover", request))
+        row = resumed["targets"][FIXTURES.TARGET]["assignments"]["resumed"]
+        self.assertEqual(row["recovery"]["source_observation"], 0)
+        self.assertEqual(row["scope"], originals["correct"]["scope"])
+        task = workflow.contract.dispatch_task(resumed, FIXTURES.TARGET, "resumed", FIXTURES.DispatchGateTests().capacity())
+        self.assertEqual((task["dispatch"]["action"], task["runtime_handle"]), ("follow-up", "review-handle"))
+        payload = json.loads(task["task"].splitlines()[1])
+        self.assertEqual(payload["recovery"]["source_observation"], 0)
+        self.assertEqual(payload["retained_findings"], list(target["findings"].values()))
+        self.assertEqual(payload["correction"]["status"], "partial")
+        with self.assertRaisesRegex(ValueError, "reuse"):
+            workflow.apply_event(resumed, FIXTURES.event("started", FIXTURES.start("resumed")))
+        resumed = workflow.apply_event(resumed, FIXTURES.event("started", dict(FIXTURES.start("resumed"), runtime_handle="review-handle")))
+        person = row["identity"]
+        for status in ("done", "partial"):
+            reply = dict(FIXTURES.report("resumed", status=status, findings=list(target["findings"].values())),
+                         reviewer=person, target=target["frozen"])
+            completed = workflow.apply_event(resumed, FIXTURES.event("report-input", {
+                "assignment_id": "resumed", "runtime_handle": "review-handle", "target": target["frozen"],
+                "report": reply, "source_status": "unchanged", "evidence": "same reviewer completed the retained frozen scope"}))
+            final = completed["targets"][FIXTURES.TARGET]
+            self.assertEqual(final["assignments"]["review"]["report"], originals["review"]["report"])
+            self.assertEqual(final["assignments"]["correct"]["report"], originals["correct"]["report"])
+            for kind in ("resume", "correction"):
+                again = dict(request, id="again", assignment_id="resumed", kind=kind)
+                with self.subTest(status=status, kind=kind), self.assertRaises(workflow.NeedsDecision) as caught:
+                    workflow.apply_event(completed, FIXTURES.event("recover", again))
+                self.assertEqual(caught.exception.code, "recovery_exhausted")
+
+    def test_source_hold_resume_rejects_missing_binding_and_new_protected_incidents(self):
+        run = self.resolved_partial_correction()
+        target = run["targets"][FIXTURES.TARGET]
+        request = dict(FIXTURES.RecoveryTests().request(run, "resume", "correct", "resumed"), target=target["frozen"])
+        for changes in ({"report_source_observation": -1}, {"report_source_observation": True},
+                        {"authored_report": None}, {"status": "done"}, {"report": None}):
+            unsafe = copy.deepcopy(run)
+            unsafe["targets"][FIXTURES.TARGET]["assignments"]["correct"].update(changes)
+            original = copy.deepcopy(unsafe)
+            with self.subTest(binding=changes), self.assertRaises(workflow.NeedsDecision):
+                workflow.contract.recovery(unsafe, unsafe["targets"][FIXTURES.TARGET], request)
+            self.assertEqual(unsafe, original)
+        for cause in (None, "registered-native-administration"):
+            unsafe = copy.deepcopy(run)
+            unsafe["targets"][FIXTURES.TARGET]["integrity_resolutions"]["0"]["cause"] = cause
+            with self.subTest(resolution=cause), self.assertRaises(workflow.NeedsDecision):
+                workflow.contract.recovery(unsafe, unsafe["targets"][FIXTURES.TARGET], request)
+        unsafe = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "changed", "components": ["source"]}))
+        with self.assertRaises(workflow.NeedsDecision) as caught:
+            workflow.apply_event(unsafe, FIXTURES.event("recover", request))
+        self.assertEqual(caught.exception.code, "source_integrity")
+
     def test_original_bookkeeping_evidence_rejects_malformed_bindings(self):
         for value in (None, [], "relative", 42):
             run = self.discovered()

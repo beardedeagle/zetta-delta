@@ -968,13 +968,35 @@ def unit_root(target: dict, row: dict) -> dict:
     return target["assignments"][row["recovery"]["unit_id"]] if row.get("recovery") else row
 
 
+def resolved_report_observation(target: dict, row: dict) -> int | None:
+    """Return the original report check for an audited live-parent resolution.
+
+    Args:
+        target (dict): Retained integrity observations and validated resolutions.
+        row (dict): File-backed report with its original intake observation.
+
+    Returns:
+        int | None: Bound incident index, or None without matching sealed evidence.
+    """
+    report = row.get("report") or row.get("rejected_report", {})
+    status = report.get("source_status", "unchanged")
+    index = row.get("report_source_observation")
+    if (not row.get("authored_report") or status not in ("changed", "unknown")
+            or type(index) is not int or not 0 <= index < len(target["integrity"])):
+        return None
+    resolution = target.get("integrity_resolutions", {}).get(str(index), {})
+    if target["integrity"][index]["status"] == status and resolution.get("cause") == "live-parent-update":
+        return index
+    return None
+
+
 def recovery(run: dict, target: dict, data: dict, *, replay: bool = False) -> dict:
     """Create bounded work for a selected participant without rewriting a report.
 
     Args:
         run (dict): Frozen registry, unavailable lanes and native capacity evidence.
         target (dict): Original assignments, reports and findings.
-        data (dict): Retry, correction or focused dispute request.
+        data (dict): Retry, correction, resolved-hold resume or focused dispute.
         replay (bool): Retain historical admission evidence without applying
             newly enforced live provider or metered limits retroactively.
 
@@ -993,7 +1015,7 @@ def recovery(run: dict, target: dict, data: dict, *, replay: bool = False) -> di
     if data["target"] != target["frozen"] or target["resources_removed"]:
         raise ValueError("recovery requires the complete frozen target and existing resources")
     evidence(data["reason"])
-    kind = choice(data["kind"], ("retry", "correction", "follow-up"), "recovery kind")
+    kind = choice(data["kind"], ("retry", "correction", "resume", "follow-up"), "recovery kind")
     prior = target["assignments"].get(stable_id(data["assignment_id"]))
     if prior is None or prior["status"] in ("queued", "running"):
         raise NeedsDecision("runtime_reconciliation", "settle the exact native task before recovery; elapsed time is not terminal evidence")
@@ -1030,13 +1052,20 @@ def recovery(run: dict, target: dict, data: dict, *, replay: bool = False) -> di
         if prior.get("withdrawal"):
             raise ValueError("unstarted withdrawn work can only use a bounded retry")
         if "route" in data:
-            raise ValueError("corrections and follow-ups reuse their selected runtime participant")
+            raise ValueError("corrections, resumes and follow-ups reuse their selected runtime participant")
         request["runtime_handle"] = prior["runtime_handle"]
-        if kind == "correction":
+        if kind in ("correction", "resume"):
             if set(data) & {"finding_id", "question", "arguments", "new_evidence", "units"}:
-                raise ValueError("correction cannot change its assigned scope")
+                raise ValueError(f"{kind} cannot change its assigned scope")
             outcome = prior.get("runtime_outcome", {})
-            if outcome.get("cause", "incomplete-report") not in ("incomplete-report", "evidence-gap") or (not prior.get("rejected_report") and prior["status"] not in ("partial", "blocked")):
+            if kind == "resume":
+                observation = resolved_report_observation(target, prior)
+                if (observation is None or not prior.get("report") or prior["status"] not in ("partial", "blocked")
+                        or not any(item["recovery"]["kind"] == "correction" for item in attempts)
+                        or outcome.get("cause", "incomplete-report") not in ("incomplete-report", "evidence-gap")):
+                    raise NeedsDecision("report_resume", "resume requires a spent correction and a partial sealed report bound to a resolved live-parent incident")
+                request["source_observation"] = observation
+            elif outcome.get("cause", "incomplete-report") not in ("incomplete-report", "evidence-gap") or (not prior.get("rejected_report") and prior["status"] not in ("partial", "blocked")):
                 raise NeedsDecision("report_correction", "one correction applies only to a malformed/incomplete report, not a runtime or source failure")
         else:
             decisions(data, ("finding_id", "question", "arguments", "new_evidence", "units"), "dispute_evidence", tuple(data.keys() - {"finding_id", "question", "arguments", "new_evidence", "units"}))
@@ -1585,11 +1614,11 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
     recovery_request = row.get("recovery")
     if recovery_request:
         payload["recovery"] = {name: recovery_request[name] for name in
-                               ("kind", "reason", "question", "arguments", "new_evidence") if name in recovery_request}
+                               ("kind", "reason", "question", "arguments", "new_evidence", "source_observation") if name in recovery_request}
         prior = target["assignments"][recovery_request["assignment_id"]]
         if prior.get("rejected_report"):
             payload["correction"] = {name: prior["rejected_report"][name] for name in ("code", "reason")}
-        elif recovery_request["kind"] == "correction" and prior["report"]:
+        elif recovery_request["kind"] in ("correction", "resume") and prior["report"]:
             payload["correction"] = {name: prior["report"][name] for name in
                                      ("status", "coverage_gaps", "checked_units", "checked_interactions", "verdicts", "adjudications") if name in prior["report"]}
         retained = {}
@@ -1606,7 +1635,7 @@ def task_block(run: dict, key: str, assignment_id: str, *, replay: bool = False,
         "Start at assigned hunks, then trace concrete triggers, callers, contracts and consequences. Check all nine categories; no finding quota. Separate pre-existing unrelated observations.",
         "Evaluate PR description, discussion and prior review history against the frozen code. Explanations may refute or change findings; accepting risk or declining a fix alone does not resolve a supported finding. Revalidate recurring claims and preserve their prior IDs/history when linking the evidence.",
         "Record source references and meaningful test evidence or the reason tests were omitted. Scouts inspect statically. Execute only assigned authorized tests in the disposable test root; never use live services.",
-        "Sources and parent must remain unchanged. Baselines detect writes afterward; they do not prevent writes or merge-back. Clean only your own artifacts and report unexpected changes.",
+        "Frozen sources, sealed artifacts and native coordinator/reviewer checkouts must remain unchanged. The live original may advance after freezing; never undo or move its repairs. Baselines detect writes afterward, not prevent them. Clean only your own artifacts and report unexpected changes.",
         f"Use original finding IDs <unit>-NN. Severity must be one of {', '.join(SEVERITIES)}; nit is optional (at most five). Keep actual finder provenance; spillover is a new original finding.",
         "done requires all assigned units/interactions, category evidence and unchanged source. Missing evidence requires partial/blocked, never guessed certainty.",
     )
