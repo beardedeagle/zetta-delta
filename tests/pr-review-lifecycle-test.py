@@ -96,6 +96,33 @@ class LifecycleTests(unittest.TestCase):
         replayed = workflow.apply_event(run, event, replay=True)
         self.assertEqual(workflow.integrity_failures(replayed), ([], []))
 
+    def test_live_parent_resolution_retains_history_and_cannot_clear_review_input_failures(self):
+        run = self.discovered()
+        target = run["targets"][FIXTURES.TARGET]
+        target["frozen"]["preparation"] = {"resource": "snapshot-" + "a" * 32}
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "changed", "components": ["parent"]}))
+        run = workflow.apply_event(run, FIXTURES.event("integrity", {"status": "unchanged", "components": []}))
+        original = copy.deepcopy(run["targets"][FIXTURES.TARGET]["integrity"])
+        row = run["targets"][FIXTURES.TARGET]["assignments"]["review"]
+        row["report"]["source_status"] = "changed"
+        row["authored_report"] = {"report": {"artifact": "retained-original"}}
+        row["report_source_observation"] = 0
+        report = copy.deepcopy(row["report"])
+        resolved = workflow.apply_event(run, FIXTURES.event("integrity-resolution", self.resolution(run, cause="live-parent-update")))
+        self.assertEqual(workflow.integrity_failures(resolved), ([], []))
+        self.assertEqual(resolved["targets"][FIXTURES.TARGET]["integrity"], original)
+        self.assertEqual(resolved["targets"][FIXTURES.TARGET]["assignments"]["review"]["report"], report)
+        for changes in ({"report_source_observation": -1}, {"report_source_observation": 1}, {"authored_report": None}):
+            unsafe = copy.deepcopy(resolved)
+            unsafe["targets"][FIXTURES.TARGET]["assignments"]["review"].update(changes)
+            with self.subTest(report_binding=changes):
+                self.assertEqual(workflow.integrity_failures(unsafe)[1], ["review"])
+        for component in ("source", "artifact:manifest.json", "native:/temporary/native", "copy:unrelated/worker"):
+            unsafe = copy.deepcopy(run)
+            unsafe["targets"][FIXTURES.TARGET]["integrity"][0]["components"] = [component]
+            with self.subTest(component=component), self.assertRaisesRegex(ValueError, "protected copies"):
+                workflow.apply_event(unsafe, FIXTURES.event("integrity-resolution", self.resolution(unsafe, cause="live-parent-update")))
+
     def test_original_bookkeeping_evidence_rejects_malformed_bindings(self):
         for value in (None, [], "relative", 42):
             run = self.discovered()

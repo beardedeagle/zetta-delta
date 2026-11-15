@@ -447,6 +447,39 @@ class ProjectTests(unittest.TestCase):
                 with self.subTest(operation=operation), self.assertRaisesRegex(preparation.NeedsDecision, "project"):
                     workflow.apply_event(run, FIXTURES.event(operation, {}, key))
 
+    def test_live_repairs_do_not_change_frozen_reads_or_clear_snapshot_tampering(self):
+        key, _ = self.issued()
+        original = (self.source / "api.py").read_bytes()
+        (self.source / "api.py").write_text("# concurrent owner repair\n")
+        code, output = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output["content"].encode(), original)
+        _, run = workflow.load_run(self.directory / "run.json")
+        observation = run["targets"][key]["integrity"][-1]
+        self.assertEqual(observation["status"], "unchanged")
+        self.assertEqual(observation["live_parent_changes"]["parent"]["status"], "changed")
+        self.assertEqual((self.source / "api.py").read_text(), "# concurrent owner repair\n")
+        snapshot = Path(run["targets"][key]["frozen"]["source_root"]) / "api.py"
+        snapshot.write_text("# changed review input\n")
+        code, errors = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual((code, errors["code"]), (2, "source_integrity"))
+        snapshot.write_bytes(original)
+        code, errors = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual((code, errors["code"]), (2, "source_integrity"))
+
+    def test_unavailable_live_parent_does_not_skip_protected_snapshot_checks(self):
+        key, _ = self.issued()
+        _, run = workflow.load_run(self.directory / "run.json")
+        snapshot = Path(run["targets"][key]["frozen"]["source_root"]) / "api.py"
+        self.source.rename(self.base / "moved owner checkout")
+        snapshot.write_text("# changed review input\n")
+        code, errors = self.cli(self.directory, "source-read", "--target", key, "--assignment", "review", "--path", "api.py")
+        self.assertEqual((code, errors["code"]), (2, "source_integrity"))
+        _, run = workflow.load_run(self.directory / "run.json")
+        observation = run["targets"][key]["integrity"][-1]
+        self.assertEqual(observation["live_parent_changes"]["parent"]["status"], "unknown")
+        self.assertIn("source", observation["components"])
+
     def issued(self, roots=None, cross=False):
         run = self.catalogued(roots)
         key, target = next(iter(run["targets"].items()))
@@ -841,7 +874,8 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(code, 2, hold)
         self.assertEqual(hold["code"], "batch_wave")
         self.assertEqual(hold["revision"], stale["revision"] + 1)
-        (self.source / "api.py").write_text("changed source\n")
+        _, current = workflow.load_run(journal)
+        (Path(current["targets"][key]["frozen"]["source_root"]) / "api.py").write_text("changed source\n")
         code, integrity = self.cli(directory, "record", "--event", str(event_file), "--revision", str(hold["revision"]))
         self.assertEqual(code, 2, integrity)
         self.assertEqual(integrity["code"], "source_integrity")

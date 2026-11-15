@@ -435,6 +435,14 @@ Native commits need not equal the reviewed repository's commit: the registered
 native project may be a different repository. Setup and finalization consume the
 same registered native copies and participating-copy baselines as ordinary checks.
 These bookkeeping exceptions never apply to a frozen source or sealed artifacts.
+Once an independent snapshot is frozen, the original source checkout may advance
+while its owner repairs findings. Its changes remain recorded as
+`live_parent_changes`; they do not change the review's source or block snapshot
+reads, report intake, vetting or adjudication. Setup and finalization still require
+the original to remain unchanged during capture. Frozen snapshots, manifests,
+sealed artifacts, native coordinator/reviewer checkouts and other participating
+copies remain protected. Reports identify live-original changes and continue to
+refer to the captured version, including findings already repaired in the live tree.
 A verified checkout's `.codegraph/socket` is recorded by kind, permissions, owner,
 device, inode and metadata change time without reading its contents. This
 also applies to owned nested checkouts; their Git ownership is validated before
@@ -1243,6 +1251,14 @@ A later clean scan or restored file cannot establish the original cause;
 ambiguous legacy incidents remain unresolved. Completed-checkout cleanup requires
 an original missing-root observation. Earlier accepted resolution records remain
 readable as historical evidence.
+
+If an older runtime blocked a frozen review solely because its live original
+advanced, adopt the verified runtime and use `resolve-integrity --target TARGET
+--observation INDEX --cause live-parent-update --evidence REASON --revision N`.
+Each resolution retains its original incident and requires a fresh complete check
+of the frozen source, artifacts and protected copies. This cause accepts only
+original-checkout components; it cannot clear a snapshot, artifact or reviewer-copy
+failure. Never restore the live checkout to satisfy a frozen review's old baseline.
 
 New runs can record an explicit owner concurrency limit with `create
 --family-limit N`. Provider account limits still come from the identity registry;

@@ -295,6 +295,10 @@ class NativeLifecycleTests(GIT.GitFixture):
         self.assertEqual(artifact.read_bytes(), original)
         (other / "api.py").write_text("actual parent source change\n")
         code, result = self.cli("check")
+        self.assertEqual(code, 0, result)
+        frozen_source = Path(self.state()[1]["targets"][second]["frozen"]["source_root"])
+        (frozen_source / "api.py").write_text("actual frozen source change\n")
+        code, result = self.cli("check")
         self.assertEqual(code, 2, result)
         self.assertEqual(result["code"], "source_integrity")
 

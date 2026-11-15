@@ -1592,7 +1592,8 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
           setup: dict | None = None, observations: dict | None = None,
           native_copies: tuple[dict, ...] = (), active_native_roots: tuple[str, ...] | None = None,
           legacy_policies: dict[str, dict] | None = None,
-          reviewed_paths: dict[str, tuple[str, ...]] | None = None) -> dict:
+          reviewed_paths: dict[str, tuple[str, ...]] | None = None,
+          live_parent_roots: tuple[str, ...] = ()) -> dict:
     """Compare source, parent, artifacts and participating-copy baselines.
 
     Args:
@@ -1614,6 +1615,8 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             They may reproduce an old unversioned parent/copy ledger, never replace it.
         reviewed_paths (dict[str, tuple[str, ...]] | None): Explicit source paths
             keyed by baseline:<name> or native:<root> for each evidence owner.
+        live_parent_roots (tuple[str, ...]): Mutable originals whose independent
+            snapshots are frozen; observe their changes without blocking review.
 
     Returns:
         dict: Actual integrity status and changed/unreadable components.
@@ -1621,6 +1624,7 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
     problems = []
     cache_changes = []
     bookkeeping = {}
+    live_parent_changes = {}
     scans = observations if observations is not None else {}
     reviewed = tuple(frozen.get("manifest", {}).get("entries", frozen.get("inventory", ())))
     def observe(root: str, exclude: tuple[str, ...] = (), *, native: bool = True, project: bool = False,
@@ -1717,8 +1721,39 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                     pass  # A raced or unreadable ref scan cannot attest bookkeeping.
         return fingerprint(current)
 
+    def differs(root: str, expected_fingerprint: str, **options) -> bool:
+        """Keep mutable-original observations separate from protected failures.
+
+        Args:
+            root (str): Recorded checkout or snapshot root.
+            expected_fingerprint (str): Authenticated original baseline digest.
+            **options (dict): Source policies passed to the content observer.
+
+        Returns:
+            bool: Whether a protected input differs; mutable originals are audited.
+
+        Raises:
+            ValueError: A protected baseline is unreadable.
+        """
+        if root not in live_parent_roots:
+            return observe(root, **options) != expected_fingerprint
+        try:
+            current = observe(root, **options)
+        except (OSError, ValueError, KeyError, TypeError):
+            live_parent_changes[component] = {"root": root, "status": "unknown", "fingerprint": None}
+        else:
+            if current != expected_fingerprint:
+                live_parent_changes[component] = {"root": root, "status": "changed", "fingerprint": current}
+        bookkeeping.pop(component, None)
+        return False
+
     component = "unreadable or unowned preparation evidence"
     try:
+        allowed_parents = {frozen["parent_root"], *(record["root"] for record in baselines.values())}
+        if (not set(live_parent_roots) <= allowed_parents
+                or set(live_parent_roots) & {record["root"] for record in native_copies}
+                or frozen["source_root"] in live_parent_roots):
+            raise ValueError("mutable originals cannot include frozen or native review copies")
         if active_native_roots is not None and not set(active_native_roots) <= {row["root"] for row in native_copies}:
             raise ValueError("active native roots must be registered copies")
         policy_roots = ({frozen["parent_root"]} if frozen["mode"] == "project" else set())
@@ -1753,18 +1788,17 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
             expected = json.loads((resource / baseline_name).read_text())
             if fingerprint(expected) != frozen[name + "_fingerprint"]:
                 raise ValueError("original baseline differs from its recorded fingerprint")
-            current = observe(frozen[name + "_root"], native=name != "source", project=project,
-                              expected=expected)
-            if current != frozen[name + "_fingerprint"]:
+            if differs(frozen[name + "_root"], frozen[name + "_fingerprint"], native=name != "source",
+                       project=project, expected=expected):
                 problems.append(name)
         for name, record in baselines.items():
             component = "copy:" + name
             expected = None
             if "artifact" in record:
                 expected = read_baseline(directory, record)
-            if observe(record["root"], tuple(record.get("exclude", ())), project=record.get("filesystem", False),
+            if differs(record["root"], record["fingerprint"], exclude=tuple(record.get("exclude", ())), project=record.get("filesystem", False),
                        expected=expected, exclude_generated=record.get("exclude_generated", False),
-                       strict_paths=(reviewed_paths or {}).get("baseline:" + name, reviewed)) != record["fingerprint"]:
+                       strict_paths=(reviewed_paths or {}).get("baseline:" + name, reviewed)):
                 problems.append("copy:" + name)
         for record in native_copies:
             if active_native_roots is not None and record["root"] not in active_native_roots:
@@ -1782,6 +1816,7 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                 if scans[store_key] != record["clone_store"]["fingerprint"]:
                     problems.append(component)
         return {"status": "changed" if problems else "unchanged", "components": problems,
+                **({"live_parent_changes": live_parent_changes} if live_parent_changes else {}),
                 **({"cache_changes": cache_changes} if cache_changes else {}),
                 **({"bookkeeping": bookkeeping} if bookkeeping else {})}
     except (OSError, ValueError, KeyError, TypeError):
@@ -1795,6 +1830,7 @@ def check(directory: Path, run_id: str, key: str, frozen: dict, baselines: dict,
                 except OSError:
                     pass
         return {"status": "unknown", "components": list(dict.fromkeys(problems + [component])),
+                **({"live_parent_changes": live_parent_changes} if live_parent_changes else {}),
                 **({"bookkeeping": bookkeeping} if bookkeeping else {})}
 
 

@@ -395,13 +395,56 @@ def integrity_failures(run: dict) -> tuple[list[str], list[str]]:
                if any(check["status"] != "unchanged" and str(index) not in target.get("integrity_resolutions", {})
                       for index, check in enumerate(target["integrity"]))]
     assignments = [key for target in run["targets"].values() for key, row in target["assignments"].items()
-                   if (row["report"] and row["report"]["source_status"] != "unchanged")
-                   or row.get("rejected_report", {}).get("source_status", "unchanged") != "unchanged"]
+                   if report_source_failure(target, row)]
     return targets, assignments
 
 
+def report_source_failure(target: dict, row: dict) -> bool:
+    """Retain report holds except those bound to a resolved live-original check.
+
+    Args:
+        target (dict): Original integrity observations and audited resolutions.
+        row (dict): Accepted or rejected file-backed report and receipt binding.
+
+    Returns:
+        bool: Whether this report still carries an unresolved source failure.
+    """
+    report = row.get("report") or row.get("rejected_report", {})
+    status = report.get("source_status", "unchanged")
+    if status == "unchanged":
+        return False
+    index = row.get("report_source_observation")
+    resolution = target.get("integrity_resolutions", {}).get(str(index), {})
+    return not (row.get("authored_report") and type(index) is int and 0 <= index < len(target["integrity"])
+                and target["integrity"][index]["status"] == status
+                and resolution.get("cause") == "live-parent-update")
+
+
+def live_parent_roots(run: dict) -> tuple[str, ...]:
+    """Identify mutable originals after their independent snapshots are frozen.
+
+    Args:
+        run (dict): Validated frozen targets and registered native copies.
+
+    Returns:
+        tuple[str, ...]: Original source roots, excluding review snapshots and
+            native coordinator/reviewer checkouts, which remain protected.
+    """
+    roots = {target["frozen"]["parent_root"] for target in run["targets"].values()
+             if target["frozen"] and "preparation" in target["frozen"]}
+    originals = tuple(roots)
+    copies = runtime_copies(run)
+    roots.update(row["project_root"] for row in copies if row.get("project_root")
+                 and any(Path(root).is_relative_to(row["project_root"]) for root in originals))
+    protected = {row["root"] for row in copies}
+    protected.update(target["frozen"]["source_root"] for target in run["targets"].values() if target["frozen"])
+    if run.get("native_parent"):
+        protected.add(run["native_parent"]["root"])
+    return tuple(sorted(roots - protected))
+
+
 def validate_integrity_resolution(run: dict, key: str, data: dict, *, replay: bool = False) -> None:
-    """Bind a bookkeeping resolution to original and fresh engine observations.
+    """Bind a non-source resolution to original and fresh engine observations.
 
     Args:
         run (dict): Replayed journal with a fresh, successful complete check.
@@ -411,7 +454,7 @@ def validate_integrity_resolution(run: dict, key: str, data: dict, *, replay: bo
             new resolutions require evidence from the original observation.
 
     Raises:
-        ValueError: Evidence is stale, duplicated, unbound or not bookkeeping.
+        ValueError: Evidence is stale, duplicated, unbound or affects protected inputs.
     """
     fields(data, ("observation", "observation_sha256", "check", "snapshot_fingerprint",
                   "native_copies_sha256", "cause", "evidence"))
@@ -423,15 +466,23 @@ def validate_integrity_resolution(run: dict, key: str, data: dict, *, replay: bo
         raise ValueError("resolution requires an unresolved incident and the latest later check")
     original = target["integrity"][index]
     if original["status"] == "unchanged" or target["integrity"][check]["status"] != "unchanged":
-        raise ValueError("bookkeeping resolution requires a fresh unchanged complete check")
+        raise ValueError("resolution requires a fresh unchanged complete protected-source check")
     frozen = target["frozen"]
     if (frozen is None or target["resources_removed"]
             or data["snapshot_fingerprint"] != frozen["source_fingerprint"]
             or data["observation_sha256"] != preparation.fingerprint(original)
             or data["native_copies_sha256"] != preparation.fingerprint({"copies": runtime_copies(run)})):
         raise ValueError("resolution evidence differs from its original snapshot or administration")
-    choice(data["cause"], ("completed-native-copy", "registered-native-administration"), "resolution cause")
+    choice(data["cause"], ("completed-native-copy", "registered-native-administration", "live-parent-update"), "resolution cause")
     evidence(data["evidence"])
+    if data["cause"] == "live-parent-update":
+        roots = set(live_parent_roots(run))
+        allowed = {"parent"} if frozen["parent_root"] in roots else set()
+        allowed.update("copy:" + owner + "/" + name for owner, item in run["targets"].items()
+                       for name, record in item["baselines"].items() if record["root"] in roots)
+        if not original["components"] or not set(original["components"]) <= allowed:
+            raise ValueError("live-parent recovery cannot resolve frozen source, artifacts or protected copies")
+        return
     settled = {row["runtime_copy"]["root"]: row["runtime_copy"]
                for item in run["targets"].values() for row in item["assignments"].values()
                if row["status"] not in ("queued", "running") and "runtime_copy" in row}
@@ -547,10 +598,8 @@ def completion_gaps(run, target):
             latest = target["assignments"][latest["superseded_by"]]
         if row["status"] in ("queued", "running") or ((row["required"] or row.get("rejected_report")) and latest["status"] != "done"):
             gaps.append(f"assignment {key}: {row['status']}")
-        if row["report"] and row["report"]["source_status"] != "unchanged":
-            gaps.append(f"assignment {key}: source integrity {row['report']['source_status']}")
-        if row.get("rejected_report", {}).get("source_status", "unchanged") != "unchanged":
-            gaps.append(f"assignment {key}: rejected report source integrity")
+        if report_source_failure(target, row):
+            gaps.append(f"assignment {key}: report source integrity")
     for key, row in target["findings"].items():
         if not target["vets"].get(key):
             gaps.append(f"finding {key}: UNVETTED")
@@ -1040,7 +1089,7 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
                 raise ValueError("source search requires its execution receipt")
             search.update(copy.deepcopy(data), status="success" if data["exit_code"] in (0, 1) else "error")
     elif operation == "integrity":
-        fields(data, ("status", "components"), ("cache_changes", "bookkeeping"))
+        fields(data, ("status", "components"), ("cache_changes", "bookkeeping", "live_parent_changes"))
         choice(data["status"], ("unchanged", "changed", "unknown"), "integrity status")
         strings(data["components"], "integrity component", empty=True)
         if (target["frozen"] is None and target["setup"] is None) or (data["status"] == "unchanged" and data["components"]):
@@ -1054,6 +1103,21 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
                     or any(not isinstance(change[name], str) or not re.fullmatch(r"[0-9a-f]{64}", change[name])
                            for name in ("before", "after"))):
                 raise ValueError("invalid generated-cache change")
+        changes = data.get("live_parent_changes", {})
+        originals = {"parent": (target["frozen"] or target["setup"] or {}).get("parent_root")}
+        originals.update({"copy:" + owner + "/" + name: record["root"] for owner, item in result["targets"].items()
+                          for name, record in item["baselines"].items()})
+        if not isinstance(changes, dict):
+            raise ValueError("live parent observations must be a component map")
+        for component, change in changes.items():
+            fields(change, ("root", "status", "fingerprint"))
+            if (target["frozen"] is None or originals.get(component) != change["root"]
+                    or change["root"] not in live_parent_roots(result) or component in data["components"]
+                    or change["status"] not in ("changed", "unknown")
+                    or (change["status"] == "unknown" and change["fingerprint"] is not None)
+                    or (change["status"] == "changed" and (not isinstance(change["fingerprint"], str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", change["fingerprint"])))):
+                raise ValueError("live parent observation does not bind a mutable original")
         if not isinstance(data.get("bookkeeping", {}), dict) or not set(data.get("bookkeeping", {})) <= set(data["components"]):
             raise ValueError("bookkeeping evidence must name original failed components")
         for component, proof in data.get("bookkeeping", {}).items():
@@ -1432,6 +1496,7 @@ def apply_event(run: dict, event: dict, *, replay: bool = False, directory: Path
             raise NeedsDecision("runtime_reconciliation", "reconcile the native outcome before accepting a report")
         evidence(data["evidence"])
         choice(data["source_status"], ("unchanged", "changed", "unknown"), "source status")
+        row["report_source_observation"] = len(target["integrity"]) - 1
         authored = row.get("authored_report")
         invalid_encoding = authored and "assembly_error" in authored and data["report"] is None
         if authored and not invalid_encoding and (not isinstance(data["report"], str)
@@ -1897,7 +1962,10 @@ def report(run: dict) -> str:
             lines.append(f"- {field}: {report_text(target.get(field) or 'not recorded')}")
         lines.append(f"- Source observations: {report_text(target['integrity'] or 'not observed')}; resources removed: {target['resources_removed']}.")
         if target.get("integrity_resolutions"):
-            lines.append(f"- Audited bookkeeping resolutions: {report_text(target['integrity_resolutions'])}.")
+            lines.append(f"- Audited integrity resolutions: {report_text(target['integrity_resolutions'])}.")
+        live_changes = [check["live_parent_changes"] for check in target["integrity"] if check.get("live_parent_changes")]
+        if live_changes:
+            lines.append(f"- Live original checkout changes are audited separately; this review applies to the frozen snapshot: {report_text(live_changes[-1])}.")
         if target.get("stage_waivers"):
             lines.append(f"- Explicit owner stage waivers: {report_text(target['stage_waivers'])}; independent review remains incomplete.")
         if target["plan"]:
@@ -2737,13 +2805,16 @@ def check_sources(directory: Path, saved: dict, run: dict, stop: bool = True,
             continue
         if "preparation" not in comparison:
             raise NeedsDecision("prepare_source", "recorded freeze evidence lacks owned preparation resources; create and prepare a new run")
+        policy = source_check_policy(run, key, runtime_copy=runtime_copy,
+                                     runtime_copy_target=runtime_copy_target, legacy_policies=legacy_policies)
+        originals = {comparison["parent_root"], *(record["root"] for record in policy["baselines"].values())}
+        mutable = tuple(root for root in live_parent_roots(run) if root in originals) if target["frozen"] else ()
         observation = preparation.check(directory, run["run_id"], key, comparison,
                                         setup=target["index_setup"] if target["frozen"] is None else None,
-                                        observations=observations,
-                                        **source_check_policy(run, key, runtime_copy=runtime_copy,
-                                                              runtime_copy_target=runtime_copy_target, legacy_policies=legacy_policies))
+                                        observations=observations, live_parent_roots=mutable, **policy)
         if (record_unchanged or observation["status"] != "unchanged" or
-                observation.get("cache_changes") and target["integrity"][-1:] != [observation]):
+                (observation.get("cache_changes") or observation.get("live_parent_changes"))
+                and target["integrity"][-1:] != [observation]):
             run = append_record(directory, saved, run, key, "integrity", observation)
     failures, _ = integrity_failures(run)
     if stop and failures:
@@ -2891,10 +2962,10 @@ def main() -> int:
     adopt = commands.add_parser("runtime-adopt", help="explicitly bind a legacy or upgraded run to this verified runtime")
     adopt.add_argument("--evidence", required=True)
     adopt.add_argument("--revision", type=int, required=True)
-    resolution = commands.add_parser("resolve-integrity", help="audit a proven bookkeeping-only incident against a fresh complete check")
+    resolution = commands.add_parser("resolve-integrity", help="audit a non-source incident against a fresh complete snapshot/copy check")
     resolution.add_argument("--target", required=True)
     resolution.add_argument("--observation", type=int, required=True, help="zero-based index in the target's integrity observations")
-    resolution.add_argument("--cause", choices=("completed-native-copy", "registered-native-administration"), required=True)
+    resolution.add_argument("--cause", choices=("completed-native-copy", "registered-native-administration", "live-parent-update"), required=True)
     resolution.add_argument("--evidence", required=True)
     resolution.add_argument("--revision", type=int, required=True)
     policy = commands.add_parser("adopt-baseline-policy", help="explicitly reproduce a legacy baseline with its recorded review exclusions")
