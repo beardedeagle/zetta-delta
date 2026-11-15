@@ -1,0 +1,30 @@
+name: Review installer
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/review-installer.yml
+      - install.sh
+      - review/**
+      - tests/pr-review-*test.py
+  push:
+    branches: [fix/review-harness-lifecycle]
+    paths:
+      - .github/workflows/review-installer.yml
+      - install.sh
+      - review/**
+      - tests/pr-review-*test.py
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify native installation and filesystem safeguards
+        run: python -B tests/pr-review-windows-test.py
